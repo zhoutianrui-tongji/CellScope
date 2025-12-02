@@ -1,0 +1,123 @@
+io:
+  final_format: csv
+  h5ad_compression: lzf
+  resume_from: 
+  intermediate_dirname: intermediate_results
+  write_csv_copy: true
+  lite_intermediate: true
+  write_intermediate_csv: true
+  write_intermediate_parquet: false
+
+annotation:
+  enable: true
+  two_stage: false
+  spatial_channel: false
+  leiden_resolution: 1.0
+  hvg_n_top_genes: 2000
+  pca_n_comps: 25
+  neighbors_k: 15
+  umap_min_dist: 0.3
+  umap_spread: 1.0
+  umap_prefix: rapx_umap
+  enrichment_panels_name: rapx_enrichment_panels
+  quality_summary_name: rapx_quality_summary
+  compute_umap: true
+  save_umap_plot: true
+  save_plots: true
+  # Preferred representation for Leiden/UMAP (options: X_dgi_gcn|X_dgi_sage|X_expr|X_pca|auto)
+  cluster_rep: "X_dgi_gcn"
+
+module1:
+  knn_k: 32
+  include_directional: true
+  winsor_perc_low: 1
+  winsor_perc_high: 99
+
+module2:
+  top_g: 4096
+  bow_knn_k: 32
+  max_rows_per_cell_for_svd: 500
+  max_svd_rows: 2000000
+  svd_n_components: 24
+  bow_weight_mode: gaussian   # gaussian | uniform
+  use_tfidf: true
+  tf_norm: true
+  parallel_chunk_cells: 128
+
+module3:
+  hdbscan_min_cluster_size: 20
+  hdbscan_allow_single_cluster: true
+  hdbscan_min_samples_frac: 0.5
+  kmeans_min_k: 2
+  kmeans_max_k: 6
+  merge_min_size: 25
+
+module5:
+  block_size: 50000
+  # SimpleK feature weights and options
+  w_gc: 0.5
+  w_expr: 0.5
+  w_sp: 0.0
+  use_gc: true
+  use_expr: true
+  speed_preset: ultra
+  use_spatial_feats: true
+  use_decell: true
+  use_cosine: true
+  enable_cap: true
+  # K estimation
+  estimate_k: auto        # auto | fixed
+  fixed_k: 1024           # used when estimate_k=fixed
+  target_sub_per_cluster: 800
+  target_cluster_per_cell: 1.0
+  K_min: 200
+  K_max: 8000
+  # Nucleus/cytoplasm split
+  split_by_nucleus: true
+  nucleus_threshold: 0.0
+  # Per-cell cap parameters
+  cap_ratio_base: 0.015
+  cap_min_keep: 3
+  cap_margin_tau: 0.015
+  cap_max_frac_soft: 0.05
+
+module6:
+  h5ad_compression_override: true
+  save_shape_summary: true
+
+module7:
+  scvi_epochs: 100
+  scvi_n_latent: 32
+  scvi_lr: 0.001
+  scvi_batch_size: 1024
+  # Optional: priority representations for annotation stage (default prefers X_dgi_gcn)
+  rep_priority: ["X_dgi_gcn", "X_dgi_sage", "X_expr", "X_pca"]
+  neighbors:
+    k_expr: 15
+    k_geom: 15
+  alpha_expr: 0.5
+  alpha_geom: 0.5
+  same_cell_beta: 0.5
+  topk_prune: 32
+  edge_norm: rw              # rw | gcn | none
+  feature_scale: standard    # standard | none
+
+module8:
+  dgi_epochs: 150
+  enable_dgi_sage: true
+  dgi_hidden: 32
+  dgi_out: 32
+  dgi_lr: 0.001
+  dgi_weight_decay: 0.0001
+  dgi_clip_grad: 1.0
+
+runtime:
+  n_jobs: 8
+  joblib_backend: threading
+  blas_threads: 32
+  neighbors_n_jobs: 8
+  use_threadpoolctl: true
+
+ui:
+  show_sample: true
+  progress_style: rich

@@ -1,0 +1,16 @@
+# Exclude test data, outputs, and large files
+/test_data/
+/test_data50000/
+/test_out/
+/test_out50000/
+nohup.out
+*.log
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.ipynb_checkpoints/
+.venv/
+venv/
+.env
