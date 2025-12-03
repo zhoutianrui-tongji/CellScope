@@ -108,7 +108,8 @@ CellScope expects three primary tabular inputs (CSV or Parquet), with required c
 	- `cell_id`: the cell identifier each transcript belongs to
 	- `x_location`/`y_location`: transcript coordinates in image/pixel space
 	- `feature_name`: gene or feature name of the transcript (e.g. `ACTB`)
-	- `overlaps_nucleus`: whether the transcript lies within the nucleus (boolean `0/1` or `true/false`)
+	- `overlaps_nucleus`: whether the transcript lies within the nucleus (boolean `0/1` or `true/false`).
+		- Note: The preprocessing step filters to cells that have both `overlaps_nucleus==0` and `==1`, so this column must be present for standard runs.
 - Example (CSV):
 	```csv
 	cell_id,x_location,y_location,feature_name,overlaps_nucleus
