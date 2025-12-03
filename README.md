@@ -100,19 +100,6 @@ Annotation (RAP‑X, enabled by default): normalize/log1p `adata2`, run HVGs + P
 
 ## Inputs
 
-CellScope expects three primary tabular inputs (CSV or Parquet):
-- `spatial`: per-transcript coordinates and gene identifiers, e.g. columns `x`, `y`, `gene`.
-- `cell-boundaries`: polygonal boundaries or masks for cells, e.g. `cell_id` with boundary definition.
-- `nucleus_boundaries`: polygonal boundaries or masks for nuclei, e.g. `cell_id` with nucleus boundary.
-
-Notes:
-- Column names can be configured via `CellScope/config/params.yaml`.
-- Input sampling previews (top-5 rows) are shown unless `--no-show-sample` is set.
-- Input formats are auto-detected; mismatches will be reported with a clear error message.
-
-
-## Outputs
-
 CellScope expects three primary tabular inputs (CSV or Parquet), with required columns as below.
 
 1) Transcripts table (`--spatial`)
@@ -163,13 +150,13 @@ Notes:
 - Column names are currently fixed as above; validation will error if any are missing.
 - CSV/Parquet are auto‑detected; top‑5 sampling previews print unless `--no-show-sample`.
 - Coordinates should be in the same reference frame for transcripts and boundaries.
-	--spatial test_data/test_transcripts_df.csv \
-	--cell-boundaries test_data/test_cell_boundaries_df.csv \
-	--nucleus-boundaries test_data/test_nucleus_boundaries_df.csv \
-	--out-dir test_out \
-	--resume-policy minimal \
-	--internal-progress
-```
+
+## Outputs
+
+- `adata1.h5ad`: per‑cell/metaspot table (after M4–M5).
+- `adata2.h5ad`: meta‑domain table (after M6–M8).
+- `final_data.csv|parquet`: transcript‑level results including clustering and annotation.
+- Intermediates include `preprocess_*.{csv,parquet}`, `module1_point_features.*`, `module2_point_df.*`, `module3_point_df.*`, `module8_dgi_*_curves.png`, `module5_domain_transcript_stats.*`, `module6_adata2_shape.*`, etc.
 
 Re-running the same command will reuse caches. Use `--dry-run-diff` to preview rerun stages.
 
