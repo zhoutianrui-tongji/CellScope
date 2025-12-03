@@ -6,16 +6,11 @@ Resumable pipeline for spatial transcriptomics with clear progress, YAML-driven 
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue) 
 ![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
 
-CellScope is a computational pipeline for high-resolution spatial transcriptomics. It computes per-transcript geometry and composition features, clusters transcripts within cells, aggregates meta-domains, builds fused expression/geometry graphs, and learns graph embeddings (DGI). Optional RAP‑X-based annotation maps clusters to subcellular compartments. The pipeline is modular, resumable, and configurable via YAML.
+CellScope is a computational pipeline for high-resolution spatial transcriptomics. It calculates the geometric and compositional characteristics of each transcript, aggregates transcripts within the cell, aggregates meta-domains, constructs fused expression/geometric graphs, and learns graph embeddings (DGI). Then map the meta-domains annotations to the subcellular compartments through the reference information. This pipeline is modular, recoverable and can be configured via YAML.
 
 ## Change Log
 
 See [CHANGELOG.md](../CHANGELOG.md).
-
-## System Requirements
-
-### Hardware
-- CPU is supported; GPU recommended for DGI training (Module 8).
 
 ### Operating System
 - Linux (tested on recent distros).
@@ -31,7 +26,7 @@ We recommend installing in a fresh conda environment:
 ```bash
 git clone https://github.com/your-org/CellScope.git
 cd CellScope
-conda create -n cellscope python=3.10 -y
+conda create -n cellscope python=3.9 -y
 conda activate cellscope
 pip install -r CellScope/requirements.txt
 pip install ./CellScope
