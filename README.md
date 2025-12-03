@@ -98,17 +98,71 @@ Annotation (RAP‑X, enabled by default): normalize/log1p `adata2`, run HVGs + P
 - State file: `out_dir/pipeline_state.json`.
 - Intermediates: `out_dir/<intermediate_dirname>/` (default `intermediate`).
 
+## Inputs
+
+CellScope expects three primary tabular inputs (CSV or Parquet):
+- `spatial`: per-transcript coordinates and gene identifiers, e.g. columns `x`, `y`, `gene`.
+- `cell-boundaries`: polygonal boundaries or masks for cells, e.g. `cell_id` with boundary definition.
+- `nucleus_boundaries`: polygonal boundaries or masks for nuclei, e.g. `cell_id` with nucleus boundary.
+
+Notes:
+- Column names can be configured via `CellScope/config/params.yaml`.
+- Input sampling previews (top-5 rows) are shown unless `--no-show-sample` is set.
+- Input formats are auto-detected; mismatches will be reported with a clear error message.
+
+
 ## Outputs
 
-- `adata1.h5ad`: per‑cell/metaspot table (after M4–M5).
-- `adata2.h5ad`: meta‑domain table (after M6–M8).
-- `final_data.csv|parquet`: transcript‑level results including clustering and annotation.
-- Intermediates include `preprocess_*.{csv,parquet}`, `module1_point_features.*`, `module2_point_df.*`, `module3_point_df.*`, `module8_dgi_*_curves.png`, `module5_domain_transcript_stats.*`, `module6_adata2_shape.*`, etc.
+CellScope expects three primary tabular inputs (CSV or Parquet), with required columns as below.
 
-## Quickstart (test data)
+1) Transcripts table (`--spatial`)
+- Required columns: `cell_id`, `x_location`, `y_location`, `feature_name`
+- Meaning:
+	- `cell_id`: the cell identifier each transcript belongs to
+	- `x_location`/`y_location`: transcript coordinates in image/pixel space
+	- `feature_name`: gene or feature name of the transcript (e.g. `ACTB`)
+- Example (CSV):
+	```csv
+	cell_id,x_location,y_location,feature_name
+	C001,102.3,55.8,ACTB
+	C001,98.1,60.2,GAPDH
+	C002,210.0,120.5,TUBB
+	```
 
-```bash
-python CellScope/bin/cellscope \
+2) Cell boundaries (`--cell-boundaries`)
+- Required columns: `cell_id`, `vertex_x`, `vertex_y`
+- Meaning:
+	- Each row is one polygon vertex of a cell boundary; vertices with the same `cell_id` are grouped to form the polygon.
+	- Vertex ordering should trace the boundary (clockwise or counter‑clockwise) for each `cell_id`.
+- Example (CSV):
+	```csv
+	cell_id,vertex_x,vertex_y
+	C001,90.0,40.0
+	C001,130.0,40.0
+	C001,130.0,80.0
+	C001,90.0,80.0
+	C002,200.0,100.0
+	C002,240.0,100.0
+	C002,240.0,140.0
+	C002,200.0,140.0
+	```
+
+3) Nucleus boundaries (`--nucleus-boundaries`)
+- Schema identical to cell boundaries: `cell_id`, `vertex_x`, `vertex_y`
+- Vertices with the same `cell_id` define the nucleus polygon of that cell.
+- Example (CSV):
+	```csv
+	cell_id,vertex_x,vertex_y
+	C001,100.0,50.0
+	C001,120.0,50.0
+	C001,120.0,70.0
+	C001,100.0,70.0
+	```
+
+Notes:
+- Column names are currently fixed as above; validation will error if any are missing.
+- CSV/Parquet are auto‑detected; top‑5 sampling previews print unless `--no-show-sample`.
+- Coordinates should be in the same reference frame for transcripts and boundaries.
 	--spatial test_data/test_transcripts_df.csv \
 	--cell-boundaries test_data/test_cell_boundaries_df.csv \
 	--nucleus-boundaries test_data/test_nucleus_boundaries_df.csv \

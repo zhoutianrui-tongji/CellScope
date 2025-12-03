@@ -2705,10 +2705,17 @@ def run_pipeline(
                             )
     except Exception:
         pass
-    # Suppress anndata FutureWarnings about deprecated io import paths
+    # Suppress warnings globally to avoid noisy output; only errors should surface
     try:
         import warnings as _warnings
+        _warnings.simplefilter("ignore")
+        _warnings.filterwarnings("ignore", category=FutureWarning)
+        _warnings.filterwarnings("ignore", category=UserWarning)
+        _warnings.filterwarnings("ignore", category=RuntimeWarning)
+        _warnings.filterwarnings("ignore", category=DeprecationWarning)
+        # Keep specific modules quiet as well
         _warnings.filterwarnings("ignore", category=FutureWarning, module=r"anndata.*")
+        _warnings.filterwarnings("ignore", category=FutureWarning, module=r"sklearn.utils.deprecation")
         # Filter common 3rd-party noisy warnings
         _warnings.filterwarnings("ignore", message=".*does not have many workers.*", category=UserWarning)
         _warnings.filterwarnings("ignore", message=".*Tensor Cores.*set `torch.set_float32_matmul_precision`.*", category=UserWarning)
