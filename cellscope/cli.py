@@ -1,5 +1,18 @@
 import sys
 import os
+try:
+    import warnings as _warnings
+    _warnings.simplefilter("ignore")
+    _warnings.filterwarnings("ignore", category=FutureWarning)
+    _warnings.filterwarnings("ignore", category=UserWarning)
+    _warnings.filterwarnings("ignore", category=RuntimeWarning)
+    _warnings.filterwarnings("ignore", category=DeprecationWarning)
+    # Silence noisy modules early
+    _warnings.filterwarnings("ignore", category=FutureWarning, module=r"anndata.*")
+    _warnings.filterwarnings("ignore", category=FutureWarning, module=r"sklearn.utils.deprecation")
+    os.environ.setdefault("PYTHONWARNINGS", "ignore")
+except Exception:
+    pass
 import click
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn

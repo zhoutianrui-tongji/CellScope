@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 import os
 import sys
+try:
+    import warnings as _warnings
+    _warnings.simplefilter("ignore")
+    _warnings.filterwarnings("ignore", category=FutureWarning)
+    _warnings.filterwarnings("ignore", category=UserWarning)
+    _warnings.filterwarnings("ignore", category=RuntimeWarning)
+    _warnings.filterwarnings("ignore", category=DeprecationWarning)
+    _warnings.filterwarnings("ignore", category=FutureWarning, module=r"sklearn.utils.deprecation")
+    os.environ.setdefault("PYTHONWARNINGS", "ignore")
+except Exception:
+    pass
 
 # Add repository root (one level up from this bin/) to sys.path
 repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))

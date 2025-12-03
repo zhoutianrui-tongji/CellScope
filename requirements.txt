@@ -1,5 +1,6 @@
 anndata>=0.10
 pandas>=1.5
+numpy>=1.24
 rich>=13
 click>=8
 pyarrow>=14
@@ -11,10 +12,13 @@ hdbscan>=0.8.33
 matplotlib>=3.7
 tqdm>=4.65
 scanpy>=1.9
+python-igraph>=0.11
+leidenalg>=0.10
 statsmodels>=0.14
 seaborn>=0.12
 umap-learn>=0.5
 lightning>=2.1
+PyYAML>=6.0
 # Deep learning + graph embeddings (required for Module 8 DGI)
 torch>=2.1
 torch-geometric>=2.5
