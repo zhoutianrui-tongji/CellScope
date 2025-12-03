@@ -1,24 +1,47 @@
 from typing import Optional, Literal, Tuple, List, Callable, cast, Dict, Any
 import os
 
-# Cap BLAS/OMP threads before importing numpy/scipy to prevent OpenBLAS crashes on >128 core hosts.
+# Configure BLAS/OMP threads before importing numpy/scipy.
+# Use a balanced default based on CPU cores, but allow user overrides via env.
+_cpu = os.cpu_count() or 8
+_threads_default = str(min(16, max(4, _cpu // 2)))
 _THREAD_ENV_DEFAULTS = {
-    "OPENBLAS_NUM_THREADS": "1",
-    "OMP_NUM_THREADS": "1",
-    "MKL_NUM_THREADS": "1",
-    "NUMEXPR_NUM_THREADS": "1",
-    "BLIS_NUM_THREADS": "1",
-    "VECLIB_MAXIMUM_THREADS": "1",
-    "ACCELERATE_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS", _threads_default),
+    "OMP_NUM_THREADS":      os.environ.get("OMP_NUM_THREADS", _threads_default),
+    "MKL_NUM_THREADS":      os.environ.get("MKL_NUM_THREADS", _threads_default),
+    "NUMEXPR_MAX_THREADS":  os.environ.get("NUMEXPR_MAX_THREADS", _threads_default),
+    "BLIS_NUM_THREADS":     os.environ.get("BLIS_NUM_THREADS", _threads_default),
+    "VECLIB_MAXIMUM_THREADS": os.environ.get("VECLIB_MAXIMUM_THREADS", _threads_default),
+    "ACCELERATE_NUM_THREADS": os.environ.get("ACCELERATE_NUM_THREADS", _threads_default),
 }
 for _k, _v in _THREAD_ENV_DEFAULTS.items():
-    os.environ.setdefault(_k, _v)
-del _THREAD_ENV_DEFAULTS, _k, _v
+    os.environ.setdefault(_k, str(_v))
+del _THREAD_ENV_DEFAULTS, _k, _v, _cpu, _threads_default
 
 import pandas as pd
 import numpy as np
 import anndata as ad
 from sklearn.neighbors import KDTree
+def _kdtree_query(points: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Build KDTree and query with tuned params; returns (indices, distances).
+    Points must be float32 array of shape (n, 2). k will be clamped to [1, n].
+    """
+    n = points.shape[0]
+    if n == 0:
+        return None, None
+    k = max(1, min(int(k), n))
+    leaf = max(20, min(64, n // 10 if n >= 100 else 20))
+    # breadth_first/sort_results improve determinism; avoid dualtree for small n
+    kdt = KDTree(points, leaf_size=leaf)
+    try:
+        dist, ind = kdt.query(points, k=k, return_distance=True, breadth_first=True, sort_results=True)
+    except TypeError:
+        # Fallback for older sklearn without options
+        dist, ind = kdt.query(points, k=k)
+    ind = np.asarray(ind)
+    if ind.dtype != np.int64:
+        ind = ind.astype(np.int64, copy=False)
+    return ind, dist
 from matplotlib.path import Path
 from sklearn.decomposition import TruncatedSVD
 from sklearn.preprocessing import StandardScaler
@@ -26,6 +49,26 @@ from sklearn.cluster import MiniBatchKMeans
 from sklearn.cluster import KMeans
 import scipy.sparse as sp
 import gc
+
+# Set Scanpy parallel jobs if available (non-intrusive performance tweak)
+try:
+    import scanpy as sc
+    sc.settings.n_jobs = max(1, int(os.environ.get("SCANPY_N_JOBS", "4")))
+except Exception:
+    pass
+
+# Lightweight helper to downcast numeric dtypes to reduce memory and improve speed
+def _downcast_numeric(df: pd.DataFrame) -> pd.DataFrame:
+    try:
+        for c in df.columns:
+            col = df[c]
+            if pd.api.types.is_float_dtype(col):
+                df[c] = col.astype(np.float32)
+            elif pd.api.types.is_integer_dtype(col):
+                df[c] = col.astype(np.int32)
+    except Exception:
+        pass
+    return df
 def _progress_iter(iterator, desc: str = "", total: Optional[int] = None, show: bool = False):
     """Terminal-friendly progress iterator with stage messages and ETA.
     - TTY: Rich single-line bar with ETA; prints start/done summaries.
@@ -455,13 +498,7 @@ def build_composition_embeddings(point_df: pd.DataFrame, transcripts_df: pd.Data
         pts = dfc[['x_location', 'y_location']].to_numpy(np.float32, copy=False)
         if len(pts) == 0:
             return None, None
-        kdt = KDTree(pts)
-        n = len(dfc)
-        k = min(K_NEI, n)
-        dist, ind = kdt.query(pts, k=k)
-        ind = np.asarray(ind)
-        if ind.dtype != np.int64:
-            ind = ind.astype(np.int64, copy=False)
+        ind, dist = _kdtree_query(pts, k=min(K_NEI, len(dfc)))
         return ind, dist
 
     def _nei_bow_for_indices(
@@ -469,14 +506,14 @@ def build_composition_embeddings(point_df: pd.DataFrame, transcripts_df: pd.Data
         ind_mat: np.ndarray,
         dist_mat: np.ndarray = None,
         weight_mode: str = 'gaussian',
-    ) -> np.ndarray:
-        """Vectorized neighborhood BoW with optional distance weights.
+    ) -> sp.csr_matrix:
+        """Vectorized neighborhood BoW with optional distance weights (sparse CSR).
         weight_mode: 'gaussian' | 'inv' | 'uniform'
         """
         G = len(vocab_genes)
         n = len(dfc)
         if n == 0 or G == 0:
-            return np.zeros((n, G), dtype=np.float32)
+            return sp.csr_matrix((n, G), dtype=np.float32)
 
         gene_idx = (
             dfc['feature_name']
@@ -520,7 +557,7 @@ def build_composition_embeddings(point_df: pd.DataFrame, transcripts_df: pd.Data
 
         valid = (nei_flat >= 0) & (nei_flat < n)
         if not valid.any():
-            return np.zeros((n, G), dtype=np.float32)
+            return sp.csr_matrix((n, G), dtype=np.float32)
         nei_flat = nei_flat[valid]
         row_idx = row_idx[valid]
         w_flat = w_flat[valid]
@@ -528,15 +565,15 @@ def build_composition_embeddings(point_df: pd.DataFrame, transcripts_df: pd.Data
         gi_flat = gene_idx[nei_flat]
         gene_valid = (gi_flat >= 0) & (gi_flat < G)
         if not gene_valid.any():
-            return np.zeros((n, G), dtype=np.float32)
+            return sp.csr_matrix((n, G), dtype=np.float32)
 
         gi_flat = gi_flat[gene_valid]
         row_idx = row_idx[gene_valid]
         w_flat = w_flat[gene_valid]
 
-        bow = np.zeros((n, G), dtype=np.float32)
-        np.add.at(bow, (row_idx, gi_flat), w_flat.astype(np.float32, copy=False))
-        return bow
+        # Build sparse BoW via COO then convert to CSR
+        bow = sp.coo_matrix((w_flat.astype(np.float32, copy=False), (row_idx, gi_flat)), shape=(n, G))
+        return bow.tocsr()
     # Sample to build SVD training set
     RANDOM_STATE = 42
     rng = np.random.default_rng(RANDOM_STATE)
@@ -557,11 +594,11 @@ def build_composition_embeddings(point_df: pd.DataFrame, transcripts_df: pd.Data
             return None
         bow = _nei_bow_for_indices(dfc, ind, dist, weight_mode=BOW_WEIGHT_MODE)
         if TF_NORM:
-            row_sum = bow.sum(1, dtype=np.float32)
+            row_sum = np.asarray(bow.sum(1)).ravel().astype(np.float32)
             row_sum[row_sum == 0] = 1.0
-            tf = (bow / row_sum[:, None]).astype(np.float32, copy=False)
+            tf = bow.multiply(1.0 / row_sum[:, None]).tocsr()
         else:
-            tf = bow.astype(np.float32, copy=False)
+            tf = bow.tocsr()
         if tf.shape[0] > MAX_ROWS_PER_CELL_FOR_SVD:
             idx_loc = rng.choice(tf.shape[0], size=MAX_ROWS_PER_CELL_FOR_SVD, replace=False)
             tf = tf[idx_loc]
@@ -587,10 +624,10 @@ def build_composition_embeddings(point_df: pd.DataFrame, transcripts_df: pd.Data
 
     if len(bow_samples) == 0:
         raise RuntimeError('SVD samples empty.')
-    B_sample = np.vstack(bow_samples).astype(np.float32, copy=False)
-    # Optional TF-IDF reweighting for SVD
-    if USE_TFIDF and B_sample.size > 0:
-        df_vec = (B_sample > 0).sum(axis=0).astype(np.float32)
+    B_sample = sp.vstack(bow_samples, format='csr', dtype=np.float32)
+    # Optional TF-IDF reweighting for SVD (sparse)
+    if USE_TFIDF and B_sample.shape[0] > 0:
+        df_vec = np.asarray(B_sample.getnnz(axis=0), dtype=np.float32)
         N_rows = float(B_sample.shape[0])
         if IDF_MODE == 'none':
             idf_vec = np.ones_like(df_vec, dtype=np.float32)
@@ -598,7 +635,7 @@ def build_composition_embeddings(point_df: pd.DataFrame, transcripts_df: pd.Data
             idf_vec = np.log(np.maximum(N_rows / np.maximum(df_vec, 1.0), 1.0)).astype(np.float32)
         else:  # 'log1p'
             idf_vec = np.log1p(N_rows / (1.0 + df_vec)).astype(np.float32)
-        B_sample = (B_sample * idf_vec[None, :]).astype(np.float32, copy=False)
+        B_sample = B_sample.multiply(idf_vec[np.newaxis, :]).tocsr()
     svd_local = TruncatedSVD(n_components=N_COMP, random_state=RANDOM_STATE)
     svd_local.fit(B_sample)
 
@@ -616,14 +653,15 @@ def build_composition_embeddings(point_df: pd.DataFrame, transcripts_df: pd.Data
             return None
         bow = _nei_bow_for_indices(dfc, ind, dist, weight_mode=BOW_WEIGHT_MODE)
         if TF_NORM:
-            row_sum = bow.sum(1, dtype=np.float32)
+            row_sum = np.asarray(bow.sum(1)).ravel().astype(np.float32)
             row_sum[row_sum == 0] = 1.0
-            tf = (bow / row_sum[:, None]).astype(np.float32, copy=False)
+            tf = bow.multiply(1.0 / row_sum[:, None]).tocsr()
         else:
-            tf = bow.astype(np.float32, copy=False)
+            tf = bow.tocsr()
         if USE_TFIDF:
             # Use same IDF as fitted on the sample
-            Z = svd_local.transform(tf * idf_vec[None, :]).astype(np.float32, copy=False)
+            tfidf = tf.multiply(idf_vec[np.newaxis, :]).tocsr()
+            Z = svd_local.transform(tfidf).astype(np.float32, copy=False)
         else:
             Z = svd_local.transform(tf).astype(np.float32, copy=False)
         k_used = min(K_NEI, len(dfc))
@@ -698,12 +736,15 @@ def per_cell_clustering(
     point_df: pd.DataFrame,
     gmm_cols: List[str],
     show_internal_progress: bool = False,
-    hdbscan_min_cluster_size: int = 10,
+    hdbscan_min_cluster_size: int = 6,
     hdbscan_allow_single_cluster: bool = True,
-    hdbscan_min_samples_frac: float = 0.5,
+    hdbscan_min_samples_frac: float = 0.3,
+    target_sub_size: int = 12,
+    n_feat_hdb: int = 24,
     kmeans_min_k: int = 2,
-    kmeans_max_k: int = 6,
-    merge_min_size: int = 25,
+    kmeans_max_k: int = 999,
+    use_k_cap: bool = False,
+    merge_min_size: Optional[int] = None,
 ) -> pd.DataFrame:
     try:
         import hdbscan  # lazy import
@@ -711,7 +752,8 @@ def per_cell_clustering(
         raise ImportError("hdbscan is required. Please install via: pip install hdbscan") from e
 
     MIN_SUB_PTS = int(hdbscan_min_cluster_size)
-    TARGET_SUB_SIZE = int(hdbscan_min_cluster_size)
+    # 使用更小的目标簇大小以促进细分，且不与最小簇大小绑定
+    TARGET_SUB_SIZE = max(8, int(target_sub_size))
     K_CAP_BASE = 999
     MIN_SAMPLES_FRAC = float(hdbscan_min_samples_frac)
 
@@ -720,30 +762,36 @@ def per_cell_clustering(
     X_gmm_sample[~np.isfinite(X_gmm_sample)] = 0.0
     feat_var = X_gmm_sample.var(axis=0)
     order = np.argsort(-feat_var)
-    N_FEAT_HDB = min(16, len(gmm_cols))
+    N_FEAT_HDB = min(int(n_feat_hdb), len(gmm_cols))
     idx_use = order[:N_FEAT_HDB]
     feat_for_hdb = [gmm_cols[i] for i in idx_use]
     del X_gmm_sample, feat_var, order
     gc.collect()
 
     def _decide_K_min(n: int) -> int:
+        # 更积极的最低簇数下界
         if n >= 6 * MIN_SUB_PTS:
-            return 3
+            return 4
         elif n >= 4 * MIN_SUB_PTS:
+            return 3
+        elif n >= 3 * MIN_SUB_PTS:
             return 2
         else:
             return 1
 
     def _decide_K_for_cell(n: int) -> int:
-        if n < MIN_SUB_PTS * 1.5:
+        if n < MIN_SUB_PTS * 1.2:
             return 1
         k_by_size = max(1, n // MIN_SUB_PTS)
-        k_target = max(1, int(round(n / float(TARGET_SUB_SIZE))))
+        k_target = max(1, int(np.ceil(n / float(TARGET_SUB_SIZE))))
         k_cap = min(K_CAP_BASE, k_by_size)
         K = min(k_target, k_cap)
         K = max(_decide_K_min(n), K)
-        # clamp by configured bounds
-        K = max(int(kmeans_min_k), min(int(kmeans_max_k), int(K)))
+        if n >= 8 * MIN_SUB_PTS:
+            K = max(K, _decide_K_min(n) + 1)
+        # Optional clamp by configured bounds
+        if bool(use_k_cap):
+            K = max(int(kmeans_min_k), min(int(kmeans_max_k), int(K)))
         return int(max(1, K))
 
     def _merge_small_clusters(labels: np.ndarray, X: np.ndarray, min_size: int) -> np.ndarray:
@@ -810,7 +858,7 @@ def per_cell_clustering(
         if Xz.shape[1] == 0 or not np.any(good):
             X_coord = g[['x_location', 'y_location']].to_numpy(np.float32, copy=False)
             Xz, _ = _safe_standardize(X_coord)
-        min_samples = max(5, int(round(MIN_SUB_PTS * MIN_SAMPLES_FRAC)))
+        min_samples = max(3, int(round(MIN_SUB_PTS * MIN_SAMPLES_FRAC)))
         clusterer = hdbscan.HDBSCAN(
             min_cluster_size=MIN_SUB_PTS,
             min_samples=min_samples,
@@ -830,19 +878,21 @@ def per_cell_clustering(
         use_fallback = False
         if n_clusters == 0:
             use_fallback = True
-        elif (n_clusters < K_min) and (n >= 2 * MIN_SUB_PTS):
+        elif (n_clusters < K_min) and (n >= int(1.5 * MIN_SUB_PTS)):
             use_fallback = True
         if use_fallback:
             K_init = _decide_K_for_cell(n)
             if K_init <= 1:
                 labels = np.zeros(n, dtype=np.int32)
             else:
-                km = KMeans(n_clusters=K_init, n_init='auto', random_state=42, max_iter=100)
+                km = KMeans(n_clusters=K_init, n_init='auto', random_state=42, max_iter=200)
                 labels = km.fit_predict(Xz).astype(np.int32)
-            labels = _merge_small_clusters(labels, Xz, min_size=int(merge_min_size))
+            _min_size = int(merge_min_size) if merge_min_size is not None else int(MIN_SUB_PTS)
+            labels = _merge_small_clusters(labels, Xz, min_size=_min_size)
             return cid, pd.Series(labels, index=g.index, dtype=np.int32)
         labels = _assign_noise_to_nearest(hdb_labels, Xz)
-        labels = _merge_small_clusters(labels, Xz, min_size=int(merge_min_size))
+        _min_size = int(merge_min_size) if merge_min_size is not None else int(MIN_SUB_PTS)
+        labels = _merge_small_clusters(labels, Xz, min_size=_min_size)
         return cid, pd.Series(labels, index=g.index, dtype=np.int32)
 
     from joblib import Parallel, delayed
@@ -1526,20 +1576,28 @@ def build_module7_graph(
             return Z, "SVD(fallback)", {"n_components": int(n_latent), "tfidf": True}
 
     def _build_knn_connectivities_by_scanpy(adata: ad.AnnData, rep_key: str, n_neighbors: int = 20) -> sp.csr_matrix:
-        try:
-            import scanpy as sc
-            sc.pp.neighbors(adata, n_neighbors=n_neighbors, use_rep=rep_key, method='umap', key_added=f'{rep_key}_nbrs')
-            C = adata.obsp[f'{rep_key}_nbrs_connectivities'].tocsr().astype(np.float32)
-            C = ((C + C.T) * 0.5).tocsr()
-            C.eliminate_zeros(); C.sort_indices()
-            return C
-        except Exception:
-            # Fallback: symmetric kNN connectivity
-            # Use conservative parallelism to avoid oversubscription
-            G_ex = kneighbors_graph(adata.obsm[rep_key], n_neighbors=n_neighbors, mode='connectivity', include_self=False, n_jobs=_preferred_n_jobs())
-            A = G_ex.maximum(G_ex.T).astype(np.float32).tocsr()
-            A.eliminate_zeros(); A.sort_indices()
-            return A
+            # Prefer sklearn kneighbors_graph for performance; fallback to scanpy
+            try:
+                G_ex = kneighbors_graph(adata.obsm[rep_key], n_neighbors=n_neighbors, mode='connectivity', include_self=False, n_jobs=_preferred_n_jobs())
+                A = G_ex.maximum(G_ex.T).astype(np.float32).tocsr()
+                A.eliminate_zeros(); A.sort_indices()
+                return A
+            except Exception as e:
+                _logging.getLogger("cellscope").warning(f"kneighbors_graph failed: {e}; falling back to scanpy.pp.neighbors.")
+                try:
+                    import scanpy as sc
+                    sc.pp.neighbors(adata, n_neighbors=n_neighbors, use_rep=rep_key, method='umap', key_added=f'{rep_key}_nbrs')
+                    C = adata.obsp.get(f'{rep_key}_nbrs_connectivities', None)
+                    if C is None:
+                        C = adata.obsp['connectivities']
+                    C = C.tocsr().astype(np.float32)
+                    C = ((C + C.T) * 0.5).tocsr()
+                    C.eliminate_zeros(); C.sort_indices()
+                    return C
+                except Exception as e2:
+                    _logging.getLogger("cellscope").error(f"scanpy neighbors failed: {e2}; returning empty CSR.")
+                    n = adata.n_obs
+                    return sp.csr_matrix((n, n), dtype=np.float32)
 
     def _row_topk_csr(A: sp.csr_matrix, k: int = 16) -> sp.csr_matrix:
         A = A.tocsr().astype(np.float32, copy=False)
@@ -2082,12 +2140,15 @@ def build_anndata(spatial_df: pd.DataFrame,
             pass
     # Module 3: per-cell clustering
     # Read Module 3 clustering options from YAML
-    _m3_hdb_min = 10
+    _m3_hdb_min = 6
     _m3_allow_single = True
-    _m3_min_samples_frac = 0.5
+    _m3_min_samples_frac = 0.3
+    _m3_target_sub_size = 12
+    _m3_n_feat_hdb = 24
     _m3_kmeans_min_k = 2
-    _m3_kmeans_max_k = 6
-    _m3_merge_min = 25
+    _m3_kmeans_max_k = 999
+    _m3_use_k_cap = False
+    _m3_merge_min = None
     try:
         _cfg = load_params_yaml()
         _m3 = _cfg.get('module3', {}) if _cfg else {}
@@ -2097,12 +2158,18 @@ def build_anndata(spatial_df: pd.DataFrame,
             _m3_allow_single = bool(_m3.get('hdbscan_allow_single_cluster'))
         if isinstance(_m3.get('hdbscan_min_samples_frac'), (int, float)):
             _m3_min_samples_frac = float(_m3.get('hdbscan_min_samples_frac'))
+            _m3_target_sub_size = int(_m3.get('target_sub_size')) if _m3.get('target_sub_size') is not None else _m3_target_sub_size
+            _m3_n_feat_hdb = int(_m3.get('n_feat_hdb')) if _m3.get('n_feat_hdb') is not None else _m3_n_feat_hdb
         if isinstance(_m3.get('kmeans_min_k'), (int, float)):
             _m3_kmeans_min_k = int(_m3.get('kmeans_min_k'))
         if isinstance(_m3.get('kmeans_max_k'), (int, float)):
             _m3_kmeans_max_k = int(_m3.get('kmeans_max_k'))
-        if isinstance(_m3.get('merge_min_size'), (int, float)):
-            _m3_merge_min = int(_m3.get('merge_min_size'))
+        if 'use_k_cap' in _m3:
+            _m3_use_k_cap = bool(_m3.get('use_k_cap'))
+        # allow null (None) to mean: use MIN_SUB_PTS for merging
+        if 'merge_min_size' in _m3:
+            val = _m3.get('merge_min_size')
+            _m3_merge_min = int(val) if isinstance(val, (int, float)) else None
     except Exception:
         pass
     import time as _time
@@ -2126,8 +2193,11 @@ def build_anndata(spatial_df: pd.DataFrame,
                 hdbscan_min_cluster_size=_m3_hdb_min,
                 hdbscan_allow_single_cluster=_m3_allow_single,
                 hdbscan_min_samples_frac=_m3_min_samples_frac,
+                target_sub_size=_m3_target_sub_size,
+                n_feat_hdb=_m3_n_feat_hdb,
                 kmeans_min_k=_m3_kmeans_min_k,
                 kmeans_max_k=_m3_kmeans_max_k,
+                use_k_cap=_m3_use_k_cap,
                 merge_min_size=_m3_merge_min,
             )
             _save_dataframe(point_df, out_dir, "module3_point_df")
@@ -2140,8 +2210,11 @@ def build_anndata(spatial_df: pd.DataFrame,
             hdbscan_min_cluster_size=_m3_hdb_min,
             hdbscan_allow_single_cluster=_m3_allow_single,
             hdbscan_min_samples_frac=_m3_min_samples_frac,
+            target_sub_size=_m3_target_sub_size,
+            n_feat_hdb=_m3_n_feat_hdb,
             kmeans_min_k=_m3_kmeans_min_k,
             kmeans_max_k=_m3_kmeans_max_k,
+            use_k_cap=_m3_use_k_cap,
             merge_min_size=_m3_merge_min,
         )
         _save_dataframe(point_df, out_dir, "module3_point_df")
@@ -2494,6 +2567,61 @@ def build_anndata(spatial_df: pd.DataFrame,
 def _checkpoint_path(out_dir: str, name: str) -> str:
     return os.path.join(out_dir, f".{name}.parquet")
 
+# Global I/O switches for intermediates, set by run_pipeline and/or params.yaml
+_WRITE_INTERMEDIATE: Optional[bool] = None
+_LITE_INTERMEDIATE: Optional[bool] = None
+_WRITE_FIGURES: Optional[bool] = None
+
+def _io_should_write_intermediate() -> bool:
+    """Decide whether to write intermediate artifacts.
+
+    Priority:
+      1) explicit global override set by run_pipeline
+      2) io.write_intermediate (if present in params.yaml)
+      3) io.keep_intermediate (legacy semantics; False disables writing)
+      4) default True
+    """
+    global _WRITE_INTERMEDIATE
+    if _WRITE_INTERMEDIATE is not None:
+        return bool(_WRITE_INTERMEDIATE)
+    try:
+        _cfg = load_params_yaml()
+        io_cfg = _cfg.get('io', {}) if _cfg else {}
+        if 'write_intermediate' in io_cfg:
+            return bool(io_cfg.get('write_intermediate'))
+        if 'keep_intermediate' in io_cfg:
+            return bool(io_cfg.get('keep_intermediate'))
+    except Exception:
+        pass
+    return True
+
+def _io_should_write_figures() -> bool:
+    """Decide whether to write figures (PNG).
+
+    Priority:
+      1) explicit global override set by run_pipeline
+      2) io.write_intermediate_figures (params.yaml)
+      3) annotation.save_plots (best-effort if present)
+      4) default True
+    Note: figures are allowed even if other intermediates are disabled.
+    """
+    global _WRITE_FIGURES
+    if _WRITE_FIGURES is not None:
+        return bool(_WRITE_FIGURES)
+    allow = True
+    try:
+        _cfg = load_params_yaml()
+        io_cfg = _cfg.get('io', {}) if _cfg else {}
+        if 'write_intermediate_figures' in io_cfg:
+            allow = bool(io_cfg.get('write_intermediate_figures'))
+        # fall back to annotation.save_plots if provided
+        ann_cfg = _cfg.get('annotation', {}) if _cfg else {}
+        if 'save_plots' in ann_cfg:
+            allow = allow and bool(ann_cfg.get('save_plots'))
+    except Exception:
+        pass
+    return allow
+
 def _intermediate_dir(out_dir: str) -> str:
     """Return the path to the intermediate directory, configurable via params.yaml.
 
@@ -2511,6 +2639,9 @@ def _intermediate_dir(out_dir: str) -> str:
 
 def _save_dataframe(df: pd.DataFrame, out_dir: str, name: str):
     """Save a dataframe as CSV/Parquet according to io flags in params.yaml."""
+    # Respect global/io switch: do nothing if disabled
+    if not _io_should_write_intermediate():
+        return
     base = _intermediate_dir(out_dir)
     write_csv = True
     write_pq = True
@@ -2614,6 +2745,8 @@ def _save_state(out_dir: str, last_completed: str, extra: Optional[dict] = None)
         pass
 
 def _save_adata(adata: ad.AnnData, out_dir: str, name: str, compression: str = "lzf"):
+    if not _io_should_write_intermediate():
+        return
     try:
         p = os.path.join(_intermediate_dir(out_dir), f"{name}.h5ad")
         try:
@@ -2631,6 +2764,8 @@ def _save_adata(adata: ad.AnnData, out_dir: str, name: str, compression: str = "
         pass
 
 def _save_fig(fig, out_dir: str, name: str):
+    if not _io_should_write_figures():
+        return
     try:
         p = os.path.join(_intermediate_dir(out_dir), f"{name}.png")
         fig.savefig(p, bbox_inches='tight', dpi=150)
@@ -2682,6 +2817,15 @@ def run_pipeline(
             compression = str(io_cfg.get('h5ad_compression'))
         if 'lite_intermediate' in io_cfg:
             lite_intermediate = bool(io_cfg.get('lite_intermediate'))
+        # New: allow disabling intermediate persistence via YAML
+        # Priority: write_intermediate (if present) > keep_intermediate (legacy)
+        if 'write_intermediate' in io_cfg:
+            save_intermediate = bool(io_cfg.get('write_intermediate'))
+        elif 'keep_intermediate' in io_cfg:
+            ki = bool(io_cfg.get('keep_intermediate'))
+            # when keep_intermediate is False, we disable saving intermediates
+            if not ki:
+                save_intermediate = False
         # Allow YAML resume_from
         if cfg and isinstance(io_cfg.get('resume_from'), (str, type(None))):
             rf = (io_cfg.get('resume_from') or '').strip()
@@ -2691,11 +2835,32 @@ def run_pipeline(
             resume_policy = str(io_cfg.get('resume_policy')).lower()
     except Exception:
         pass
+    # Set global I/O switches for helpers
+    try:
+        global _WRITE_INTERMEDIATE, _LITE_INTERMEDIATE, _WRITE_FIGURES
+        _WRITE_INTERMEDIATE = bool(save_intermediate)
+        _LITE_INTERMEDIATE = bool(lite_intermediate)
+        # Figures default to True unless explicitly disabled
+        if 'write_intermediate_figures' in (io_cfg or {}):
+            _WRITE_FIGURES = bool(io_cfg.get('write_intermediate_figures'))
+        else:
+            _WRITE_FIGURES = True
+        # Respect annotation.save_plots if present
+        try:
+            ann_cfg = cfg.get('annotation', {}) if cfg else {}
+            if 'save_plots' in ann_cfg and _WRITE_FIGURES is not None:
+                _WRITE_FIGURES = _WRITE_FIGURES and bool(ann_cfg.get('save_plots'))
+        except Exception:
+            pass
+    except Exception:
+        pass
     # Cap BLAS/OMP threads to avoid OpenBLAS NUM_THREADS crash on many-core hosts
     try:
         os.environ.setdefault("OPENBLAS_NUM_THREADS", "64")
         os.environ.setdefault("MKL_NUM_THREADS",     "1")
         os.environ.setdefault("OMP_NUM_THREADS",     "1")
+        os.environ.setdefault("NUMEXPR_MAX_THREADS", "64")
+        os.environ.setdefault("NUMEXPR_NUM_THREADS", "16")
         # Silence JAX GPU reminder by forcing CPU backend
         os.environ.setdefault("JAX_PLATFORM_NAME",    "cpu")
         os.environ.setdefault("JAX_PLATFORMS",        "cpu")
@@ -2912,6 +3077,22 @@ def run_pipeline(
                 dgi_epochs=dgi_epochs,
                 enable_dgi_sage=enable_dgi_sage,
             )
+            # Optional: prune final_data columns to reduce redundancy per config
+            try:
+                _cfg = load_params_yaml()
+                _io_cfg = (_cfg.get('io', {}) if _cfg else {})
+            except Exception:
+                _io_cfg = {}
+            drop_embeddings = bool(_io_cfg.get('drop_embeddings', False))
+            keep_cols = _io_cfg.get('final_keep_columns', None)
+            if isinstance(keep_cols, list) and len(keep_cols) > 0:
+                existing = [c for c in keep_cols if c in final_data.columns]
+                if len(existing) > 0:
+                    final_data = final_data.loc[:, existing]
+            elif drop_embeddings:
+                # Drop large embedding columns when requested
+                drop_prefixes = ("comp_emb", "gmm_feat_", "X_", "Z_", "umap_")
+                final_data = final_data[[c for c in final_data.columns if not any(str(c).startswith(p) for p in drop_prefixes)]]
             persist_build = (save_intermediate and not lite_intermediate) or resume_enabled
             if persist_build:
                 try:
@@ -3151,9 +3332,25 @@ def _normalize_and_cluster_adata2(
         chosen_key = 'pca_nbrs'
     # Future-proof: igraph flavor
     try:
-        sc.tl.leiden(adata2, neighbors_key=chosen_key, key_added='domain_type', resolution=float(leiden_resolution), flavor='igraph', n_iterations=2, directed=False)
+        try:
+            sc.tl.leiden(adata2, neighbors_key=chosen_key, key_added='domain_type', resolution=float(leiden_resolution), flavor='igraph', n_iterations=2, directed=False)
+        except Exception as e:
+            _logging.getLogger("cellscope").warning(f"Leiden(igraph) failed: {e}; falling back to 'leidenalg' flavor.")
+            try:
+                sc.tl.leiden(adata2, neighbors_key=chosen_key, key_added='domain_type', resolution=float(leiden_resolution), flavor='leidenalg', n_iterations=2, directed=False)
+            except Exception as e2:
+                _logging.getLogger("cellscope").error(f"Leiden fallback failed: {e2}; skipping clustering and setting 'domain_type' to 'unknown'.")
+                adata2.obs['domain_type'] = 'unknown'
     except Exception:
-        sc.tl.leiden(adata2, neighbors_key=chosen_key, key_added='domain_type', resolution=float(leiden_resolution))
+        try:
+            sc.tl.leiden(adata2, neighbors_key=chosen_key, key_added='domain_type', resolution=float(leiden_resolution))
+        except Exception as e:
+            _logging.getLogger("cellscope").warning(f"Leiden(default) failed: {e}; trying 'leidenalg' flavor.")
+            try:
+                sc.tl.leiden(adata2, neighbors_key=chosen_key, key_added='domain_type', resolution=float(leiden_resolution), flavor='leidenalg')
+            except Exception as e2:
+                _logging.getLogger("cellscope").error(f"Leiden fallback failed: {e2}; skipping clustering and setting 'domain_type' to 'unknown'.")
+                adata2.obs['domain_type'] = 'unknown'
     # alias for RAP-X
     adata2.obs['leiden'] = adata2.obs['domain_type'].astype(str)
     # Optional UMAP visualization saved to intermediate (use chosen neighbors)

@@ -34,7 +34,7 @@ _BUILD_STAGE_KEYS: Tuple[str, ...] = (
     # Module 2
     'module2.top_g','module2.bow_knn_k','module2.max_rows_per_cell_for_svd','module2.max_svd_rows','module2.svd_n_components','module2.bow_weight_mode','module2.use_tfidf','module2.tf_norm','module2.parallel_chunk_cells',
     # Module 3
-    'module3.hdbscan_min_cluster_size','module3.hdbscan_allow_single_cluster','module3.hdbscan_min_samples_frac','module3.kmeans_min_k','module3.kmeans_max_k','module3.merge_min_size',
+    'module3.hdbscan_min_cluster_size','module3.hdbscan_allow_single_cluster','module3.hdbscan_min_samples_frac','module3.target_sub_size','module3.n_feat_hdb','module3.kmeans_min_k','module3.kmeans_max_k','module3.use_k_cap','module3.merge_min_size',
     # Module 5
     'module5.block_size',
     'module5.w_gc','module5.w_expr','module5.w_sp','module5.use_gc','module5.use_expr',
@@ -81,7 +81,7 @@ MODULE_PARAM_MAP: Dict[str, Tuple[str, ...]] = {
         'module2.top_g','module2.bow_knn_k','module2.max_rows_per_cell_for_svd','module2.max_svd_rows','module2.svd_n_components','module2.bow_weight_mode','module2.use_tfidf','module2.tf_norm','module2.parallel_chunk_cells',
     ),
     'm3': (
-        'module3.hdbscan_min_cluster_size','module3.hdbscan_allow_single_cluster','module3.hdbscan_min_samples_frac','module3.kmeans_min_k','module3.kmeans_max_k','module3.merge_min_size',
+        'module3.hdbscan_min_cluster_size','module3.hdbscan_allow_single_cluster','module3.hdbscan_min_samples_frac','module3.target_sub_size','module3.n_feat_hdb','module3.kmeans_min_k','module3.kmeans_max_k','module3.use_k_cap','module3.merge_min_size',
     ),
     # m4 builds adata1 from point features; no direct params, but depends on m1..m3
     'm5': (

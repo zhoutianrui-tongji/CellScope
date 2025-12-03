@@ -19,6 +19,9 @@ seaborn>=0.12
 umap-learn>=0.5
 lightning>=2.1
 PyYAML>=6.0
+# Optional performance accelerators (recommended)
+pynndescent>=0.5
+numba>=0.58
 # Deep learning + graph embeddings (required for Module 8 DGI)
 torch>=2.1
 torch-geometric>=2.5

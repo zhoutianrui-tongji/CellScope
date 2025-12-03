@@ -7,6 +7,9 @@ io:
   lite_intermediate: true
   write_intermediate_csv: true
   write_intermediate_parquet: false
+  write_intermediate_figures: true
+  drop_embeddings: true
+  keep_intermediate: false
 
 annotation:
   enable: true
@@ -14,8 +17,8 @@ annotation:
   spatial_channel: false
   leiden_resolution: 1.0
   hvg_n_top_genes: 2000
-  pca_n_comps: 25
-  neighbors_k: 15
+  pca_n_comps: 32
+  neighbors_k: 32
   umap_min_dist: 0.3
   umap_spread: 1.0
   umap_prefix: rapx_umap
@@ -45,12 +48,15 @@ module2:
   parallel_chunk_cells: 128
 
 module3:
-  hdbscan_min_cluster_size: 20
+  hdbscan_min_cluster_size: 6
   hdbscan_allow_single_cluster: true
-  hdbscan_min_samples_frac: 0.5
+  hdbscan_min_samples_frac: 0.3
+  target_sub_size: 12
+  n_feat_hdb: 32
   kmeans_min_k: 2
-  kmeans_max_k: 6
-  merge_min_size: 25
+  kmeans_max_k: 100
+  use_k_cap: false
+  merge_min_size: null    # 若为 null，则按 MIN_SUB_PTS 合并小簇（推荐）
 
 module5:
   block_size: 50000
@@ -86,7 +92,7 @@ module6:
   save_shape_summary: true
 
 module7:
-  scvi_epochs: 100
+  scvi_epochs: 200
   scvi_n_latent: 32
   scvi_lr: 0.001
   scvi_batch_size: 1024
@@ -112,10 +118,10 @@ module8:
   dgi_clip_grad: 1.0
 
 runtime:
-  n_jobs: 8
+  n_jobs: 16
   joblib_backend: threading
   blas_threads: 32
-  neighbors_n_jobs: 8
+  neighbors_n_jobs: 16
   use_threadpoolctl: true
 
 ui:
