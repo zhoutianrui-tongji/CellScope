@@ -103,17 +103,18 @@ Annotation (RAP‑X, enabled by default): normalize/log1p `adata2`, run HVGs + P
 CellScope expects three primary tabular inputs (CSV or Parquet), with required columns as below.
 
 1) Transcripts table (`--spatial`)
-- Required columns: `cell_id`, `x_location`, `y_location`, `feature_name`
+- Required columns: `cell_id`, `x_location`, `y_location`, `feature_name`, `overlaps_nucleus`
 - Meaning:
 	- `cell_id`: the cell identifier each transcript belongs to
 	- `x_location`/`y_location`: transcript coordinates in image/pixel space
 	- `feature_name`: gene or feature name of the transcript (e.g. `ACTB`)
+	- `overlaps_nucleus`: whether the transcript lies within the nucleus (boolean `0/1` or `true/false`)
 - Example (CSV):
 	```csv
-	cell_id,x_location,y_location,feature_name
-	C001,102.3,55.8,ACTB
-	C001,98.1,60.2,GAPDH
-	C002,210.0,120.5,TUBB
+	cell_id,x_location,y_location,feature_name,overlaps_nucleus
+	C001,102.3,55.8,ACTB,0
+	C001,98.1,60.2,GAPDH,1
+	C002,210.0,120.5,TUBB,0
 	```
 
 2) Cell boundaries (`--cell-boundaries`)
