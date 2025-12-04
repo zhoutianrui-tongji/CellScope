@@ -4,6 +4,8 @@ Unsupervised subcellular clustering and annotation for high-resolution Spatial T
 
 CellScope is a computational pipeline for cell identification and subcellular annotation on high-resolution spatial transcriptomics data. It supports sequencing-based technologies (e.g., Stereo-seq, Seq-Scope) and imaging-based technologies (e.g., seqFISH+, Xenium). The repository provides a CLI and a configurable, modular pipeline with resume and lightweight checkpoints.
 
+![Pipeline overview](./src/CellScope_workflow.png)
+
 ## System Requirements
 **Operating System**: Linux (tested on Rocky Linux 9.4)
 
