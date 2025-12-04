@@ -35,7 +35,7 @@ cd CellScope
 conda create -n cellscope-env python=3.9
 conda activate cellscope-env
 pip install -r requirements.txt
-pip install .
+pip install -e .
 ```
 
 ## Documentation
