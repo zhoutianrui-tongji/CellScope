@@ -1,6 +1,6 @@
 # CellScope
 
-Cell identification and subcellular annotation for high-resolution Spatial Transcriptomics
+Unsupervised subcellular clustering and annotation for high-resolution Spatial Transcriptomics
 
 CellScope is a computational pipeline for cell identification and subcellular annotation on high-resolution spatial transcriptomics data. It supports sequencing-based technologies (e.g., Stereo-seq, Seq-Scope) and imaging-based technologies (e.g., seqFISH+, Xenium). The repository provides a CLI and a configurable, modular pipeline with resume and lightweight checkpoints.
 
@@ -31,9 +31,9 @@ See `requirements.txt` for the full list.
 ### Recommended (Conda environment)
 ```bash
 git clone https://github.com/zhoutianrui-tongji/CellScope.git
-cd CellScope/CellScope
-conda create -n cellscope python=3.9
-conda activate cellscope
+cd CellScope
+conda create -n cellscope-env python=3.9
+conda activate cellscope-env
 pip install -r requirements.txt
 pip install .
 ```
