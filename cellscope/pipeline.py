@@ -2475,16 +2475,7 @@ def build_anndata(spatial_df: pd.DataFrame,
             progress_callback("Module 7 · Done" + (f" ({_suf})" if _suf else ""))
         except Exception:
             pass
-    try:
-        import logging as _logging
-        _logging.getLogger("cellscope").info("Module 7 · Done (%s)", "recomputed" if _m7_recomputed else "cache")
-    except Exception:
-        pass
-    if progress_callback:
-        try:
-            progress_callback(f"Module 7 · Done ({'recomputed' if _m7_recomputed else 'cache'})")
-        except Exception:
-            pass
+    # NOTE: single logging/progress_callback above is sufficient; avoid duplicate messages.
 
     # Module 8: Train DGI (GCN/SAGE) and backfill embeddings to adata2/adata1
     # Module 8: DGI embeddings (allow resume)
