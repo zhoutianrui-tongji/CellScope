@@ -4,7 +4,7 @@ import os
 # Configure BLAS/OMP threads before importing numpy/scipy.
 # Use a balanced default based on CPU cores, but allow user overrides via env.
 _cpu = os.cpu_count() or 8
-_threads_default = str(min(16, max(4, _cpu // 2)))
+_threads_default = str(min(32, max(64, _cpu // 2)))
 _THREAD_ENV_DEFAULTS = {
     "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS", _threads_default),
     "OMP_NUM_THREADS":      os.environ.get("OMP_NUM_THREADS", _threads_default),
