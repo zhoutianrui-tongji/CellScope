@@ -1,4 +1,4 @@
-from typing import Optional, Literal, Tuple, List, Callable, cast, Dict, Any
+from typing import Optional, Literal, Tuple, List, Callable, cast, Dict, Any, Union
 import os
 
 # Configure BLAS/OMP threads before importing numpy/scipy.
@@ -746,10 +746,7 @@ def per_cell_clustering(
     use_k_cap: bool = False,
     merge_min_size: Optional[int] = None,
 ) -> pd.DataFrame:
-    try:
-        import hdbscan  # lazy import
-    except Exception as e:
-        raise ImportError("hdbscan is required. Please install via: pip install hdbscan") from e
+    import hdbscan  # lazy import
 
     MIN_SUB_PTS = int(hdbscan_min_cluster_size)
     # 使用更小的目标簇大小以促进细分，且不与最小簇大小绑定
@@ -1373,8 +1370,8 @@ def run_module5_simple(
     # Avoid duplicate print of final summary when internal iterator already printed timings.
     if not show_internal_progress:
         _step_done('block clustering', t0_main)
-    adata1.obs["cell_cluster"] = pd.Categorical(global_labels.astype(str))
-    return adata1, pd.DataFrame(dict(n_sub=[n_sub], n_cells=[n_cells], K_total=[K_total], final_K=[int(adata1.obs["cell_cluster"].nunique())]))
+    adata1.obs["meta-domain"] = pd.Categorical(global_labels.astype(str))
+    return adata1, pd.DataFrame(dict(n_sub=[n_sub], n_cells=[n_cells], K_total=[K_total], final_K=[int(adata1.obs["meta-domain"].nunique())]))
 
 
 def build_adata2_from_adata1_and_pointdf(
@@ -1424,7 +1421,7 @@ def build_adata2_from_adata1_and_pointdf(
         except Exception: pass
     # 2) cell_sub -> cluster mapping
     t0 = _step_start("Map metaspots to clusters")
-    sub2clu = adata1.obs['cell_cluster'].astype(str).values
+    sub2clu = adata1.obs['meta-domain'].astype(str).values
     clu_codes, clu_uni = pd.factorize(sub2clu, sort=False)
     _step_done("Map metaspots to clusters", t0)
     if _m6_prog and _m6_task is not None:
@@ -1444,8 +1441,8 @@ def build_adata2_from_adata1_and_pointdf(
     # 4) aggregate geometry stats
     t0 = _step_start("Aggregate geometry stats per cluster")
     want_cols = [c for c in ['r_mean','r_std','r_p50','d_cell_norm_mean','d_nuc_norm_mean','elongation','spread','log_n'] if c in adata1.obs.columns]
-    agg = (adata1.obs[want_cols + ['cell_cluster']]
-            .groupby('cell_cluster', sort=False, observed=True)
+    agg = (adata1.obs[want_cols + ['meta-domain']]
+            .groupby('meta-domain', sort=False, observed=True)
            .agg({'r_mean':'mean','r_std':'mean','r_p50':'mean','d_cell_norm_mean':'mean','d_nuc_norm_mean':'mean','elongation':'median','spread':'median','log_n':'mean'}))
     adata2.obs = adata2.obs.join(agg, how='left')
     _step_done("Aggregate geometry stats per cluster", t0)
@@ -1454,8 +1451,8 @@ def build_adata2_from_adata1_and_pointdf(
         except Exception: pass
     # 5) representative cell id
     t0 = _step_start("Select representative cell per cluster")
-    rep_cell = (adata1.obs[['cell_cluster','cell_id']]
-              .groupby('cell_cluster', observed=True)['cell_id']
+    rep_cell = (adata1.obs[['meta-domain','cell_id']]
+              .groupby('meta-domain', observed=True)['cell_id']
               .agg(lambda x: x.value_counts().index[0]))
     adata2.obs['rep_cell_id'] = adata2.obs.index.map(rep_cell.to_dict())
     _step_done("Select representative cell per cluster", t0)
@@ -1986,7 +1983,7 @@ def run_module8_dgi(adata1: ad.AnnData, adata2: ad.AnnData, show_internal_progre
         adata2.obsm["X_dgi_sage"] = Z_sage
     # Map back to adata1 by cluster
     clu_to_row = {clu: i for i, clu in enumerate(adata2.obs_names.astype(str))}
-    row_idx_adata1 = adata1.obs["cell_cluster"].astype(str).map(clu_to_row).to_numpy()
+    row_idx_adata1 = adata1.obs["meta-domain"].astype(str).map(clu_to_row).to_numpy()
     def _broadcast(Z, row_index):
         out = np.zeros((len(row_index), Z.shape[1]), dtype=np.float32)
         mask = (row_index >= 0) & (row_index < Z.shape[0])
@@ -2330,7 +2327,7 @@ def build_anndata(spatial_df: pd.DataFrame,
         _m5_recomputed = True
     # Stats: transcripts count per meta-domain
     try:
-        vc = point_df.groupby("cell_cluster")["transcript_id"].count()
+        vc = point_df.groupby("meta-domain")["transcript_id"].count()
         stats = vc.describe().to_frame(name="value")
         _save_dataframe(stats.reset_index(), out_dir or os.getcwd(), "module5_domain_transcript_stats")
     except Exception:
@@ -2339,11 +2336,11 @@ def build_anndata(spatial_df: pd.DataFrame,
     if 'cell_sub' not in adata1.obs.columns:
         adata1.obs = adata1.obs.copy()
         adata1.obs['cell_sub'] = adata1.obs.index.astype(str)
-    # Attach cell_cluster to point_df
-    if "cell_cluster" in point_df.columns:
-        point_df = point_df.drop(columns=["cell_cluster"])  # ensure fresh
+    # Attach meta-domain to point_df
+    if "meta-domain" in point_df.columns:
+        point_df = point_df.drop(columns=["meta-domain"])  # ensure fresh
     point_df = point_df.merge(
-        adata1.obs[["cell_sub", "cell_cluster"]], on="cell_sub", how="left"
+        adata1.obs[["cell_sub", "meta-domain"]], on="cell_sub", how="left"
     )
     try:
         _save_dataframe(point_df, out_dir, "module5_point_df")
@@ -2778,6 +2775,7 @@ def run_pipeline(
     cell_boundaries_path: str,
     nucleus_boundaries_path: str,
     out_dir: str,
+    gold_data: Optional[Union[str, pd.DataFrame]] = None,
     resume: bool = True,
     save_intermediate: bool = True,
     lite_intermediate: bool = False,
@@ -3144,6 +3142,7 @@ def run_pipeline(
                 out_dir=out_dir,
                 rapx_two_stage=rapx_two_stage,
                 rapx_spatial_channel=rapx_spatial_channel,
+                gold_data=gold_data,
             )
             persist_annotation = (save_intermediate and not lite_intermediate) or resume_enabled
             if persist_annotation:
@@ -3880,7 +3879,8 @@ def _load_default_gold_tables() -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_df: pd.DataFrame, show_internal_progress: bool = False, out_dir: Optional[str] = None,
-                                rapx_two_stage: bool = False, rapx_spatial_channel: bool = False):
+                                rapx_two_stage: bool = False, rapx_spatial_channel: bool = False,
+                                gold_data: Optional[Union[str, pd.DataFrame]] = None):
     # Step 1: normalize + cluster on adata2 (scanpy)
     # Pull clustering params from config if available
     rep_priority = None
@@ -3931,11 +3931,56 @@ def _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_df
         )
         # Type cast retained for analyzers
         rep_priority = cast(Optional[List[str]], rep_priority)
-    # Step 2: load gold tables and merge RNALocate into 7 compartments, then fuse with APEX
-    gold_apex, rna_loc = _load_default_gold_tables()
-    l1 = build_gold_from_rnalocate_l1(rna_loc, species=('Homo sapiens','Mus musculus'), rna_types=('mRNA',), agg_mode='prob_or', score_floor=0.6, use_pubmed_weight=True)
-    gold_from_rna = project_l1_to_seven(l1, mode='strict', mito_non_omm=None)
-    gold_aug = merge_gold(gold_apex, gold_from_rna, fuse='max')
+    # Step 2: load gold tables (or use user-supplied `gold_data`).
+    if gold_data is not None:
+        try:
+            if isinstance(gold_data, str):
+                # Interpret string as path to parquet/csv
+                if os.path.exists(gold_data):
+                    try:
+                        _gdf = pd.read_parquet(gold_data)
+                    except Exception:
+                        _gdf = pd.read_csv(gold_data)
+                else:
+                    raise FileNotFoundError(f"gold_data path not found: {gold_data}")
+            elif isinstance(gold_data, pd.DataFrame):
+                _gdf = gold_data.copy()
+            else:
+                _gdf = pd.DataFrame(gold_data)
+            # Ensure gene column present
+            if 'Common_Gene' not in _gdf.columns:
+                # try reset index as gene names
+                try:
+                    _gdf = _gdf.reset_index()
+                except Exception:
+                    pass
+            if 'Common_Gene' not in _gdf.columns:
+                raise ValueError("Provided gold_data must contain a 'Common_Gene' column")
+            # Normalize numeric columns per-row to 0-1 (same logic as default loader)
+            val_cols = [c for c in _gdf.columns if c != 'Common_Gene']
+            if len(val_cols) == 0:
+                raise ValueError("Provided gold_data must contain numeric region columns in addition to 'Common_Gene'")
+            X = _gdf[val_cols].apply(pd.to_numeric, errors='coerce').fillna(0.0).astype(float)
+            X = X.subtract(X.min(axis=1), axis=0)
+            span = (X.max(axis=1) - X.min(axis=1)).replace(0, 1.0)
+            X = X.div(span, axis=0)
+            gold_aug = pd.concat([_gdf[['Common_Gene']].reset_index(drop=True), X.reset_index(drop=True)], axis=1)
+        except Exception as e:
+            # If loading user gold fails, fall back to default tables (but warn)
+            try:
+                import logging as _logging
+                _logging.getLogger('cellscope').warning('Failed to load provided gold_data (%s); falling back to defaults', e)
+            except Exception:
+                pass
+            gold_apex, rna_loc = _load_default_gold_tables()
+            l1 = build_gold_from_rnalocate_l1(rna_loc, species=('Homo sapiens','Mus musculus'), rna_types=('mRNA',), agg_mode='prob_or', score_floor=0.6, use_pubmed_weight=True)
+            gold_from_rna = project_l1_to_seven(l1, mode='strict', mito_non_omm=None)
+            gold_aug = merge_gold(gold_apex, gold_from_rna, fuse='max')
+    else:
+        gold_apex, rna_loc = _load_default_gold_tables()
+        l1 = build_gold_from_rnalocate_l1(rna_loc, species=('Homo sapiens','Mus musculus'), rna_types=('mRNA',), agg_mode='prob_or', score_floor=0.6, use_pubmed_weight=True)
+        gold_from_rna = project_l1_to_seven(l1, mode='strict', mito_non_omm=None)
+        gold_aug = merge_gold(gold_apex, gold_from_rna, fuse='max')
     # Step 3: RAP-X annotation; write to adata2.obs
     # Read RAP-X tuning knobs from config (optional)
     rapx_max_genes = 1200
@@ -4007,13 +4052,13 @@ def _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_df
                 pass
     except Exception:
         pass
-    # Step 4: map annotation back to final point table via cell_cluster
-    if 'cell_cluster' in final_df.columns:
+    # Step 4: map annotation back to final point table via meta-domain
+    if 'meta-domain' in final_df.columns:
         # Faster mapping vs merge for large final_df
         m = adata2.obs['subcellular_annotation'].astype(str)
         # Ensure key types align
         final_df = final_df.copy()
-        final_df['cell_cluster'] = final_df['cell_cluster'].astype(str)
+        final_df['meta-domain'] = final_df['meta-domain'].astype(str)
         # Vectorized map
-        final_df['subcellular_annotation'] = final_df['cell_cluster'].map(m)
+        final_df['subcellular_annotation'] = final_df['meta-domain'].map(m)
     return adata1, adata2, final_df

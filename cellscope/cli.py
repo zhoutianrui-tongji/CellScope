@@ -33,6 +33,7 @@ console = Console()
 @click.option("--cell-boundaries", required=True, type=click.Path(exists=True), help="Cell boundaries CSV file.")
 @click.option("--nucleus-boundaries", required=True, type=click.Path(exists=True), help="Nucleus boundaries CSV file.")
 @click.option("--out-dir", required=True, type=click.Path(), help="Output directory.")
+@click.option("--gold-data", type=click.Path(exists=True), help="Optional gold table CSV/Parquet to use for annotation (overrides default).")
 @click.option("--no-resume", is_flag=True, help="Disable resume from checkpoints.")
 @click.option("--no-save-intermediate", is_flag=True, help="Do not save intermediate checkpoints.")
 # Default: show samples; provide a flag to disable
@@ -45,7 +46,7 @@ console = Console()
 
 # Module parameters are read from the unified YAML config (no per-module CLI overrides)
 # matmul precision is auto-detected on GPU; option removed for simplicity
-def main(spatial, cell_boundaries, nucleus_boundaries, out_dir, no_resume, no_save_intermediate, no_show_sample, config, internal_progress, resume_policy, dry_run_diff):
+def main(spatial, cell_boundaries, nucleus_boundaries, out_dir, gold_data, no_resume, no_save_intermediate, no_show_sample, config, internal_progress, resume_policy, dry_run_diff):
     """CellScope CLI: run pipeline and write outputs."""
     os.makedirs(out_dir, exist_ok=True)
 
@@ -120,6 +121,7 @@ def main(spatial, cell_boundaries, nucleus_boundaries, out_dir, no_resume, no_sa
                 spatial_path=spatial,
                 cell_boundaries_path=cell_boundaries,
                 nucleus_boundaries_path=nucleus_boundaries,
+                gold_data=gold_data,
                 out_dir=out_dir,
                 resume=not no_resume,
                 save_intermediate=not no_save_intermediate,
