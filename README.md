@@ -37,7 +37,6 @@ conda activate cellscope-env
 pip install -r requirements.txt
 pip install .
 ```
-Note: Scanpy's Leiden requires `python-igraph` and `leidenalg`. Prefer installing via conda-forge when available.
 
 ## Documentation
 Configuration and usage are documented in this `README.md` and the `docs/` folder. The main configuration is `CellScope/config/params.yaml` (I/O, module parameters, annotation settings).
@@ -127,7 +126,7 @@ Notes:
 - `adata1.h5ad`: per‑cell/metaspot table (after M4–M5).
 - `adata2.h5ad`: meta‑domain table (after M6–M8).
 - `final_data.csv|parquet`: transcript‑level results including clustering and annotation.
-- Intermediates include `preprocess_*.{csv,parquet}`, `module1_point_features.*`, `module2_point_df.*`, `module3_point_df.*`, `module8_dgi_*_curves.png`, `module5_domain_transcript_stats.*`, `module6_adata2_shape.*`, etc.
+
 
 
 
