@@ -3586,6 +3586,25 @@ def merge_gold(existing_gold_df: pd.DataFrame, new_gold_df: pd.DataFrame, fuse='
 
 
 def _prepare_gold_matrix(gold_df: pd.DataFrame) -> pd.DataFrame:
+    """Prepare and normalize a gold-standard gene-by-region matrix.
+
+    This utility function takes a table of gene annotation scores (gold_df)
+    and returns a cleaned, row-normalized DataFrame where each gene row is
+    scaled to the 0..1 range. Gene names are upper-cased and duplicate
+    gene rows are collapsed by taking the maximum across duplicates.
+
+    Parameters
+    ----------
+    gold_df : pd.DataFrame
+        Input table containing gene identifiers either as an index or in a
+        column named 'Common_Gene', and one or more numeric region columns.
+
+    Returns
+    -------
+    pd.DataFrame
+        Normalized gene x region matrix with upper-case gene names as the
+        index and numeric columns for regions.
+    """
     gd = gold_df.copy()
     if 'Common_Gene' in gd.columns and gd.index.name != 'Common_Gene':
         gd = gd.set_index('Common_Gene')
@@ -3604,6 +3623,32 @@ def _prepare_gold_matrix(gold_df: pd.DataFrame) -> pd.DataFrame:
 def _build_group_means(adata: ad.AnnData, gold_gene_index_upper: pd.Index):
     from scipy.sparse import csr_matrix as _csr
     from scipy.sparse import issparse as _iss
+    """Compute per-cluster mean expression for genes of interest.
+
+    The function expects `adata.obs['leiden']` to exist. It selects the
+    genes present in `gold_gene_index_upper` (which should be upper-cased),
+    aggregates the observations by leiden cluster and returns a CSR sparse
+    matrix of cluster x gene means along with the cluster id list and the
+    array of genes (upper-case) corresponding to matrix columns.
+
+    Parameters
+    ----------
+    adata : anndata.AnnData
+        AnnData containing observations and variables. Must contain
+        `adata.obs['leiden']` and `adata.var_names`.
+    gold_gene_index_upper : pd.Index
+        An index (upper-case gene names) used to filter adata.var_names.
+
+    Returns
+    -------
+    group_mean : scipy.sparse.csr_matrix
+        Sparse matrix of shape (n_clusters, n_genes_selected) with mean
+        expression per cluster.
+    cluster_ids : list
+        Ordered list of leiden cluster labels corresponding to rows.
+    genes_up : np.ndarray
+        Array of upper-case gene names corresponding to columns.
+    """
     if 'leiden' not in adata.obs.columns:
         raise KeyError("adata.obs is missing 'leiden'. Please cluster first and write labels into adata.obs['leiden'].")
     common_genes_up = adata.var_names.astype(str).str.upper()
@@ -3625,6 +3670,24 @@ def _build_group_means(adata: ad.AnnData, gold_gene_index_upper: pd.Index):
 
 
 def _robust_gene_stats(group_mean_csr):
+    """Compute robust, MAD-scaled statistics per gene across clusters.
+
+    This routine converts the sparse group-mean matrix to a dense array and
+    computes a robust z-like score per gene and cluster using the gene-wise
+    median and MAD (median absolute deviation). The returned matrix S has
+    shape (n_clusters, n_genes) and is suitable for downstream rank-based
+    and projection enrichment tests.
+
+    Parameters
+    ----------
+    group_mean_csr : scipy.sparse.csr_matrix
+        Sparse matrix of cluster x gene means.
+
+    Returns
+    -------
+    np.ndarray
+        Robust standardized scores (S) with non-finite values coerced to 0.
+    """
     G = group_mean_csr.toarray().astype(np.float32)
     med = np.median(G, axis=0, keepdims=True)
     mad = np.median(np.abs(G - med), axis=0, keepdims=True)
@@ -3637,6 +3700,42 @@ def _robust_gene_stats(group_mean_csr):
 def _rapx_annotate_core(adata_sub: ad.AnnData, sets: dict, regions: List[str]) -> pd.DataFrame:
     from scipy.stats import rankdata, norm, hypergeom
     from scipy.special import erfc
+    """Core RAP-X enrichment engine.
+
+    For each cluster (from adata_sub.obs['leiden']) and each region, this
+    function computes multiple enrichment statistics and combines them into
+    a single z-like score and an FDR-like q-value. The three channels used
+    per region are:
+
+      - a rank-based Mann-Whitney-like z from cluster-level robust scores,
+      - a projection score of the cluster vector onto a region-specific
+        weight vector,
+      - a top-K hypergeometric enrichment p-value converted to a z-score.
+
+    The three channels are averaged (normalized) to form `z_comb`, which is
+    then centered by its median and converted to p/q for multiple-region
+    ranking. The returned DataFrame (index = leiden) contains for each
+    cluster the combined z and q for each region and the chosen label
+    (`label`, `z1`, `q1`).
+
+    Parameters
+    ----------
+    adata_sub : anndata.AnnData
+        AnnData with observations aggregated at the meta-domain level. Must
+        include `adata_sub.obs['leiden']`.
+    sets : dict
+        Mapping from region name to set of gene names (strings, upper/lower
+        case tolerated) used as region markers.
+    regions : list
+        Ordered list of region names corresponding to keys of `sets`.
+
+    Returns
+    -------
+    pd.DataFrame
+        Annotation table indexed by `leiden` containing per-region
+        `z_comb__{region}` and `q_comb__{region}` columns plus `label`,
+        `z1`, and `q1` for each cluster.
+    """
     # build labels over gold genes
     gold_genes_upper = pd.Index(sorted(set().union(*[set(map(str.upper, s)) for s in sets.values()])))
     group_mean, cluster_ids, genes_up = _build_group_means(adata_sub, gold_genes_upper)
@@ -3973,7 +4072,7 @@ def _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_df
         gold_from_rna = project_l1_to_seven(l1, mode='strict', mito_non_omm=None)
         gold_aug = merge_gold(gold_apex, gold_from_rna, fuse='max')
     # Step 3: RAP-X annotation; write to adata2.obs
-    # Read RAP-X tuning knobs from config (optional)
+    # Read    tuning knobs from config (optional)
     rapx_max_genes = 1200
     rapx_min_genes = 300
     rapx_frac_genes = 0.25
