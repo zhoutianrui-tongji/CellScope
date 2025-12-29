@@ -4943,12 +4943,13 @@ def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_d
             except Exception:
                 pass
             gold_apex, rna_loc = _load_default_gold_tables()
-            l1 = build_gold_from_rnalocate_l1(rna_loc, species=('Homo sapiens','Mus musculus'), rna_types=('mRNA',), agg_mode='prob_or', score_floor=0.6, use_pubmed_weight=True)
+            # l1 = build_gold_from_rnalocate_l1(rna_loc, species=('Homo sapiens','Mus musculus'), rna_types=('mRNA',), agg_mode='prob_or', score_floor=0.6, use_pubmed_weight=True)
+            l1 = build_gold_from_rnalocate_l1(rna_loc, agg_mode='prob_or', score_floor=0.6, use_pubmed_weight=True)
             gold_from_rna = project_l1_to_seven(l1, mode='strict', mito_non_omm=None)
             gold_aug = merge_gold(gold_apex, gold_from_rna, fuse='max')
     else:
         gold_apex, rna_loc = _load_default_gold_tables()
-        l1 = build_gold_from_rnalocate_l1(rna_loc, species=('Homo sapiens','Mus musculus'), rna_types=('mRNA',), agg_mode='prob_or', score_floor=0.6, use_pubmed_weight=True)
+        l1 = build_gold_from_rnalocate_l1(rna_loc, agg_mode='prob_or', score_floor=0.6, use_pubmed_weight=True)
         gold_from_rna = project_l1_to_seven(l1, mode='strict', mito_non_omm=None)
         gold_aug = merge_gold(gold_apex, gold_from_rna, fuse='max')
 
