@@ -93,11 +93,12 @@ This document describes the configuration options read from `CellScope/config/pa
 - `dgi_hidden`/`dgi_out` (int): Hidden and output dimensions. Default: `32/32`.
 - `dgi_lr` (float), `dgi_weight_decay` (float), `dgi_clip_grad` (float): Optimizer settings.
 
-## runtime (hints)
-- `n_jobs` (int), `neighbors_n_jobs` (int): CPU parallelism hints.
-- `joblib_backend` (`threading|loky`): Backend for joblib blocks.
-- `blas_threads` (int): Max BLAS threads (process-local if supported).
-- `use_threadpoolctl` (bool): Attempt to cap BLAS/OpenMP threads.
+## runtime (parallelism)
+- `n_jobs` (int): Preferred worker count for parallel sections (honored unless `CELLSCOPE_N_JOBS` env is set).
+- `joblib_backend` (`threading|loky`): Backend for joblib blocks (env `CELLSCOPE_JOBLIB_BACKEND` still wins).
+- `blas_threads` (int): Caps BLAS/OpenMP thread pools; applied at startup and optionally via `threadpoolctl`.
+- `use_threadpoolctl` (bool): If true and `blas_threads` is set, also call `threadpoolctl.threadpool_limits`.
+- `neighbors_n_jobs` (int): Reserved for neighbor graph overrides (falls back to `n_jobs`).
 
 ## ui
 - `show_sample` (bool): Show top-5 preview of inputs at start. Default: `true`.

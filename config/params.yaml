@@ -11,25 +11,6 @@ io:
   drop_embeddings: true
   keep_intermediate: false
 
-annotation:
-  enable: true
-  two_stage: false
-  spatial_channel: false
-  leiden_resolution: 1.0
-  hvg_n_top_genes: 2000
-  pca_n_comps: 32
-  neighbors_k: 32
-  umap_min_dist: 0.3
-  umap_spread: 1.0
-  umap_prefix: rapx_umap
-  enrichment_panels_name: rapx_enrichment_panels
-  quality_summary_name: rapx_quality_summary
-  compute_umap: true
-  save_umap_plot: true
-  save_plots: true
-  # Preferred representation for Leiden/UMAP (options: X_dgi_gcn|X_dgi_sage|X_expr|X_pca|auto)
-  cluster_rep: "X_dgi_gcn"
-
 module1:
   knn_k: 32
   include_directional: true
@@ -52,11 +33,16 @@ module3:
   hdbscan_allow_single_cluster: true
   hdbscan_min_samples_frac: 0.3
   target_sub_size: 12
-  n_feat_hdb: 32
+  n_feat_hdb: 16
   kmeans_min_k: 2
   kmeans_max_k: 100
   use_k_cap: false
   merge_min_size: null    # 若为 null，则按 MIN_SUB_PTS 合并小簇（推荐）
+  hdbscan_max_points: 600         # 1 表示全部使用 MiniBatchKMeans（跳过 HDBSCAN）
+  kmeans_train_size: 512        # per-cell MiniBatchKMeans 的训练采样数（小样本更快）
+  kmeans_batch_size: 1024       # per-cell MiniBatchKMeans 的 batch_size（减轻单批开销）
+  small_backend_cells: 1000     # 低于该值时用线程后端，5k 不触发
+  sequential_cells: 1000           # 禁用顺序模式，避免 5k 时退化到串行
 
 module5:
   block_size: 50000
@@ -86,6 +72,11 @@ module5:
   cap_min_keep: 3
   cap_margin_tau: 0.015
   cap_max_frac_soft: 0.05
+  # Two-stage MiniBatchKMeans (fit on sample, predict all)
+  train_sample_per_block: 600000   # 每个 block 用于训练的采样上限
+  assign_chunk_size: 50000         # 预测阶段内部 chunk 尺寸（若 predict 内存充足可无视）
+  mbk_batch_size: 8192
+  mbk_max_iter: 80
 
 module6:
   h5ad_compression_override: true
@@ -117,11 +108,27 @@ module8:
   dgi_weight_decay: 0.0001
   dgi_clip_grad: 1.0
 
+annotation:
+  enable: true
+  method: rapx
+  two_stage: true
+  spatial_channel: true
+  leiden_resolution: 1.0
+  hvg_n_top_genes: 2000
+  pca_n_comps: 32
+  neighbors_k: 32
+  umap_min_dist: 0.3
+  umap_spread: 1.0
+  compute_umap: true
+  save_umap_plot: true
+  save_plots: true
+  # Preferred representation for Leiden/UMAP (options: X_dgi_gcn|X_dgi_sage|X_expr|X_pca|auto)
+  cluster_rep: "X_dgi_gcn"
+
 runtime:
-  n_jobs: 16
-  joblib_backend: threading
-  blas_threads: 32
-  neighbors_n_jobs: 16
+  n_jobs: 48
+  joblib_backend: loky
+  blas_threads: 2
   use_threadpoolctl: true
 
 ui:

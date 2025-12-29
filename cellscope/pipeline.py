@@ -1,10 +1,44 @@
 from typing import Optional, Literal, Tuple, List, Callable, cast, Dict, Any, Union
 import os
+import re
+import math
+import logging as _logging
+from collections import defaultdict, Counter
+
+# Optional early config load so runtime.blas_threads / runtime.n_jobs in params.yaml
+# can cap BLAS/OMP threads before importing heavy numeric libs.
+try:
+    from .config import load_params_yaml as _load_params_yaml_threads
+except Exception:  # pragma: no cover - defensive for import edge cases
+    _load_params_yaml_threads = None
+
+def _coerce_pos_int(v: object) -> Optional[int]:
+    try:
+        iv = int(v)  # type: ignore[arg-type]
+        return iv if iv > 0 else None
+    except Exception:
+        return None
+
+from tqdm.auto import tqdm
+from scipy.stats import hypergeom, norm, rankdata, fisher_exact
+from scipy.special import erfc
+from statsmodels.stats.multitest import multipletests
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # Configure BLAS/OMP threads before importing numpy/scipy.
-# Use a balanced default based on CPU cores, but allow user overrides via env.
+# Priority: params.yaml runtime.blas_threads / runtime.n_jobs > env > fallback heuristic.
+_runtime_cfg_threads = {}
+try:
+    if _load_params_yaml_threads:
+        _runtime_cfg_threads = (_load_params_yaml_threads() or {}).get("runtime", {}) or {}
+except Exception:
+    _runtime_cfg_threads = {}
+
 _cpu = os.cpu_count() or 8
-_threads_default = str(min(32, max(64, _cpu // 2)))
+_fallback_threads = max(1, min(32, _cpu // 2 or 1))
+_yaml_threads = _coerce_pos_int(_runtime_cfg_threads.get("blas_threads")) or _coerce_pos_int(_runtime_cfg_threads.get("n_jobs"))
+_threads_default = str(_yaml_threads or _fallback_threads)
 _THREAD_ENV_DEFAULTS = {
     "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS", _threads_default),
     "OMP_NUM_THREADS":      os.environ.get("OMP_NUM_THREADS", _threads_default),
@@ -16,7 +50,7 @@ _THREAD_ENV_DEFAULTS = {
 }
 for _k, _v in _THREAD_ENV_DEFAULTS.items():
     os.environ.setdefault(_k, str(_v))
-del _THREAD_ENV_DEFAULTS, _k, _v, _cpu, _threads_default
+del _THREAD_ENV_DEFAULTS, _k, _v, _cpu, _threads_default, _fallback_threads, _yaml_threads, _runtime_cfg_threads
 
 import pandas as pd
 import numpy as np
@@ -47,6 +81,7 @@ from sklearn.decomposition import TruncatedSVD
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.cluster import KMeans
+from sklearn.metrics import pairwise_distances_argmin
 import scipy.sparse as sp
 import gc
 
@@ -745,6 +780,11 @@ def per_cell_clustering(
     kmeans_max_k: int = 999,
     use_k_cap: bool = False,
     merge_min_size: Optional[int] = None,
+    hdbscan_max_points: int = 512,
+    kmeans_train_size: int = 1024,
+    kmeans_batch_size: int = 2048,
+    small_backend_cells: int = 12000,
+    sequential_cells: int = 256,
 ) -> pd.DataFrame:
     import hdbscan  # lazy import
 
@@ -841,6 +881,9 @@ def per_cell_clustering(
 
     groups = list(point_df.groupby('cell_id', sort=False))
 
+    # Deterministic RNG for MiniBatchKMeans sampling inside _fit_one
+    rng = np.random.default_rng(42)
+
     def _fit_one(args):
         cid, g = args
         g = g.dropna(subset=feat_for_hdb)
@@ -855,6 +898,33 @@ def per_cell_clustering(
         if Xz.shape[1] == 0 or not np.any(good):
             X_coord = g[['x_location', 'y_location']].to_numpy(np.float32, copy=False)
             Xz, _ = _safe_standardize(X_coord)
+        # Fast path: large cells switch to sampled MiniBatchKMeans to avoid expensive HDBSCAN
+        if n > int(hdbscan_max_points):
+            K_init = _decide_K_for_cell(n)
+            if bool(use_k_cap):
+                K_init = max(int(kmeans_min_k), min(int(kmeans_max_k), int(K_init)))
+            K_init = max(1, int(K_init))
+            train_n = min(int(kmeans_train_size), n)
+            K_init = min(K_init, max(1, train_n))
+            idx_train = rng.choice(n, size=train_n, replace=False)
+            X_train = Xz[idx_train]
+            bs = max(64, min(int(kmeans_batch_size), train_n))
+            km = MiniBatchKMeans(
+                n_clusters=K_init,
+                init="k-means++",
+                n_init=3,
+                random_state=42,
+                batch_size=bs,
+                max_iter=80,
+                reassignment_ratio=0.01,
+                verbose=0,
+            )
+            km.fit(X_train)
+            labels = km.predict(Xz).astype(np.int32)
+            _min_size = int(merge_min_size) if merge_min_size is not None else int(MIN_SUB_PTS)
+            labels = _merge_small_clusters(labels, Xz, min_size=_min_size)
+            return cid, pd.Series(labels, index=g.index, dtype=np.int32)
+
         min_samples = max(3, int(round(MIN_SUB_PTS * MIN_SAMPLES_FRAC)))
         clusterer = hdbscan.HDBSCAN(
             min_cluster_size=MIN_SUB_PTS,
@@ -892,9 +962,32 @@ def per_cell_clustering(
         labels = _merge_small_clusters(labels, Xz, min_size=_min_size)
         return cid, pd.Series(labels, index=g.index, dtype=np.int32)
 
+    # Lightweight backend selection for small datasets to cut scheduler/IPC overhead
+    _force_threads = bool(os.environ.get("CELLSCOPE_FORCE_THREADS", "").strip())
+    use_sequential = len(groups) <= int(sequential_cells)
+    _backend = _joblib_backend()
+    if _force_threads or len(groups) <= int(small_backend_cells):
+        _backend = "threading"
+    if use_sequential:
+        iterator = _progress_iter(range(len(groups)), desc='Per-cell clustering (seq)', total=len(groups), show=show_internal_progress)
+        results = []
+        for idx in iterator:
+            results.append(_fit_one(groups[idx]))
+        labels_per_cell = pd.concat([s for _, s in results]).astype(np.int32)
+        point_df = point_df.copy()
+        point_df['cluster_in_cell'] = labels_per_cell
+        missing = point_df['cluster_in_cell'].isna()
+        if missing.any():
+            point_df.loc[missing, 'cluster_in_cell'] = -1
+        point_df['cluster_in_cell'] = point_df['cluster_in_cell'].astype(np.int32)
+        point_df['cell_sub'] = (
+            point_df['cell_id'].astype(str) + ':' + point_df['cluster_in_cell'].astype(np.int32).astype(str)
+        )
+        return point_df
+
     from joblib import Parallel, delayed
     N_JOBS = _preferred_n_jobs()
-    _backend = _joblib_backend()
+    # _backend already chosen above, but keep env override precedence
     if os.environ.get("CELLSCOPE_FORCE_THREADS", "").strip():
         _backend = "threading"
 
@@ -1255,6 +1348,64 @@ def _mini_batch_kmeans_simple(X: np.ndarray, K: int, seed: int = 0, desc: str = 
     return y.astype(np.int32)
 
 
+def _two_stage_mb_kmeans_assign(
+    X: np.ndarray,
+    K: int,
+    seed: int = 0,
+    sample_n: int = 300000,
+    batch_size: int = 8192,
+    assign_chunk: int = 50000,
+    use_cosine: bool = True,
+    max_iter: int = 60,
+):
+    """Train MiniBatchKMeans on a subsample then assign all points in chunks.
+    Keeps clustering quality close to full MBK while cutting runtime for very large blocks."""
+    n = X.shape[0]
+    if n <= K or n <= sample_n:
+        return _mini_batch_kmeans_simple(X, K=K, seed=seed, desc="MBK-full")
+
+    # 1) Train on a capped subsample (smaller default to reduce wall clock)
+    sample_n = max(K, min(int(sample_n), n))
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(n, size=sample_n, replace=False)
+    X_train = X[idx]
+    bs = max(1024, min(int(batch_size), sample_n))
+    mbk = MiniBatchKMeans(
+        n_clusters=K,
+        init="k-means++",
+        n_init=3,
+        random_state=seed,
+        batch_size=bs,
+        max_iter=int(max_iter),
+        reassignment_ratio=0.01,
+        verbose=0,
+    )
+    mbk.fit(X_train)
+    centers = mbk.cluster_centers_.astype(np.float32, copy=False)
+
+    # 2) Chunked assignment (fast BLAS dot for cosine, stabilized quadratic form for L2)
+    if use_cosine:
+        centers = centers / (np.linalg.norm(centers, axis=1, keepdims=True) + 1e-8)
+    step = max(2048, int(assign_chunk))
+    labels = np.empty(n, dtype=np.int32)
+    if use_cosine:
+        for s in range(0, n, step):
+            e = min(n, s + step)
+            X_chunk = X[s:e]
+            sim = X_chunk @ centers.T  # cosine similarity via dot product
+            labels[s:e] = np.argmax(sim, axis=1).astype(np.int32)
+    else:
+        c_norm = np.einsum('ij,ij->i', centers, centers)
+        for s in range(0, n, step):
+            e = min(n, s + step)
+            X_chunk = X[s:e]
+            x_norm = np.einsum('ij,ij->i', X_chunk, X_chunk)
+            # d^2 = ||x||^2 + ||c||^2 - 2 x·c
+            dist = x_norm[:, None] + c_norm[None, :] - 2.0 * (X_chunk @ centers.T)
+            labels[s:e] = np.argmin(dist, axis=1).astype(np.int32)
+    return labels
+
+
 def run_module5_simple(
     adata1: ad.AnnData,
     point_df: pd.DataFrame,
@@ -1300,6 +1451,11 @@ def run_module5_simple(
     enable_cap = bool(_m5.get('enable_cap', enable_cap))
     use_gc = bool(_m5.get('use_gc', True))
     use_expr = bool(_m5.get('use_expr', True))
+    # More aggressive speed defaults for large cohorts; can still be overridden in params.yaml
+    train_sample_per_block = int(_m5.get('train_sample_per_block', 300000))
+    assign_chunk_size = int(_m5.get('assign_chunk_size', _m5.get('block_size', 50000) or 50000))
+    mbk_batch_size = int(_m5.get('mbk_batch_size', 8192))
+    mbk_max_iter = int(_m5.get('mbk_max_iter', 60 if str(speed_preset).lower() == 'ultra' else 80))
     # feature construction
     X_all, cell_ids, u_cells, cell_codes = _construct_features_simple(
         adata1,
@@ -1348,8 +1504,15 @@ def run_module5_simple(
         cell_ids_blk = cell_ids[idx]
         n_cells_blk = np.unique(cell_ids_blk).size
         K_blk = max(2, int(round(K_total * (n_cells_blk / max(1, n_cells)))))
-        y = _mini_batch_kmeans_simple(
-            Xi, K=K_blk, seed=42 + (0 if prefix == 'N' else 1), desc=f"[{prefix}] MBK K={K_blk}"
+        y = _two_stage_mb_kmeans_assign(
+            Xi,
+            K=K_blk,
+            seed=42 + (0 if prefix == 'N' else 1),
+            sample_n=train_sample_per_block,
+            batch_size=mbk_batch_size,
+            assign_chunk=assign_chunk_size,
+            use_cosine=use_cosine,
+            max_iter=mbk_max_iter,
         )
         if enable_cap:
             y = _cap_per_cell_simple(
@@ -2146,6 +2309,11 @@ def build_anndata(spatial_df: pd.DataFrame,
     _m3_kmeans_max_k = 999
     _m3_use_k_cap = False
     _m3_merge_min = None
+    _m3_hdbscan_max_points = 512
+    _m3_kmeans_train_size = 1024
+    _m3_kmeans_batch_size = 2048
+    _m3_small_backend_cells = 12000
+    _m3_sequential_cells = 256
     try:
         _cfg = load_params_yaml()
         _m3 = _cfg.get('module3', {}) if _cfg else {}
@@ -2167,6 +2335,16 @@ def build_anndata(spatial_df: pd.DataFrame,
         if 'merge_min_size' in _m3:
             val = _m3.get('merge_min_size')
             _m3_merge_min = int(val) if isinstance(val, (int, float)) else None
+        if isinstance(_m3.get('hdbscan_max_points'), (int, float)):
+            _m3_hdbscan_max_points = int(_m3.get('hdbscan_max_points'))
+        if isinstance(_m3.get('kmeans_train_size'), (int, float)):
+            _m3_kmeans_train_size = int(_m3.get('kmeans_train_size'))
+        if isinstance(_m3.get('kmeans_batch_size'), (int, float)):
+            _m3_kmeans_batch_size = int(_m3.get('kmeans_batch_size'))
+        if isinstance(_m3.get('small_backend_cells'), (int, float)):
+            _m3_small_backend_cells = int(_m3.get('small_backend_cells'))
+        if isinstance(_m3.get('sequential_cells'), (int, float)):
+            _m3_sequential_cells = int(_m3.get('sequential_cells'))
     except Exception:
         pass
     import time as _time
@@ -2196,6 +2374,11 @@ def build_anndata(spatial_df: pd.DataFrame,
                 kmeans_max_k=_m3_kmeans_max_k,
                 use_k_cap=_m3_use_k_cap,
                 merge_min_size=_m3_merge_min,
+                hdbscan_max_points=_m3_hdbscan_max_points,
+                kmeans_train_size=_m3_kmeans_train_size,
+                kmeans_batch_size=_m3_kmeans_batch_size,
+                small_backend_cells=_m3_small_backend_cells,
+                sequential_cells=_m3_sequential_cells,
             )
             _save_dataframe(point_df, out_dir, "module3_point_df")
     else:
@@ -2213,6 +2396,11 @@ def build_anndata(spatial_df: pd.DataFrame,
             kmeans_max_k=_m3_kmeans_max_k,
             use_k_cap=_m3_use_k_cap,
             merge_min_size=_m3_merge_min,
+            hdbscan_max_points=_m3_hdbscan_max_points,
+            kmeans_train_size=_m3_kmeans_train_size,
+            kmeans_batch_size=_m3_kmeans_batch_size,
+            small_backend_cells=_m3_small_backend_cells,
+            sequential_cells=_m3_sequential_cells,
         )
         _save_dataframe(point_df, out_dir, "module3_point_df")
     try:
@@ -2670,6 +2858,8 @@ def _preferred_n_jobs() -> int:
       CELLSCOPE_N_JOBS         -> explicit override
       CELLSCOP3E_N_JOBS        -> (legacy typo) still honored
 
+    params.yaml (runtime.n_jobs) is honored when env vars are absent.
+
     Fallback heuristic: use ~1/3 of available CPUs, cap <=32 (legacy behavior).
     """
     for k in ("CELLSCOPE_N_JOBS", "CELLSCOP3E_N_JOBS"):
@@ -2682,29 +2872,52 @@ def _preferred_n_jobs() -> int:
         except Exception:
             pass
     try:
+        from .config import load_params_yaml
+        cfg = load_params_yaml() or {}
+        runtime_cfg = cfg.get("runtime", {}) or {}
+        v = runtime_cfg.get("n_jobs")
+        v_int = _coerce_pos_int(v)
+        if v_int:
+            return v_int
+    except Exception:
+        pass
+    try:
         import multiprocessing
         cpu = max(1, multiprocessing.cpu_count())
     except Exception:
         cpu = 4
-    return max(1, min(32, cpu // 3 if cpu >= 3 else 1))
+    # Default: use roughly half of available CPUs, capped at 32
+    return max(1, min(32, cpu // 2 if cpu >= 2 else 1))
 
 def _joblib_backend() -> str:
     # Default backend: 'loky' for maximum throughput on CPU-bound tasks.
-    # Users can override via CELLSCOPE_JOBLIB_BACKEND (e.g., to 'threading').
-    return os.environ.get("CELLSCOPE_JOBLIB_BACKEND", "loky")
+    # Users can override via CELLSCOPE_JOBLIB_BACKEND env or runtime.joblib_backend.
+    env_backend = os.environ.get("CELLSCOPE_JOBLIB_BACKEND")
+    if env_backend:
+        return env_backend
+    try:
+        from .config import load_params_yaml
+        cfg = load_params_yaml() or {}
+        runtime_cfg = cfg.get("runtime", {}) or {}
+        rt_backend = runtime_cfg.get("joblib_backend")
+        if isinstance(rt_backend, str) and rt_backend.strip():
+            return rt_backend.strip()
+    except Exception:
+        pass
+    return "loky"
 
 def _cluster_chunk_size() -> int:
     """Chunk size for per-cell parallel loops.
 
-    Env: CELLSCOPE_CLUSTER_CHUNK (int, default 128)
+    Env: CELLSCOPE_CLUSTER_CHUNK (int, default 64)
     Smaller chunks reduce peak memory (fewer simultaneous process payloads)
     at the cost of higher scheduler overhead.
     """
     try:
-        v = int(os.environ.get("CELLSCOPE_CLUSTER_CHUNK", "32"))
-        return max(8, min(512, v))
+        v = int(os.environ.get("CELLSCOPE_CLUSTER_CHUNK", "512"))
+        return max(128, min(1024, v))
     except Exception:
-        return 32
+        return 128
 
 
 def _state_path(out_dir: str) -> str:
@@ -2780,6 +2993,7 @@ def run_pipeline(
     ]] = None,
     show_internal_progress: bool = False,
     enable_annotation: bool = True,
+    annotation_method: str = "rapx",
     scvi_epochs: int = 100,
     dgi_epochs: int = 200,
     enable_dgi_sage: bool = False,
@@ -2824,6 +3038,21 @@ def run_pipeline(
             resume_policy = str(io_cfg.get('resume_policy')).lower()
     except Exception:
         pass
+    try:
+        runtime_cfg = cfg.get('runtime', {}) if cfg else {}
+    except Exception:
+        runtime_cfg = {}
+    # Annotation toggles/method from YAML (default on, method=rapx)
+    try:
+        ann_cfg = cfg.get('annotation', {}) if cfg else {}
+        if 'enable' in ann_cfg:
+            enable_annotation = bool(ann_cfg.get('enable'))
+        if 'method' in ann_cfg:
+            _m = str(ann_cfg.get('method') or "").strip().lower()
+            if _m:
+                annotation_method = _m
+    except Exception:
+        pass
     # Set global I/O switches for helpers
     try:
         global _WRITE_INTERMEDIATE, _LITE_INTERMEDIATE, _WRITE_FIGURES
@@ -2843,13 +3072,24 @@ def run_pipeline(
             pass
     except Exception:
         pass
-    # Cap BLAS/OMP threads to avoid OpenBLAS NUM_THREADS crash on many-core hosts
+    # Cap BLAS/OMP threads; allow runtime.blas_threads in params.yaml to take effect
     try:
-        os.environ.setdefault("OPENBLAS_NUM_THREADS", "64")
-        os.environ.setdefault("MKL_NUM_THREADS",     "1")
-        os.environ.setdefault("OMP_NUM_THREADS",     "1")
-        os.environ.setdefault("NUMEXPR_MAX_THREADS", "64")
-        os.environ.setdefault("NUMEXPR_NUM_THREADS", "16")
+        _rt_blas_threads = _coerce_pos_int(runtime_cfg.get('blas_threads')) if runtime_cfg else None
+        if _rt_blas_threads:
+            for _env_k in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "OMP_NUM_THREADS", "NUMEXPR_MAX_THREADS", "NUMEXPR_NUM_THREADS"):
+                os.environ[_env_k] = str(_rt_blas_threads)
+            if runtime_cfg.get('use_threadpoolctl'):
+                try:
+                    from threadpoolctl import threadpool_limits
+                    threadpool_limits(int(_rt_blas_threads))
+                except Exception:
+                    pass
+        else:
+            os.environ.setdefault("OPENBLAS_NUM_THREADS", "64")
+            os.environ.setdefault("MKL_NUM_THREADS",     "1")
+            os.environ.setdefault("OMP_NUM_THREADS",     "1")
+            os.environ.setdefault("NUMEXPR_MAX_THREADS", "64")
+            os.environ.setdefault("NUMEXPR_NUM_THREADS", "16")
         # Silence JAX GPU reminder by forcing CPU backend
         os.environ.setdefault("JAX_PLATFORM_NAME",    "cpu")
         os.environ.setdefault("JAX_PLATFORMS",        "cpu")
@@ -3108,8 +3348,9 @@ def run_pipeline(
             raise RuntimeError("Missing 'module5_final_data' checkpoint; cannot skip 'build_anndata' stage.")
         final_data = cached_final
 
-    # ==== Stage 4: Annotation (optional) ====
-    run_annotation = enable_annotation and adata2 is not None
+    # ==== Stage 4: Annotation (optional/configurable) ====
+    ann_method = (annotation_method or "rapx").lower()
+    run_annotation = bool(enable_annotation) and (ann_method != "none") and adata2 is not None
     annotation_cache = None
     annotation_cache_ready = False
     if run_annotation and resume_enabled and stage_to_idx["annotate"] < start_idx:
@@ -3131,6 +3372,7 @@ def run_pipeline(
                 adata1, adata2, final_data,
                 show_internal_progress=show_internal_progress,
                 out_dir=out_dir,
+                annotation_method=ann_method,
                 rapx_two_stage=rapx_two_stage,
                 rapx_spatial_channel=rapx_spatial_channel,
                 gold_data=gold_data,
@@ -3585,31 +3827,154 @@ def merge_gold(existing_gold_df: pd.DataFrame, new_gold_df: pd.DataFrame, fuse='
     return out
 
 
-def _prepare_gold_matrix(gold_df: pd.DataFrame) -> pd.DataFrame:
-    """Prepare and normalize a gold-standard gene-by-region matrix.
+def _load_manual_marker_data(path: Optional[str] = None) -> Optional[pd.DataFrame]:
+    """Load optional manual marker table and normalize row-wise to 0-1.
 
-    This utility function takes a table of gene annotation scores (gold_df)
-    and returns a cleaned, row-normalized DataFrame where each gene row is
-    scaled to the 0..1 range. Gene names are upper-cased and duplicate
-    gene rows are collapsed by taking the maximum across duplicates.
-
-    Parameters
-    ----------
-    gold_df : pd.DataFrame
-        Input table containing gene identifiers either as an index or in a
-        column named 'Common_Gene', and one or more numeric region columns.
-
-    Returns
-    -------
-    pd.DataFrame
-        Normalized gene x region matrix with upper-case gene names as the
-        index and numeric columns for regions.
+    Expected columns: `Common_Gene` + region columns (Nucleus/Nucleolus/.../OMM).
+    If `Common_Gene` absent but index is the gene names, the index will be reset.
+    Missing file or parse errors return None (non-fatal).
     """
+    if path is None:
+        path = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'src', 'manual_marker.csv'))
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        try:
+            df = pd.read_table(path)
+        except Exception:
+            return None
+
+    if 'Common_Gene' not in df.columns and df.index.name == 'Common_Gene':
+        df = df.reset_index()
+    if 'Common_Gene' not in df.columns:
+        return None
+
+    val_cols = [c for c in df.columns if c != 'Common_Gene']
+    if len(val_cols) == 0:
+        return None
+
+    X = df[val_cols].apply(pd.to_numeric, errors='coerce').fillna(0.0).astype(float)
+    X = X.subtract(X.min(axis=1), axis=0)
+    span = (X.max(axis=1) - X.min(axis=1)).replace(0, 1.0)
+    X = X.div(span, axis=0)
+    out = pd.concat([df[['Common_Gene']].reset_index(drop=True), X.reset_index(drop=True)], axis=1)
+
+    # Drop all-zero rows to avoid inflating sets with null markers.
+    try:
+        mask_nonzero = (X.sum(axis=1) > 0)
+        out = out.loc[mask_nonzero].reset_index(drop=True)
+    except Exception:
+        pass
+    return out
+
+
+# ---------- 目标区域与别名 ----------
+TARGET_REGIONS = ['NUCLEUS','NUCLEOLUS','LAMINA','NUCLEAR_PORE','CYTOSOL','ER','OMM']
+GOLD_ALIAS = {
+    'NUCLEUS':'NUCLEUS','NUCLEOLUS':'NUCLEOLUS','LAMINA':'LAMINA',
+    'NUCLEAR_PORE':'NUCLEAR_PORE','NUCLEARPORE':'NUCLEAR_PORE',
+    'CYTOSOL':'CYTOSOL','CYTOSOLIC':'CYTOSOL',
+    'ER':'ER','ERM':'ER','ER_LUMEN':'ER','ER_LUMINAL':'ER',
+    'OMM':'OMM','MITOCHONDRIA_OMM':'OMM',
+}
+PRETTY = {'NUCLEUS':'Nucleus','NUCLEOLUS':'Nucleolus','LAMINA':'Lamina',
+          'NUCLEAR_PORE':'Nuclear Pore','CYTOSOL':'Cytosol','ER':'ER','OMM':'OMM'}
+
+# 可视化用的顺序与颜色
+PRETTY_ORDER = ['Cytosol','ER','Lamina','Nuclear Pore','Nucleolus','Nucleus','OMM']
+SIG_COLOR    = {'***':'#d62728','**':'#ff7f0e','*':'#2ca02c','ns':'#7f7f7f'}
+
+# ---------- 参数 ----------
+TARGET_SET_SIZE = 600
+MIN_SET_SIZE    = 200
+MAX_SET_SIZE    = 1000
+MIN_TOP_VALUE   = 0.1
+USE_MARGIN      = True
+
+TOPK_OVERLAP_FRAC = 0.3
+TOPK_OVERLAP_MIN  = 250
+
+FDR_CUTOFF      = 0.05
+Z_CUTOFF        = 1
+TIE_DELTA       = 0.35
+ALWAYS_ASSIGN   = False
+
+PROMOTE_TOP2    = True
+DELTA_PROMOTE   = 1
+REL_PROMOTE     = 0.9
+
+# 新增：第4个通道权重（空间）
+CHANNEL_WEIGHTS = (1, 1, 1, 0.1)  # MWU, Proj, Hyp, Spatial
+
+# ---------- Gold 基因大小写自适应 ----------
+def harmonize_gold_gene_case(gold_df: pd.DataFrame, target_var_names: Optional[pd.Index] = None) -> pd.DataFrame:
+    """Normalize `Common_Gene` casing and pick the style with better overlap to target genes.
+
+    Mouse数据常用首字母大写+其余小写的写法（例如 Actb），而 Gold 表往往是全大写。
+    这里同时计算两种写法与目标 adata.var_names 的重叠度，选择更优者并去重聚合。
+    """
+    gd = gold_df.copy()
+
+    # Ensure Common_Gene is a column for processing.
+    if 'Common_Gene' not in gd.columns and gd.index.name == 'Common_Gene':
+        gd = gd.reset_index()
+    if 'Common_Gene' not in gd.columns:
+        return gd
+
+    genes = gd['Common_Gene'].astype(str)
+    upper = genes.str.upper()
+    mouse_style = genes.str.capitalize()
+
+    chosen = upper
+    if target_var_names is not None:
+        tgt = pd.Index(target_var_names.astype(str))
+        tgt_up = tgt.str.upper()
+        tgt_set = set(tgt)
+        tgt_up_set = set(tgt_up)
+
+        # Score exact case matches for mouse-style, and uppercase matches for both.
+        hit_upper = len(tgt_up_set.intersection(set(upper)))
+        hit_mouse_case = len(tgt_set.intersection(set(mouse_style)))
+        hit_mouse_upper = len(tgt_up_set.intersection(set(mouse_style.str.upper())))
+
+        # Prefer mouse-style when it improves exact-case overlap; otherwise fall back to upper.
+        prefer_mouse = hit_mouse_case > hit_upper
+        # Tie-breaker: if target genes大多不是全大写，则倾向 mouse-style
+        frac_target_mixed = float((tgt != tgt_up).mean()) if len(tgt) else 0.0
+        if not prefer_mouse and hit_mouse_case == hit_upper and frac_target_mixed >= 0.2:
+            prefer_mouse = True
+
+        chosen = mouse_style if prefer_mouse else upper
+        try:
+            _logging.getLogger('cellscope').info(
+                "Gold gene case harmonization: upper=%d, mouse_case=%d, mouse_upper=%d, target_mixed=%.2f, chosen=%s",
+                hit_upper, hit_mouse_case, hit_mouse_upper, frac_target_mixed,
+                'mouse-style' if prefer_mouse else 'upper'
+            )
+        except Exception:
+            pass
+
+    gd['Common_Gene'] = chosen
+
+    # Deduplicate after recasing; aggregate by max to keep conservative probabilities.
+    if gd['Common_Gene'].duplicated().any():
+        num_cols = [c for c in gd.columns if c != 'Common_Gene']
+        agg = gd.groupby('Common_Gene', sort=False)[num_cols].max()
+        gd = agg.reset_index()
+
+    return gd
+
+# ---------- Gold 处理 ----------
+def prepare_gold_matrix(gold_df: pd.DataFrame) -> pd.DataFrame:
     gd = gold_df.copy()
     if 'Common_Gene' in gd.columns and gd.index.name != 'Common_Gene':
         gd = gd.set_index('Common_Gene')
     gd.index = gd.index.astype(str).str.upper()
     num_gd = gd.apply(pd.to_numeric, errors='coerce').dropna(axis=1, how='all').dropna(axis=0, how='all')
+    if num_gd.shape[1] == 0:
+        raise ValueError("gold_data 数值化后无可用列。")
     vals = num_gd.to_numpy(dtype=np.float32, copy=True)
     cmin = np.nanmin(vals, axis=0, keepdims=True)
     cmax = np.nanmax(vals, axis=0, keepdims=True)
@@ -3620,48 +3985,81 @@ def _prepare_gold_matrix(gold_df: pd.DataFrame) -> pd.DataFrame:
     return num_gd
 
 
-def _build_group_means(adata: ad.AnnData, gold_gene_index_upper: pd.Index):
-    from scipy.sparse import csr_matrix as _csr
-    from scipy.sparse import issparse as _iss
-    """Compute per-cluster mean expression for genes of interest.
+def _canon_region_col(colname: str) -> str:
+    s = str(colname).strip().upper().replace(' ', '_')
+    s = re.sub(r'(_LOG2FC)$', '', s)
+    s = re.sub(r'(_DEORPHAN(ED)?)$', '', s)
+    s = re.sub(r'(_ORPHAN)$', '', s)
+    s = re.sub(r'__+', '_', s)
+    return GOLD_ALIAS.get(s, s)
 
-    The function expects `adata.obs['leiden']` to exist. It selects the
-    genes present in `gold_gene_index_upper` (which should be upper-cased),
-    aggregates the observations by leiden cluster and returns a CSR sparse
-    matrix of cluster x gene means along with the cluster id list and the
-    array of genes (upper-case) corresponding to matrix columns.
 
-    Parameters
-    ----------
-    adata : anndata.AnnData
-        AnnData containing observations and variables. Must contain
-        `adata.obs['leiden']` and `adata.var_names`.
-    gold_gene_index_upper : pd.Index
-        An index (upper-case gene names) used to filter adata.var_names.
+def build_adaptive_sets(gold_mat: pd.DataFrame):
+    gm = gold_mat.copy()
+    gm.columns = [_canon_region_col(c) for c in gm.columns]
+    keep = [c for c in gm.columns if c in TARGET_REGIONS]
+    if not keep:
+        raise ValueError(f"清洗后无目标区域列；现有列={list(set(gm.columns))}")
+    gm = gm[keep].groupby(level=0, axis=1).max()
 
-    Returns
-    -------
-    group_mean : scipy.sparse.csr_matrix
-        Sparse matrix of shape (n_clusters, n_genes_selected) with mean
-        expression per cluster.
-    cluster_ids : list
-        Ordered list of leiden cluster labels corresponding to rows.
-    genes_up : np.ndarray
-        Array of upper-case gene names corresponding to columns.
-    """
+    vals = gm.to_numpy(dtype=np.float32, copy=True)
+    cmin = np.nanmin(vals, axis=0, keepdims=True)
+    cmax = np.nanmax(vals, axis=0, keepdims=True)
+    span = np.maximum(cmax - cmin, 1e-8)
+    vals = (vals - cmin) / span
+    gm = pd.DataFrame(vals, index=gm.index, columns=gm.columns)
+
+    row_sum = gm.sum(1).replace(0, np.nan)
+    gm_norm = gm.div(row_sum, axis=0).fillna(0.0)
+
+    arr = gm_norm.to_numpy()
+    top_idx = arr.argmax(axis=1)
+    top_val = arr[np.arange(arr.shape[0]), top_idx]
+    second_val = np.partition(arr, -2, axis=1)[:, -2] if arr.shape[1] >= 2 else np.zeros_like(top_val)
+    margin = top_val - second_val
+
+    genes = gm_norm.index.to_numpy()
+    regions_raw = list(gm_norm.columns)
+
+    sets, weights = {}, {}
+    for r_i, r in enumerate(regions_raw):
+        pool = np.where((top_idx == r_i) & (top_val >= MIN_TOP_VALUE))[0]
+        if pool.size == 0:
+            sets[r] = set()
+            weights[r] = pd.Series(dtype=np.float32)
+            continue
+        score = top_val[pool] * (margin[pool] if USE_MARGIN else 1.0)
+        order = np.argsort(-score, kind='mergesort')
+        take = min(max(TARGET_SET_SIZE, MIN_SET_SIZE), min(pool.size, MAX_SET_SIZE))
+        sel = pool[order[:take]]
+        w = (top_val[sel] * margin[sel]).astype(np.float32)
+        if w.size > 0:
+            w = (w - w.min()) / (w.max() - w.min() + 1e-8)
+        sets[r] = set(genes[sel])
+        weights[r] = pd.Series(w, index=genes[sel], name=r).sort_values(ascending=False)
+
+    sets = {PRETTY.get(k, k): v for k, v in sets.items()}
+    weights = {PRETTY.get(k, k): s for k, s in weights.items()}
+    regions = list(sets.keys())
+    return sets, weights, regions
+
+
+# ---------- 表达汇总与稳健 Z ----------
+def build_group_means(adata, gold_gene_index_upper):
     if 'leiden' not in adata.obs.columns:
-        raise KeyError("adata.obs is missing 'leiden'. Please cluster first and write labels into adata.obs['leiden'].")
+        raise KeyError("adata.obs is missing 'leiden'. Please complete the clustering first and write the cluster labels into adata.obs['leiden'].")
     common_genes_up = adata.var_names.astype(str).str.upper()
     mask_common = common_genes_up.isin(gold_gene_index_upper)
     if mask_common.sum() == 0:
-        raise RuntimeError("No gene intersection with gold. Please check naming/mapping.")
+        raise RuntimeError("No intersection with gold data. Please check naming/mapping.")
     X = adata[:, mask_common].X
     leiden_cat = adata.obs['leiden'].astype('category')
     codes = leiden_cat.cat.codes.to_numpy()
     n_groups = int(codes.max()) + 1
     n_obs = adata.n_obs
-    M = _csr((np.ones(n_obs, dtype=np.float32), (codes, np.arange(n_obs, dtype=np.int64))), shape=(n_groups, n_obs), dtype=np.float32)
-    group_sum = M @ (X if _iss(X) else _csr(X))
+    M = sp.csr_matrix((np.ones(n_obs, dtype=np.float32), (codes, np.arange(n_obs, dtype=np.int64))),
+                      shape=(n_groups, n_obs), dtype=np.float32)
+    group_sum = M @ (X if sp.issparse(X) else sp.csr_matrix(X))
     counts = np.maximum(np.bincount(codes, minlength=n_groups).astype(np.float32), 1e-8)
     group_mean = group_sum.multiply(1.0 / counts[:, None]).tocsr()
     cluster_ids = list(leiden_cat.cat.categories)
@@ -3669,25 +4067,7 @@ def _build_group_means(adata: ad.AnnData, gold_gene_index_upper: pd.Index):
     return group_mean, cluster_ids, genes_up
 
 
-def _robust_gene_stats(group_mean_csr):
-    """Compute robust, MAD-scaled statistics per gene across clusters.
-
-    This routine converts the sparse group-mean matrix to a dense array and
-    computes a robust z-like score per gene and cluster using the gene-wise
-    median and MAD (median absolute deviation). The returned matrix S has
-    shape (n_clusters, n_genes) and is suitable for downstream rank-based
-    and projection enrichment tests.
-
-    Parameters
-    ----------
-    group_mean_csr : scipy.sparse.csr_matrix
-        Sparse matrix of cluster x gene means.
-
-    Returns
-    -------
-    np.ndarray
-        Robust standardized scores (S) with non-finite values coerced to 0.
-    """
+def robust_gene_stats(group_mean_csr):
     G = group_mean_csr.toarray().astype(np.float32)
     med = np.median(G, axis=0, keepdims=True)
     mad = np.median(np.abs(G - med), axis=0, keepdims=True)
@@ -3697,99 +4077,113 @@ def _robust_gene_stats(group_mean_csr):
     return S
 
 
-def _rapx_annotate_core(adata_sub: ad.AnnData, sets: dict, regions: List[str]) -> pd.DataFrame:
-    from scipy.stats import rankdata, norm, hypergeom
-    from scipy.special import erfc
-    """Core RAP-X enrichment engine.
+def normalize_subanno(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.lower()
+    s = s.str.replace(r"[^a-z]+", "", regex=True)
+    return s
 
-    For each cluster (from adata_sub.obs['leiden']) and each region, this
-    function computes multiple enrichment statistics and combines them into
-    a single z-like score and an FDR-like q-value. The three channels used
-    per region are:
 
-      - a rank-based Mann-Whitney-like z from cluster-level robust scores,
-      - a projection score of the cluster vector onto a region-specific
-        weight vector,
-      - a top-K hypergeometric enrichment p-value converted to a z-score.
-
-    The three channels are averaged (normalized) to form `z_comb`, which is
-    then centered by its median and converted to p/q for multiple-region
-    ranking. The returned DataFrame (index = leiden) contains for each
-    cluster the combined z and q for each region and the chosen label
-    (`label`, `z1`, `q1`).
-
-    Parameters
-    ----------
-    adata_sub : anndata.AnnData
-        AnnData with observations aggregated at the meta-domain level. Must
-        include `adata_sub.obs['leiden']`.
-    sets : dict
-        Mapping from region name to set of gene names (strings, upper/lower
-        case tolerated) used as region markers.
-    regions : list
-        Ordered list of region names corresponding to keys of `sets`.
-
-    Returns
-    -------
-    pd.DataFrame
-        Annotation table indexed by `leiden` containing per-region
-        `z_comb__{region}` and `q_comb__{region}` columns plus `label`,
-        `z1`, and `q1` for each cluster.
-    """
-    # build labels over gold genes
+# ---------- 核心标注逻辑（新增空间通道）----------
+def _rapx_annotate_core(adata_sub, sets, regions,
+                        use_spatial_channel=False,
+                        geom_before_top2=True,
+                        top2_switch_z_floor_ratio=0.9,
+                        top2_switch_q_ceiling_ratio=2.0,
+                        top2_switch_z_not_much_worse=0.25):
     gold_genes_upper = pd.Index(sorted(set().union(*[set(map(str.upper, s)) for s in sets.values()])))
-    group_mean, cluster_ids, genes_up = _build_group_means(adata_sub, gold_genes_upper)
-    S = _robust_gene_stats(group_mean)
+    group_mean, cluster_ids, genes_up = build_group_means(adata_sub, gold_genes_upper)
+    S = robust_gene_stats(group_mean)
+
     Gn = len(genes_up)
     gene_pos = {g: i for i, g in enumerate(genes_up)}
     region_indices, region_weights = {}, {}
     for r in regions:
         idx = np.fromiter((gene_pos[g] for g in sets[r] if g in gene_pos), dtype=np.int64, count=-1)
-        idx.sort(); region_indices[r] = idx
+        idx.sort()
+        region_indices[r] = idx
         w = np.zeros(Gn, dtype=np.float32)
         if idx.size > 0:
             w[idx] = 1.0 / np.sqrt(max(idx.size, 1))
         region_weights[r] = w
 
     def z_mwu_from_ranks(ranks: np.ndarray, idx_in: np.ndarray) -> float:
-        n1 = idx_in.size; n2 = ranks.size - n1
-        if n1 < 5 or n2 < 5: return 0.0
+        n1 = idx_in.size
+        n2 = ranks.size - n1
+        if n1 < 5 or n2 < 5:
+            return 0.0
         R_sum = ranks[idx_in].sum(dtype=np.float64)
         U = R_sum - n1 * (n1 + 1) / 2.0
         mean_U = n1 * n2 / 2.0
         std_U  = np.sqrt(n1 * n2 * (n1 + n2 + 1) / 12.0)
-        if std_U <= 0 or not np.isfinite(std_U): return 0.0
+        if std_U <= 0 or not np.isfinite(std_U):
+            return 0.0
         return float((U - mean_U) / std_U)
 
     def p_to_z_right_tail(p: float, cap: float = 8.0) -> float:
-        if p <= 0: return cap
+        if p <= 0:
+            return cap
         p = max(min(p, 1.0), 1e-300)
         return float(norm.isf(p))
 
+    rmean_cache = adata_sub.obs.groupby('leiden')['r_mean'].mean().to_dict() if 'r_mean' in adata_sub.obs.columns else {}
+    NUC_GROUP = {'Nucleus','Nucleolus','Lamina','Nuclear Pore'}
+    CYT_GROUP = {'Cytosol','ER','OMM'}
+
     records = []
-    for iC, clu in enumerate(cluster_ids):
+    for iC, clu in enumerate(tqdm(cluster_ids, desc="RAP-X annotation (with spatial)", ncols=80)):
         s_vec = S[iC, :].astype(np.float32, copy=False)
         ranks = rankdata(s_vec, method='average').astype(np.float64)
+
         G_eff = s_vec.size
-        K = min(max(250, int(0.3 * G_eff)), G_eff)
+        K = max(TOPK_OVERLAP_MIN, int(TOPK_OVERLAP_FRAC * G_eff))
+        K = min(K, G_eff)
         topk_idx = np.argpartition(s_vec, G_eff - K)[-K:]
-        topk_mask = np.zeros(G_eff, dtype=bool); topk_mask[topk_idx] = True
+        topk_mask = np.zeros(G_eff, dtype=bool)
+        topk_mask[topk_idx] = True
+
         s_std = float(np.std(s_vec)) + 1e-8
-        z_comb = np.zeros(len(regions), dtype=np.float32)
+
+        z_mwu_arr  = np.zeros(len(regions), dtype=np.float32)
+        z_proj_arr = np.zeros(len(regions), dtype=np.float32)
+        z_hyp_arr  = np.zeros(len(regions), dtype=np.float32)
+        z_spatial_arr = np.zeros(len(regions), dtype=np.float32)
+
         for j, r in enumerate(regions):
             idx_in = region_indices[r]
-            if idx_in.size == 0: z_comb[j] = 0.0; continue
-            z_mwu = z_mwu_from_ranks(ranks, idx_in)
-            z_proj = float(np.dot(s_vec, region_weights[r]) / s_std) if s_std > 0 else 0.0
+            if idx_in.size == 0:
+                z_mwu_arr[j] = 0.0; z_proj_arr[j] = 0.0; z_hyp_arr[j] = 0.0; z_spatial_arr[j] = 0.0
+                continue
+
+            z_mwu_arr[j] = z_mwu_from_ranks(ranks, idx_in)
+            z_proj_arr[j] = float(np.dot(s_vec, region_weights[r]) / s_std) if s_std > 0 else 0.0
             x = int(topk_mask[idx_in].sum())
-            from scipy.stats import hypergeom as _hyper
-            p = float(_hyper.sf(x - 1, G_eff, idx_in.size, K))
-            z_hyp = p_to_z_right_tail(p)
-            # simple average of three channels
-            z_comb[j] = (z_mwu + z_proj + z_hyp) / np.sqrt(3.0)
+            p = float(hypergeom.sf(x - 1, G_eff, idx_in.size, K))
+            z_hyp_arr[j] = p_to_z_right_tail(p)
+
+            if use_spatial_channel:
+                cluster_mask = adata_sub.obs['leiden'] == clu
+                r_mean = adata_sub.obs.loc[cluster_mask, 'r_mean'].mean() if 'r_mean' in adata_sub.obs.columns else 0.0
+                if r in NUC_GROUP:
+                    z_spatial_arr[j] = -r_mean if r_mean < 0 else -1.0
+                else:
+                    z_spatial_arr[j] = r_mean if r_mean > 0 else -1.0
+
+        if use_spatial_channel:
+            z_spatial_arr = (z_spatial_arr - z_spatial_arr.mean()) / (z_spatial_arr.std() + 1e-8)
+
+        if use_spatial_channel and len(CHANNEL_WEIGHTS) >= 4:
+            w_mwu, w_proj, w_hyp, w_spatial = CHANNEL_WEIGHTS
+            den = np.sqrt(w_mwu**2 + w_proj**2 + w_hyp**2 + w_spatial**2)
+            z_comb = (w_mwu*z_mwu_arr + w_proj*z_proj_arr + w_hyp*z_hyp_arr + w_spatial*z_spatial_arr) / den
+        else:
+            w_mwu, w_proj, w_hyp = CHANNEL_WEIGHTS[:3]
+            den = np.sqrt(w_mwu**2 + w_proj**2 + w_hyp**2)
+            z_comb = (w_mwu*z_mwu_arr + w_proj*z_proj_arr + w_hyp*z_hyp_arr) / den
+
         z_comb[~np.isfinite(z_comb)] = 0.0
         med = np.median(z_comb[np.isfinite(z_comb)])
         z_centered = z_comb - med
+
         p_for_fdr = 0.5 * erfc(z_centered / np.sqrt(2.0))
         p_for_fdr = np.clip(p_for_fdr, 1e-300, 1.0)
         order_p = np.argsort(p_for_fdr)
@@ -3798,153 +4192,629 @@ def _rapx_annotate_core(adata_sub: ad.AnnData, sets: dict, regions: List[str]) -
         q_comb[order_p] = p_for_fdr[order_p] * len(regions) / ranks_p
         for t in range(len(regions) - 2, -1, -1):
             q_comb[order_p[t]] = min(q_comb[order_p[t]], q_comb[order_p[t + 1]])
-        i1 = int(np.argmax(z_centered)); r1 = regions[i1]
-        rec = { 'leiden': clu, 'label': str(r1), 'z1': float(z_centered[i1]), 'q1': float(q_comb[i1]) }
+
+        ord_reg = np.argsort(-z_centered)
+        i1 = ord_reg[0]
+        i2 = ord_reg[1] if len(regions) > 1 else ord_reg[0]
+        r1, r2 = regions[i1], regions[i2]
+        z1, z2 = float(z_centered[i1]), float(z_centered[i2])
+        q1, q2 = float(q_comb[i1]), float(q_comb[i2])
+
+        promote = False
+        if PROMOTE_TOP2 and (z2 >= Z_CUTOFF) and ((z1 - z2) < DELTA_PROMOTE) and (z2 >= REL_PROMOTE * max(z1, 1e-8)) and (q2 <= FDR_CUTOFF * 1.5):
+            promote = True
+            i_chosen, i_other = i2, i1
+        else:
+            i_chosen, i_other = i1, i2
+
+        def _unpack_choice(i_chosen, i_other):
+            return (regions[i_chosen], float(z_centered[i_chosen]), float(q_comb[i_chosen]),
+                    regions[i_other],  float(z_centered[i_other]),  float(q_comb[i_other]))
+
+        def _apply_geometry(i_chosen, i_other):
+            r_chosen, z_chosen, q_chosen, r_other, z_other, q_other = _unpack_choice(i_chosen, i_other)
+            r_pref = rmean_cache.get(clu, np.nan)
+            reg2idx = {r:i for i,r in enumerate(regions)}
+            idx_nuc = [reg2idx[r] for r in regions if r in NUC_GROUP]
+            idx_cyt = [reg2idx[r] for r in regions if r in CYT_GROUP]
+            if (q_chosen > FDR_CUTOFF or (z_chosen - z_other) < TIE_DELTA) and np.isfinite(r_pref):
+                prefer_nuc = (r_pref < 0)
+                cand_idx = idx_nuc if prefer_nuc else idx_cyt
+                if cand_idx:
+                    j = int(cand_idx[np.argmax(z_centered[cand_idx])])
+                    if z_centered[j] + 0.25 >= z_chosen:
+                        i_chosen = j
+                        i_other  = i1 if j != i1 else i2
+            return i_chosen, i_other
+
+        def _apply_top2_if_lowconf(i_chosen, i_other):
+            r_chosen, z_chosen, q_chosen, r_other, z_other, q_other = _unpack_choice(i_chosen, i_other)
+            if ALWAYS_ASSIGN:
+                prelim_low_conf = not ((q_chosen <= FDR_CUTOFF) and (z_chosen >= Z_CUTOFF) and ((z_chosen - z_other) >= TIE_DELTA or q_other > FDR_CUTOFF*2))
+            else:
+                prelim_low_conf = not ((q_chosen <= FDR_CUTOFF) and (z_chosen >= Z_CUTOFF))
+            used_top2 = False
+            if prelim_low_conf:
+                can_switch = (
+                    (z2 >= (Z_CUTOFF * top2_switch_z_floor_ratio)) and
+                    (q2 <= (FDR_CUTOFF * top2_switch_q_ceiling_ratio)) and
+                    (z2 >= z1 - top2_switch_z_not_much_worse)
+                )
+                if can_switch:
+                    i_chosen, i_other = i_other, i_chosen
+                    used_top2 = True
+            return i_chosen, i_other, prelim_low_conf, used_top2
+
+        if geom_before_top2:
+            i_chosen, i_other = _apply_geometry(i_chosen, i_other)
+            i_chosen, i_other, prelim_low_conf, used_top2_due_to_low_conf = _apply_top2_if_lowconf(i_chosen, i_other)
+        else:
+            i_chosen, i_other, prelim_low_conf, used_top2_due_to_low_conf = _apply_top2_if_lowconf(i_chosen, i_other)
+            i_chosen, i_other = _apply_geometry(i_chosen, i_other)
+
+        r_chosen, z_chosen, q_chosen, r_other, z_other, q_other = _unpack_choice(i_chosen, i_other)
+
+        rec = {
+            'leiden': clu,
+            'label': str(r_chosen),
+            'low_conf': bool(prelim_low_conf),
+            'top1': r1, 'z1': round(z1,3), 'q1': q1,
+            'top2': r2, 'z2': round(z2,3), 'q2': q2,
+            'promoted_from_top2': bool(promote),
+            'used_top2_due_to_low_conf': bool(used_top2_due_to_low_conf),
+        }
         for j, r in enumerate(regions):
-            rec[f'z_comb__{r}'] = float(z_comb[j]); rec[f'q_comb__{r}'] = float(q_comb[j])
+            rec[f'z_mwu__{r}']  = round(float(z_mwu_arr[j]), 3)
+            rec[f'z_proj__{r}'] = round(float(z_proj_arr[j]), 3)
+            rec[f'z_hyp__{r}']  = round(float(z_hyp_arr[j]), 3)
+            rec[f'z_comb__{r}'] = round(float(z_comb[j]), 3)
+            rec[f'q_comb__{r}'] = float(q_comb[j])
+            if use_spatial_channel:
+                rec[f'z_spatial__{r}'] = round(float(z_spatial_arr[j]), 3)
         records.append(rec)
+
     annot_df = pd.DataFrame.from_records(records).set_index('leiden')
     return annot_df
 
 
-def run_rapx(adata: ad.AnnData, gold_df: pd.DataFrame, produced_label_col: str = 'subcellular_annotation',
-            max_genes_per_region: int = 1200, min_genes_per_region: int = 300, frac_genes: float = 0.25) -> pd.DataFrame:
-    """Execute RAP-X annotation.
+# ---------- 工具：初始化/清理目标列 dtype，避免 Categorical 写回错误 ----------
+def _ensure_obs_columns_initialized(adata, produced_label_col, meta_cols):
+    import numpy as _np
+    import pandas as _pd
 
-    Performance knobs:
-      max_genes_per_region: hard cap of genes selected per region (default 1200).
-      min_genes_per_region: lower bound (default 300).
-      frac_genes: fraction of available genes to consider (default 0.25).
-    """
-    gold_mat0 = _prepare_gold_matrix(gold_df)
-    vals = gold_mat0.to_numpy(dtype=np.float32, copy=True)
-    row_sum = np.nansum(vals, axis=1, keepdims=True); row_sum[row_sum <= 0] = 1.0
-    gm_norm = (vals / row_sum).astype(np.float32)
-    genes = gold_mat0.index.to_numpy()
-    regions_raw = [c for c in gold_mat0.columns if c in SEVEN_COLS]
-    sets = {}
-    n_total = len(genes)
-    # derive dynamic take size once
-    dyn_take = int(max(min_genes_per_region, int(frac_genes * n_total)))
-    dyn_take = int(min(max_genes_per_region, dyn_take))
-    for i, r in enumerate(regions_raw):
-        scores = gm_norm[:, i]
-        order = np.argsort(-scores)
-        take = dyn_take
-        sets[SEVEN_PRETTY.get(r, r)] = set(genes[order[:take]].astype(str))
-    regions = list(sets.keys())
-    annot_df = _rapx_annotate_core(adata, sets, regions)
-    adata.obs[produced_label_col] = adata.obs['leiden'].map(annot_df['label']).astype('category')
+    if (produced_label_col not in adata.obs.columns) or isinstance(adata.obs[produced_label_col].dtype, _pd.CategoricalDtype):
+        adata.obs[produced_label_col] = _pd.Series([_pd.NA] * adata.n_obs, dtype="object", index=adata.obs_names)
+
+    _meta_dtypes = {
+        'top1': 'object', 'top2': 'object',
+        'z1': 'float32', 'z2': 'float32',
+        'q1': 'float64', 'q2': 'float64',
+        'low_conf': 'boolean',
+        'promoted_from_top2': 'boolean',
+        'used_top2_due_to_low_conf': 'boolean',
+    }
+
+    for col in meta_cols:
+        tgt = f"subcell_{col}"
+        want = _meta_dtypes.get(col, 'object')
+
+        if (tgt not in adata.obs.columns) or isinstance(adata.obs[tgt].dtype, _pd.CategoricalDtype):
+            if want in ('float32', 'float64'):
+                fill = _np.nan
+            else:
+                fill = _pd.NA
+            adata.obs[tgt] = _pd.Series([fill] * adata.n_obs, dtype=want, index=adata.obs_names)
+
+
+# ---------- QUQ 诊断富集可视化 ----------
+def improved_enrichment_visualization(
+    adata,
+    annot_df,
+    sets,
+    produced_label_col='subcellular_annotation',
+    p_adj_max=0.1,
+    lfc_min=0.0,
+    selection_mode='quq',
+    q_per_group=800,
+    min_freq_abs=2,
+    min_freq_frac=0.2,
+    balance_labels=True,
+    target_per_label=3000,
+    min_per_label=500,
+    max_per_label=20000,
+    min_query_fallback=150,
+    fallback_mode='weighted_union',
+    show_tables=True
+):
+    sns.set(style='whitegrid', context='talk')
+
+    def _map_var_upper(adata):
+        vn = adata.var_names.astype(str)
+        up = vn.str.upper()
+        mp = {}
+        for i,u in enumerate(up):
+            if u not in mp:
+                mp[u] = vn[i]
+        return mp
+
+    def _genes_to_var(genes, up2var):
+        out = []
+        for g in genes:
+            if g is None:
+                continue
+            v = up2var.get(str(g).upper())
+            if v is not None:
+                out.append(v)
+        return set(out)
+
+    sc.tl.rank_genes_groups(adata, groupby='leiden', method='wilcoxon', use_raw=False)
+    deg_df = sc.get.rank_genes_groups_df(adata, group=None).copy()
+    deg_df['names'] = deg_df['names'].astype(str)
+    for c in ['pvals_adj','logfoldchanges','scores']:
+        deg_df[c] = pd.to_numeric(deg_df[c], errors='coerce')
+    deg_df = deg_df[deg_df['logfoldchanges'] > 0]
+    if p_adj_max is not None:
+        deg_df = deg_df[deg_df['pvals_adj'] <= float(p_adj_max)]
+    if lfc_min is not None:
+        deg_df = deg_df[deg_df['logfoldchanges'] >= float(lfc_min)]
+
+    groups_in_deg = sorted(deg_df['group'].astype(str).unique().tolist())
+    top_by_group = {}
+    for g in groups_in_deg:
+        sub = deg_df[deg_df['group'].astype(str) == g].copy()
+        sub = sub.sort_values(['pvals_adj','logfoldchanges','scores'],
+                              ascending=[True, False, False], kind='mergesort')
+        if q_per_group is not None:
+            sub = sub.head(int(q_per_group))
+        top_by_group[g] = sub
+
+    print(f"Avg genes per cluster (Top-q): {np.mean([len(v) for v in top_by_group.values()]) if top_by_group else 0:.0f}")
+
+    grp2lab = annot_df['label'].astype(str).to_dict()
+
+    label_cluster_counts = Counter(annot_df['label'].astype(str))
+    label_gene_hits = defaultdict(Counter)
+    for g, sub in top_by_group.items():
+        lab = grp2lab.get(str(g), "Unknown")
+        if lab == "Unknown":
+            continue
+        label_gene_hits[lab].update(sub['names'].astype(str).tolist())
+
+    genes_by_label = {}
+    weights_by_label = {}
+
+    def _build_union(lab):
+        picked = list(label_gene_hits.get(lab, Counter()).keys())
+        return set(picked), pd.Series(1.0, index=picked, dtype=float)
+
+    def _build_weighted_union(lab):
+        agg = []
+        for g, sub in top_by_group.items():
+            if grp2lab.get(str(g), 'Unknown') != lab:
+                continue
+            s = sub.copy()
+            s['w'] = (-np.log10(s['pvals_adj'].clip(lower=1e-300)) + s['logfoldchanges'].clip(lower=0))
+            agg.append(s[['names','w']])
+        if len(agg):
+            W = pd.concat(agg).groupby('names')['w'].sum().sort_values(ascending=False)
+            order = W.index.tolist()
+            return set(order), W
+        else:
+            return _build_union(lab)
+
+    def _cap_balance(gset, wser):
+        if not balance_labels:
+            return gset, wser
+        if len(gset) == 0:
+            return gset, wser
+        order = wser.sort_values(ascending=False).index
+        cap = max(min_per_label, min(len(order), target_per_label))
+        order = order[:min(cap, max_per_label)]
+        return set(order), wser.reindex(order).fillna(0.0)
+
+    for lab in label_gene_hits.keys():
+        if selection_mode.lower() == 'union':
+            gset, wser = _build_union(lab)
+        elif selection_mode.lower() == 'weighted_union':
+            gset, wser = _build_weighted_union(lab)
+        else:
+            n_lab = max(1, int(label_cluster_counts.get(lab, 1)))
+            thr = max(int(min_freq_abs), int(math.ceil(min_freq_frac * n_lab)))
+            picked = [g for g, c in label_gene_hits[lab].items() if c >= thr]
+            wser = pd.Series({g: float(label_gene_hits[lab][g]) for g in picked}, dtype=float) if picked else pd.Series(dtype=float)
+            gset = set(picked)
+        gset, wser = _cap_balance(gset, wser)
+        genes_by_label[lab] = gset
+        weights_by_label[lab] = wser
+
+    did_fallback = False
+    for lab in list(genes_by_label.keys()):
+        if 0 < len(genes_by_label[lab]) < int(min_query_fallback):
+            did_fallback = True
+            if fallback_mode == 'weighted_union':
+                gset, wser = _build_weighted_union(lab)
+            else:
+                gset, wser = _build_union(lab)
+            gset, wser = _cap_balance(gset, wser)
+            genes_by_label[lab] = gset
+            weights_by_label[lab] = wser
+    print("Query sizes by label:", {k: len(v) for k, v in genes_by_label.items()})
+    if did_fallback:
+        print(f"[Note] Applied fallback for labels with query < {min_query_fallback} using mode='{fallback_mode}'")
+
+    up2var = _map_var_upper(adata)
+    background_genes = set(up2var.values())
+    gold_sets_diag = {lab: (_genes_to_var(gset, up2var) & background_genes) for lab, gset in sets.items()}
+
+    def _star(fdr):
+        return '***' if fdr<=1e-3 else '**' if fdr<=1e-2 else '*' if fdr<=0.05 else 'ns'
+
+    rows = []
+    regions_all = [r for r in PRETTY_ORDER if r in sets.keys()]
+    for lab in regions_all:
+        gold = gold_sets_diag.get(lab, set()) & background_genes
+        query = genes_by_label.get(lab, set())
+
+        if len(query) and (next(iter(query)) not in background_genes):
+            query = _genes_to_var(query, up2var)
+        query = query & background_genes
+
+        A = len(query & gold)
+        B = len(query - gold)
+        C = len(gold - query)
+        D = len(background_genes - (query | gold))
+        N = A + B + C + D
+
+        a,b,c,d = A+0.5, B+0.5, C+0.5, D+0.5
+        p1 = a / (a+b); p0 = c / (c+d)
+        fe = (p1 / p0) if p0 > 0 else np.inf
+        log2fe = np.log2(fe) if fe > 0 else -np.inf
+
+        _, p_fisher = fisher_exact([[A, B],[C, D]], alternative='greater')
+        p_hg = float(hypergeom.sf(max(A,0)-1, N, (A+C), (A+B))) if (A+B)>0 and (A+C)>0 else 1.0
+
+        OR = (a*d)/(b*c)
+        var_logOR = (1/a)+(1/b)+(1/c)+(1/d)
+        se_logOR = math.sqrt(var_logOR)
+        z = 1.96
+        logOR = math.log(OR)
+        lo, hi = logOR - z*se_logOR, logOR + z*se_logOR
+        log2OR = logOR/math.log(2); lo2, hi2 = lo/math.log(2), hi/math.log(2)
+
+        rows.append({
+            'Label': lab,
+            'Overlap': int(A),
+            'Query_genes': int(A+B),
+            'Gold_genes': int(A+C),
+            'Background': int(N),
+            'Expected': float((A+B)*(A+C)/max(N,1)),
+            'Fold_enrichment': float(fe),
+            'log2FE': float(log2fe),
+            'Odds_ratio': float(OR),
+            'log2OR': float(log2OR),
+            'log2OR_CI_lo': float(lo2),
+            'log2OR_CI_hi': float(hi2),
+            'P_value_hg': float(p_hg),
+            'P_value_fisher': float(p_fisher)
+        })
+
+    enrich_df = pd.DataFrame(rows).set_index('Label')
+    if len(enrich_df):
+        _, fdr, _, _ = multipletests(enrich_df['P_value_hg'].values, method='fdr_bh')
+        enrich_df['FDR'] = fdr
+        enrich_df['Significance'] = enrich_df['FDR'].apply(_star)
+    else:
+        enrich_df['FDR'] = []
+        enrich_df['Significance'] = []
+
+    regions = [r for r in PRETTY_ORDER if r in enrich_df.index]
+    E = enrich_df.loc[regions]
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12), gridspec_kw={'height_ratios':[1.1,0.9]})
+
+    ax = axes[0,0]
+    y = np.arange(len(E))[::-1]
+    ax.hlines(y, xmin=E['log2OR_CI_lo'].values[::-1], xmax=E['log2OR_CI_hi'].values[::-1],
+              colors=[SIG_COLOR[s] for s in E['Significance'].values[::-1]], lw=3, alpha=0.9)
+    ax.plot(E['log2OR'].values[::-1], y, 'o', color='black', ms=6)
+    for i,(lab,r) in enumerate(E.iloc[::-1].iterrows()):
+        ax.text(r['log2OR']+0.08, y[i], f"{r['log2FE']:.2f} FE {r['Significance']}", va='center', fontsize=10)
+    ax.axvline(0, color='k', ls='--', alpha=0.6)
+    ax.set_yticks(y); ax.set_yticklabels(E.index[::-1])
+    ax.set_xlabel('log2(OR) with 95% CI'); ax.set_title('Enrichment')
+
+    ax = axes[0,1]
+    x = E['log2FE'].values; yv = -np.log10(E['FDR'].clip(lower=1e-300).values)
+    sizes = 60 + 30*np.sqrt(np.clip(E['Overlap'].values,1,None))
+    colors = [SIG_COLOR[s] for s in E['Significance']]
+    ax.scatter(x, yv, s=sizes, c=colors, edgecolors='black', alpha=0.9)
+    for lab, xv, yvi in zip(E.index, x, yv):
+        ax.annotate(lab, (xv, yvi), xytext=(6,4), textcoords='offset points', fontsize=10)
+    ax.axvline(0, color='k', ls='--', alpha=0.5)
+    ax.axhline(-np.log10(0.05), color='red', ls='--', alpha=0.5, label='FDR=0.05')
+    ax.set_xlabel('log2(FE)'); ax.set_ylabel('-log10(FDR)'); ax.set_title('Significance Volcano')
+
+    ax = axes[1,0]
+    ax.scatter(E['log2FE'], E.index, s=60+30*np.sqrt(np.clip(E['Overlap'],1,None)),
+               c=[SIG_COLOR[s] for s in E['Significance']], edgecolors='black', alpha=0.9)
+    ax.axvline(0, color='k', ls='--', alpha=0.5)
+    ax.set_xlabel('log2(FE)'); ax.set_ylabel(''); ax.set_title('Bubble: Overlap size & significance')
+
+    ax = axes[1,1]
+    width = 0.35
+    pos = np.arange(len(E))
+    q = E['Query_genes'].values; g = E['Gold_genes'].values
+    exp = E['Expected'].values
+    ax.barh(pos-width/2, q, height=width, label='Query', color='#4C72B0', alpha=0.85)
+    ax.barh(pos+width/2, g, height=width, label='Gold', color='#DD8452', alpha=0.85)
+    for i,(ev) in enumerate(exp):
+        ax.plot(ev, i, 'k|', ms=14)
+    ax.set_yticks(pos); ax.set_yticklabels(E.index)
+    ax.legend(loc='lower right'); ax.set_title('Power diagnostics (| marks Expected overlap)')
+    plt.tight_layout(); plt.show()
+
+    if show_tables:
+        try:
+            from IPython.display import display as _display
+            print("\n[Enrichment table]")
+            _display(E.round(4))
+        except Exception:
+            print("\n[Enrichment table]\n", E.round(4).to_string())
+
+    return enrich_df
+
+
+# ---------- 质量总览 ----------
+def plot_annotation_quality_summary(adata, annot_df, produced_label_col='subcellular_annotation'):
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+
+    label_counts = adata.obs[produced_label_col].value_counts()
+    colors = plt.cm.Set3(np.arange(len(label_counts)))
+    axes[0,0].pie(label_counts.values, labels=label_counts.index,
+                  autopct='%1.1f%%', colors=colors, startangle=90)
+    axes[0,0].set_title('Cell Label Distribution', fontsize=14, fontweight='bold')
+
+    conf_counts = adata.obs['subcell_low_conf'].value_counts()
+    conf_labels = ['High Confidence' if not x else 'Low Confidence' for x in conf_counts.index]
+    axes[0,1].pie(conf_counts.values, labels=conf_labels, autopct='%1.1f%%',
+                  colors=['lightgreen', 'lightcoral'], startangle=90)
+    axes[0,1].set_title('Annotation Confidence Distribution', fontsize=14, fontweight='bold')
+
+    z_scores = pd.to_numeric(adata.obs['subcell_z1'], errors='coerce').dropna()
+    axes[1,0].hist(z_scores, bins=30, alpha=0.7, edgecolor='black', color='skyblue')
+    z_median = float(z_scores.median()) if len(z_scores) else np.nan
+    if np.isfinite(z_median):
+        axes[1,0].axvline(x=z_median, color='red', linestyle='--', label=f'Median: {z_median:.2f}')
+        axes[1,0].legend()
+    axes[1,0].set_xlabel('Z-score (Top1)'); axes[1,0].set_ylabel('Frequency')
+    axes[1,0].set_title('Top1 Z-score Distribution', fontsize=14, fontweight='bold')
+    axes[1,0].grid(alpha=0.3)
+
+    q_values = pd.to_numeric(adata.obs['subcell_q1'], errors='coerce').dropna()
+    log_q = -np.log10(q_values + 1e-10) if len(q_values) else pd.Series([], dtype=float)
+    axes[1,1].hist(log_q, bins=30, alpha=0.7, edgecolor='black', color='orange')
+    axes[1,1].axvline(x=-np.log10(0.05), color='red', linestyle='--', label='FDR=0.05')
+    axes[1,1].set_xlabel('-log₁₀(Q-value)'); axes[1,1].set_ylabel('Frequency')
+    axes[1,1].set_title('Top1 Q-value Distribution', fontsize=14, fontweight='bold')
+    axes[1,1].legend(); axes[1,1].grid(alpha=0.3)
+
+    plt.tight_layout(); plt.show()
+
+    print(f"\n=== Annotation Quality Summary ===")
+    print(f"Total cells: {adata.n_obs:,}")
+    print(f"Total clusters: {len(annot_df)}")
+    high_conf_ratio = (~pd.to_numeric(adata.obs['subcell_low_conf'], errors='coerce')).mean()
+    print(f"High confidence annotation ratio: {high_conf_ratio:.1%}")
+    if np.isfinite(z_median):
+        print(f"Z-score median: {z_median:.2f}")
+    print(f"Significant annotation ratio (FDR≤0.05): {(q_values <= 0.05).mean():.1%}")
+    print("\nLabel distribution:")
+    for label, count in label_counts.items():
+        pct = count / adata.n_obs * 100
+        print(f"  {label}: {count:,} cells ({pct:.1f}%)")
+
+
+# ---------- 主函数（支持两阶段标注）----------
+def run_rapx(adata, gold_df=None, produced_label_col='subcellular_annotation',
+             plot_umap=True, plot_diag_enrich=False,
+             geom_before_top2=True,
+             top2_switch_z_floor_ratio=0.9,
+             top2_switch_q_ceiling_ratio=2.0,
+             top2_switch_z_not_much_worse=0.25,
+             use_two_stage=False,
+             use_spatial_channel=False):
+
+    if gold_df is None:
+        if 'gold_data' not in globals():
+            raise ValueError("请传 gold_df 或在全局提供 gold_data 变量。")
+        gold_df = globals()['gold_data']
+
+    if 'leiden' not in adata.obs.columns:
+        raise KeyError("adata.obs 缺少 'leiden'，请先在 adata.obs['leiden'] 写入簇标签。")
+    if use_two_stage and ('r_mean' not in adata.obs.columns):
+        raise KeyError("两阶段需要 adata.obs['r_mean'] 作为核/质粗分依据，请先计算并写入。")
+
+    gold_mat0 = prepare_gold_matrix(gold_df)
+    sets, weights, regions = build_adaptive_sets(gold_mat0)
+    print("区域基因集大小（RAP-X v2）：", {k: len(v) for k, v in sets.items()})
+
+    if use_two_stage:
+        print("\n=== Stage 1: Nuclear vs Cytoplasmic classification ===")
+        adata.obs['compartment_pred'] = np.where(
+            adata.obs['r_mean'] < 0, 'Nuclear', 'Cytoplasmic'
+        )
+
+        nuclear_labels = {'Nucleus', 'Nucleolus', 'Lamina', 'Nuclear Pore'}
+        cyto_labels    = {'Cytosol', 'ER', 'OMM'}
+
+        nuclear_sets = {k: v for k, v in sets.items() if k in nuclear_labels}
+        cyto_sets    = {k: v for k, v in sets.items() if k in cyto_labels}
+
+        print(f"Predicted compartments: {adata.obs['compartment_pred'].value_counts().to_dict()}")
+        print(f"Nuclear gold sets: {list(nuclear_sets.keys())}")
+        print(f"Cytoplasmic gold sets: {list(cyto_sets.keys())}")
+
+        meta_cols = ['top1','z1','q1','top2','z2','q2',
+                     'low_conf','promoted_from_top2','used_top2_due_to_low_conf']
+
+        _ensure_obs_columns_initialized(adata, produced_label_col, meta_cols)
+
+        annot_df_list = []
+
+        for comp, comp_sets in [('Nuclear', nuclear_sets), ('Cytoplasmic', cyto_sets)]:
+            mask = (adata.obs['compartment_pred'] == comp)
+            n_cells = int(mask.sum())
+            if n_cells == 0:
+                continue
+            print(f"\n=== Stage 2: Annotating {comp} ({n_cells} cells) ===")
+
+            adata_sub = adata[mask].copy()
+
+            annot_sub = _rapx_annotate_core(
+                adata_sub,
+                comp_sets,
+                list(comp_sets.keys()),
+                use_spatial_channel=use_spatial_channel,
+                geom_before_top2=geom_before_top2,
+                top2_switch_z_floor_ratio=top2_switch_z_floor_ratio,
+                top2_switch_q_ceiling_ratio=top2_switch_q_ceiling_ratio,
+                top2_switch_z_not_much_worse=top2_switch_z_not_much_worse
+            )
+
+            tmp_label = adata_sub.obs['leiden'].map(annot_sub['label']).astype('object')
+            adata.obs.loc[mask, produced_label_col] = tmp_label.values
+
+            for col in meta_cols:
+                src = adata_sub.obs['leiden'].map(annot_sub[col])
+                tgt = f"subcell_{col}"
+                if isinstance(adata.obs[tgt].dtype, pd.CategoricalDtype):
+                    adata.obs[tgt] = adata.obs[tgt].astype('object')
+
+                if col in ('low_conf','promoted_from_top2','used_top2_due_to_low_conf'):
+                    adata.obs.loc[mask, tgt] = pd.Series(src.values, index=adata.obs.index[mask]).astype('boolean').values
+                elif col in ('top1','top2'):
+                    adata.obs.loc[mask, tgt] = pd.Series(src.values, index=adata.obs.index[mask]).astype('object').values
+                elif col in ('z1','z2'):
+                    adata.obs.loc[mask, tgt] = pd.to_numeric(src, errors='coerce').astype('float32').values
+                elif col in ('q1','q2'):
+                    adata.obs.loc[mask, tgt] = pd.to_numeric(src, errors='coerce').astype('float64').values
+                else:
+                    adata.obs.loc[mask, tgt] = pd.Series(src.values, index=adata.obs.index[mask]).astype('object').values
+
+            annot_sub2 = annot_sub.copy()
+            annot_sub2['compartment'] = comp
+            annot_sub2 = annot_sub2.reset_index().set_index(['leiden','compartment'])
+            annot_df_list.append(annot_sub2)
+
+        cats = pd.unique(adata.obs[produced_label_col].dropna().astype(str))
+        adata.obs[produced_label_col] = pd.Categorical(adata.obs[produced_label_col], categories=sorted(cats), ordered=False)
+
+        adata.obs['cluster-subcellular'] = (
+            adata.obs['leiden'].astype(str) + ':' + adata.obs[produced_label_col].astype(str)
+        )
+
+        annot_df = pd.concat(annot_df_list).sort_index() if len(annot_df_list) else pd.DataFrame(columns=['label'])
+
+    else:
+        annot_df = _rapx_annotate_core(
+            adata, sets, regions,
+            use_spatial_channel=use_spatial_channel,
+            geom_before_top2=geom_before_top2,
+            top2_switch_z_floor_ratio=top2_switch_z_floor_ratio,
+            top2_switch_q_ceiling_ratio=top2_switch_q_ceiling_ratio,
+            top2_switch_z_not_much_worse=top2_switch_z_not_much_worse
+        )
+        adata.obs[produced_label_col] = adata.obs['leiden'].map(annot_df['label']).astype('category')
+
+        for col in ['top1','z1','q1','top2','z2','q2','low_conf','promoted_from_top2','used_top2_due_to_low_conf']:
+            adata.obs[f'subcell_{col}'] = adata.obs['leiden'].map(annot_df[col])
+
+        adata.obs['cluster-subcellular'] = (
+            adata.obs['leiden'].astype(str) + ':' + adata.obs[produced_label_col].astype(str)
+        )
+
+    adata.uns['subcellular_annotation_meta'] = {
+        'regions': regions,
+        'set_sizes': {k: len(v) for k, v in sets.items()},
+        'params': {
+            'use_two_stage': use_two_stage,
+            'use_spatial_channel': use_spatial_channel,
+            'CHANNEL_WEIGHTS': list(CHANNEL_WEIGHTS),
+            'geom_before_top2': bool(geom_before_top2),
+            'TOPK_OVERLAP_FRAC': TOPK_OVERLAP_FRAC,
+            'TOPK_OVERLAP_MIN': TOPK_OVERLAP_MIN,
+            'FDR_CUTOFF': FDR_CUTOFF,
+            'Z_CUTOFF': Z_CUTOFF,
+            'TIE_DELTA': TIE_DELTA,
+        }
+    }
+
+    if plot_umap:
+        def _sanitize_color_cols(cols):
+            out = []
+            for c in cols:
+                if c in adata.obs.columns:
+                    col = adata.obs[c]
+                    if pd.api.types.is_bool_dtype(col) or str(col.dtype) == 'boolean':
+                        new_c = f"{c}__plotnum"
+                        if new_c not in adata.obs.columns:
+                            adata.obs[new_c] = col.astype('float32')
+                        out.append(new_c)
+                        continue
+                out.append(c)
+            return out
+
+        colors1 = _sanitize_color_cols(['cluster-subcellular', produced_label_col])
+        colors2 = _sanitize_color_cols(['subcell_z1','subcell_q1','subcell_low_conf'])
+
+        sc.pl.umap(adata, color=colors1,
+                   legend_fontsize="small", wspace=0.6)
+        sc.pl.umap(adata, color=colors2,
+                   cmap='viridis', wspace=0.4)
+
+    if plot_diag_enrich:
+        print("\n=== Using improved enrichment analysis (QUQ default) ===")
+
+        if isinstance(annot_df.index, pd.MultiIndex):
+            if 'q1' in annot_df.columns:
+                annot_df_vis = (
+                    annot_df.reset_index()
+                            .sort_values(['leiden','q1'], ascending=[True, True])
+                            .drop_duplicates(subset=['leiden'], keep='first')
+                            .set_index('leiden')
+                )
+            else:
+                annot_df_vis = (
+                    annot_df.reset_index()
+                            .drop_duplicates(subset=['leiden'], keep='first')
+                            .set_index('leiden')
+                )
+        else:
+            annot_df_vis = annot_df
+
+        _ = improved_enrichment_visualization(
+            adata, annot_df_vis, sets,
+            selection_mode='weighted_union',
+            q_per_group=500,
+            p_adj_max=0.5, lfc_min=0.0,
+            balance_labels=True,
+            target_per_label=TARGET_SET_SIZE,
+            min_per_label=TARGET_SET_SIZE,
+            max_per_label=TARGET_SET_SIZE,
+            min_query_fallback=80,
+            fallback_mode='weighted_union',
+            show_tables=True
+        )
+
+
+        if 'plot_annotation_quality_summary' in globals():
+            try:
+                plot_annotation_quality_summary(adata, annot_df_vis, produced_label_col)
+            except Exception as e:
+                print(f"[WARN] plot_annotation_quality_summary 运行失败：{e}")
+
+    print("Adaptive set sizes:", {k: len(v) for k, v in sets.items()})
     return annot_df
-
-
-def _plot_rapx_enrichment_and_quality(annot_df: pd.DataFrame, adata2: ad.AnnData, out_dir: Optional[str] = None):
-    """Save RAP-X enrichment heatmaps and quality summary panels.
-    - Enrichment: heatmaps of z_comb and -log10(q_comb) per cluster vs region
-    - Quality: label distribution, q1 distribution, z1 vs -log10(q1) scatter sized by cluster size
-    """
-    try:
-        import matplotlib.pyplot as plt
-        try:
-            import seaborn as sns  # optional but nicer
-            _has_sns = True
-        except Exception:
-            _has_sns = False
-
-        # Align clusters order to adata2 leiden categories if available
-        idx = annot_df.index.astype(str)
-        try:
-            cats = adata2.obs['leiden'].astype('category').cat.categories.astype(str)
-            order_clusters = [c for c in cats if c in set(idx)]
-            annot_ord = annot_df.loc[order_clusters]
-        except Exception:
-            annot_ord = annot_df.sort_index()
-
-        # Determine regions from columns (prefer SEVEN_COLS ordering)
-        regions_all = [c for c in SEVEN_COLS if (f'z_comb__{c}' in annot_ord.columns)]
-        if not regions_all:
-            regions_all = sorted([c.replace('z_comb__', '') for c in annot_ord.columns if c.startswith('z_comb__')])
-
-        # Build matrices
-        Z = np.vstack([annot_ord[f'z_comb__{r}'].to_numpy(dtype=float, copy=False) for r in regions_all]).T if regions_all else None
-        Q = np.vstack([annot_ord[f'q_comb__{r}'].to_numpy(dtype=float, copy=False) for r in regions_all]).T if regions_all else None
-
-        # 1) Enrichment heatmaps
-        if Z is not None and Q is not None and Z.size > 0 and Q.size > 0:
-            fig, axes = plt.subplots(1, 2, figsize=(max(8, 1.2*len(regions_all)), max(4, 0.35*len(annot_ord))))
-            ax1, ax2 = axes
-            if _has_sns:
-                sns.heatmap(Z, ax=ax1, cmap='coolwarm', center=0.0, cbar_kws={'label': 'z-score'})
-            else:
-                im1 = ax1.imshow(Z, aspect='auto', cmap='coolwarm', vmin=np.nanmin(Z), vmax=np.nanmax(Z))
-                fig.colorbar(im1, ax=ax1, label='z-score')
-            ax1.set_title('RAP-X Enrichment (z)')
-            ax1.set_xticks(np.arange(len(regions_all)))
-            ax1.set_xticklabels(regions_all, rotation=45, ha='right')
-            ax1.set_yticks(np.arange(len(annot_ord)))
-            ax1.set_yticklabels(annot_ord.index.astype(str))
-
-            q_neglog = -np.log10(np.clip(Q, 1e-12, 1.0))
-            if _has_sns:
-                sns.heatmap(q_neglog, ax=ax2, cmap='viridis', cbar_kws={'label': '-log10(q)'})
-            else:
-                im2 = ax2.imshow(q_neglog, aspect='auto', cmap='viridis', vmin=np.nanmin(q_neglog), vmax=np.nanmax(q_neglog))
-                fig.colorbar(im2, ax=ax2, label='-log10(q)')
-            ax2.set_title('RAP-X Enrichment (-log10 q)')
-            ax2.set_xticks(np.arange(len(regions_all)))
-            ax2.set_xticklabels(regions_all, rotation=45, ha='right')
-            ax2.set_yticks(np.arange(len(annot_ord)))
-            ax2.set_yticklabels(annot_ord.index.astype(str))
-            fig.tight_layout()
-            _save_fig(fig, out_dir or os.getcwd(), "rapx_enrichment_panels")
-            plt.close(fig)
-
-        # 2) Quality summary
-        try:
-            # Label distribution
-            label_counts = annot_df['label'].astype(str).value_counts().sort_values(ascending=False)
-        except Exception:
-            label_counts = pd.Series(dtype=int)
-        q1 = annot_df.get('q1', pd.Series(index=annot_df.index, dtype=float)).astype(float)
-        z1 = annot_df.get('z1', pd.Series(index=annot_df.index, dtype=float)).astype(float)
-        q1_neglog = -np.log10(np.clip(q1.to_numpy(dtype=float, copy=False), 1e-12, 1.0))
-        # Cluster sizes from adata2
-        try:
-            clu_sizes = adata2.obs['leiden'].value_counts()
-            clu_sizes = clu_sizes.reindex(annot_df.index.astype(str)).fillna(0).astype(int)
-        except Exception:
-            clu_sizes = pd.Series(1, index=annot_df.index)
-
-        fig2, axes2 = plt.subplots(1, 3, figsize=(12, 4))
-        # Left: label distribution
-        ax = axes2[0]
-        if len(label_counts) > 0:
-            ax.bar(label_counts.index.astype(str), label_counts.values, color='#4C72B0')
-            ax.set_xticks(np.arange(len(label_counts)))
-            ax.set_xticklabels(label_counts.index.astype(str), rotation=45, ha='right')
-        ax.set_title('Annotation Label Counts')
-        ax.set_ylabel('Clusters')
-
-        # Middle: q1 distribution
-        ax = axes2[1]
-        ax.hist(q1_neglog, bins=20, color='#55A868', alpha=0.9)
-        ax.set_title('-log10(q1) across clusters')
-        ax.set_xlabel('-log10(q1)')
-
-        # Right: z1 vs -log10(q1), size by cluster size
-        ax = axes2[2]
-        sizes = np.clip(clu_sizes.to_numpy(dtype=float, copy=False), 1.0, np.inf)
-        s_norm = 20.0 * (sizes / np.nanmax(sizes)) if np.nanmax(sizes) > 0 else 20.0
-        ax.scatter(z1.to_numpy(dtype=float, copy=False), q1_neglog, s=s_norm, alpha=0.8, c='#C44E52', edgecolors='none')
-        ax.set_xlabel('z1 (top region)')
-        ax.set_ylabel('-log10(q1)')
-        ax.set_title('Top Enrichment Strength per Cluster')
-        fig2.tight_layout()
-        _save_fig(fig2, out_dir or os.getcwd(), "rapx_quality_summary")
-        plt.close(fig2)
-    except Exception:
-        # Never break the pipeline for plotting
-        pass
 
 
 def _load_default_gold_tables() -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -3968,9 +4838,19 @@ def _load_default_gold_tables() -> Tuple[pd.DataFrame, pd.DataFrame]:
     return gold_apex, rna_locate
 
 
-def _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_df: pd.DataFrame, show_internal_progress: bool = False, out_dir: Optional[str] = None,
+def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_df: pd.DataFrame, show_internal_progress: bool = False, out_dir: Optional[str] = None,
+                                annotation_method: str = "rapx",
                                 rapx_two_stage: bool = False, rapx_spatial_channel: bool = False,
                                 gold_data: Optional[Union[str, pd.DataFrame]] = None):
+    # Step 0: choose annotation method (future-proof)
+    _method = (annotation_method or "rapx").lower()
+    if _method not in {"rapx", "rap-x"}:
+        try:
+            _logging.getLogger('cellscope').warning("Annotation method '%s' not supported; skipping annotation stage.", _method)
+        except Exception:
+            pass
+        return adata1, adata2, final_df
+
     # Step 1: normalize + cluster on adata2 (scanpy)
     # Pull clustering params from config if available
     rep_priority = None
@@ -4071,17 +4951,36 @@ def _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_df
         l1 = build_gold_from_rnalocate_l1(rna_loc, species=('Homo sapiens','Mus musculus'), rna_types=('mRNA',), agg_mode='prob_or', score_floor=0.6, use_pubmed_weight=True)
         gold_from_rna = project_l1_to_seven(l1, mode='strict', mito_non_omm=None)
         gold_aug = merge_gold(gold_apex, gold_from_rna, fuse='max')
+
+    # Optional manual marker augmentation (row-normalized, fused by max/prob_or logic).
+    manual_df = _load_manual_marker_data()
+    if manual_df is not None:
+        try:
+            gold_aug = merge_gold(gold_aug, manual_df, fuse='max')
+            _logging.getLogger('cellscope').info("Manual marker table merged: %d genes", len(manual_df))
+        except Exception:
+            try:
+                _logging.getLogger('cellscope').warning("Manual marker merge failed; continuing without manual markers")
+            except Exception:
+                pass
+
+    # Case-harmonize gold genes to improve mouse coverage when gold is all upper-case.
+    try:
+        gold_aug = harmonize_gold_gene_case(gold_aug, target_var_names=adata2.var_names)
+    except Exception:
+        pass
     # Step 3: RAP-X annotation; write to adata2.obs
-    # Read    tuning knobs from config (optional)
-    rapx_max_genes = 1200
-    rapx_min_genes = 300
-    rapx_frac_genes = 0.25
+    rapx_use_two_stage = False
+    rapx_use_spatial_channel = False
+    rapx_plot_umap = False
+    rapx_plot_diag = False
     try:
         _cfg2 = load_params_yaml()
         ann_cfg = _cfg2.get('annotation', {}) if _cfg2 else {}
-        rapx_max_genes = int(ann_cfg.get('rapx_set_max_genes', rapx_max_genes))
-        rapx_min_genes = int(ann_cfg.get('rapx_set_min_genes', rapx_min_genes))
-        rapx_frac_genes = float(ann_cfg.get('rapx_set_frac_genes', rapx_frac_genes))
+        rapx_use_two_stage = bool(ann_cfg.get('two_stage', rapx_use_two_stage))
+        rapx_use_spatial_channel = bool(ann_cfg.get('spatial_channel', rapx_use_spatial_channel))
+        rapx_plot_umap = bool(ann_cfg.get('save_umap_plot', False) or ann_cfg.get('save_plots', False))
+        rapx_plot_diag = bool(ann_cfg.get('save_plots', False))
     except Exception:
         pass
     t_rapx0 = __import__('time').perf_counter()
@@ -4089,9 +4988,10 @@ def _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_df
         adata2,
         gold_df=gold_aug,
         produced_label_col='subcellular_annotation',
-        max_genes_per_region=rapx_max_genes,
-        min_genes_per_region=rapx_min_genes,
-        frac_genes=rapx_frac_genes,
+        plot_umap=rapx_plot_umap,
+        plot_diag_enrich=rapx_plot_diag,
+        use_two_stage=rapx_use_two_stage,
+        use_spatial_channel=rapx_use_spatial_channel,
     )
     t_rapx1 = __import__('time').perf_counter()
     print(f"[RAP-X timing] annotate_core took {t_rapx1 - t_rapx0:0.2f}s (regions={len(annot_df.columns)})")
