@@ -1,6 +1,54 @@
 #!/usr/bin/env python3
 import os
 import sys
+
+
+def _get_cli_value(flag: str):
+    """Return CLI value for '--flag value' or '--flag=value'."""
+    argv = sys.argv[1:]
+    for i, tok in enumerate(argv):
+        if tok == flag and i + 1 < len(argv):
+            return argv[i + 1]
+        pref = flag + "="
+        if tok.startswith(pref):
+            return tok[len(pref):]
+    return None
+
+
+def _maybe_apply_lowmem_defaults():
+    """Apply safe defaults when using low-memory config profiles.
+
+    Uses setdefault so user-provided env vars always win.
+    """
+    cfg_path = _get_cli_value("--config") or os.environ.get("CELLSCOPE_CONFIG", "")
+    cfg_name = os.path.basename(cfg_path) if cfg_path else ""
+    lowmem_profile = cfg_name in {"params.lowmem.yaml", "params.ultralowmem.yaml"}
+    if not lowmem_profile:
+        return
+
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    os.environ.setdefault("CELLSCOPE_JOBLIB_BACKEND", "threading")
+    os.environ.setdefault("CELLSCOPE_CLUSTER_CHUNK", "8")
+    if cfg_name == "params.ultralowmem.yaml":
+        os.environ.setdefault("CELLSCOPE_N_JOBS", "1")
+    else:
+        os.environ.setdefault("CELLSCOPE_N_JOBS", "2")
+
+    try:
+        print(
+            "[cellscoper-bin] lowmem defaults active "
+            f"(config={cfg_name}, n_jobs={os.environ.get('CELLSCOPE_N_JOBS')}, "
+            f"backend={os.environ.get('CELLSCOPE_JOBLIB_BACKEND')}, "
+            f"chunk={os.environ.get('CELLSCOPE_CLUSTER_CHUNK')})",
+            file=sys.stderr,
+        )
+    except Exception:
+        pass
+
+
 try:
     import warnings as _warnings
     _warnings.simplefilter("ignore")
@@ -17,6 +65,8 @@ except Exception:
 repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
+
+_maybe_apply_lowmem_defaults()
 
 from cellscope.cli import main
 

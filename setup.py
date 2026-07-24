@@ -2,16 +2,16 @@ from setuptools import setup, find_packages
 import pathlib
 
 here = pathlib.Path(__file__).parent.resolve()
-readme = (here / "README.md").read_text(encoding="utf-8") if (here / "README.md").exists() else "CellScope: Spatial transcriptomics pipeline."
+readme = (here / "README.md").read_text(encoding="utf-8") if (here / "README.md").exists() else "CellScoper: Spatial transcriptomics pipeline."
 
 setup(
-	name="CellScope",
+	name="CellScoper",
 	version="1.0.0",
 	description="A modular, resumable spatial transcriptomics pipeline with graph embeddings and annotation",
 	long_description=readme,
 	long_description_content_type="text/markdown",
-	author="CellScope Contributors",
-	url="https://github.com/your-org/CellScope",
+	author="CellScoper Contributors",
+	url="https://github.com/zhoutianrui-tongji/CellScope",
 	license="MIT",
 	packages=find_packages(),
 	python_requires=">=3.9",
@@ -40,6 +40,7 @@ setup(
 	],
 	entry_points={
 		"console_scripts": [
+			"cellscoper=cellscope.cli:main",
 			"cellscope=cellscope.cli:main",
 		]
 	},

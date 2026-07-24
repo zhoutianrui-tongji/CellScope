@@ -1,55 +1,83 @@
+# CellScoper balanced defaults: prioritize spatial continuity and annotation
+# quality while keeping transcript-level memory bounded for large datasets.
 io:
   final_format: csv
   h5ad_compression: lzf
-  resume_from: 
+  resume_policy: minimal
+  resume_from: null
   intermediate_dirname: intermediate_results
   write_csv_copy: true
+  write_intermediate: true
   lite_intermediate: true
-  write_intermediate_csv: true
+  write_intermediate_csv: false
   write_intermediate_parquet: false
   write_intermediate_figures: true
   drop_embeddings: true
-  keep_intermediate: false
+
+# This key is read directly by the CLI and therefore belongs at the top level.
+show_sample: true
 
 module1:
-  knn_k: 32
   include_directional: true
   winsor_perc_low: 1
   winsor_perc_high: 99
 
 module2:
-  top_g: 4096
-  bow_knn_k: 32
-  max_rows_per_cell_for_svd: 500
-  max_svd_rows: 2000000
+  # Streaming keeps these richer local-composition features memory bounded.
+  top_g: 1024
+  bow_knn_k: 12
+  max_rows_per_cell_for_svd: 256
+  max_svd_rows: 100000
   svd_n_components: 24
-  bow_weight_mode: gaussian   # gaussian | uniform
+  svd_sample_cells: 5000
+  parallel_chunk_cells: 8
+  source_from_point_df: false
+  stream_local_embeddings: true
   use_tfidf: true
   tf_norm: true
-  parallel_chunk_cells: 128
+  idf_mode: log1p             # log1p | log | none
+  bow_weight_mode: gaussian   # gaussian | uniform
 
 module3:
-  hdbscan_min_cluster_size: 6
+  # Canonical MetaSpot mode. K is derived from unique XY sites, and Ward
+  # clustering is constrained to the local spatial graph.
+  enforce_spatial_connectivity: true
+  target_sites_per_metaspot: 100
+  min_metaspots_per_cell: 1
+  max_metaspots_per_cell: 100
+  spatial_connectivity_k: 8
+  spatial_radius_quantile: 0.9
+  spatial_radius_factor: 1.5
+  spatial_smoothing_iterations: 1
+  spatial_smoothing_min_fraction: 0.6
+  spatial_min_component_size: 20
+  spatial_compactness: 1.0
+
+  # Feature budget used by canonical Ward clustering and the legacy fallback.
+  n_feat_hdb: 24
+
+  # HDBSCAN/KMeans are retained only as a fallback when the canonical target
+  # above is null or spatial connectivity is disabled.
+  hdbscan_min_cluster_size: 30
   hdbscan_allow_single_cluster: true
-  hdbscan_min_samples_frac: 0.3
-  target_sub_size: 12
-  n_feat_hdb: 16
+  hdbscan_min_samples_frac: 0.2
+  target_sub_size: 30
   kmeans_min_k: 2
-  kmeans_max_k: 100
-  use_k_cap: false
-  merge_min_size: null    # 若为 null，则按 MIN_SUB_PTS 合并小簇（推荐）
-  hdbscan_max_points: 600         # 1 表示全部使用 MiniBatchKMeans（跳过 HDBSCAN）
-  kmeans_train_size: 512        # per-cell MiniBatchKMeans 的训练采样数（小样本更快）
-  kmeans_batch_size: 1024       # per-cell MiniBatchKMeans 的 batch_size（减轻单批开销）
-  small_backend_cells: 1000     # 低于该值时用线程后端，5k 不触发
-  sequential_cells: 1000           # 禁用顺序模式，避免 5k 时退化到串行
+  kmeans_max_k: 50
+  use_k_cap: true
+  merge_min_size: 20
+  hdbscan_max_points: 1000
+  kmeans_train_size: 512
+  kmeans_batch_size: 1024
+  small_backend_cells: 1000
+  sequential_cells: 1000
 
 module5:
   block_size: 50000
   # SimpleK feature weights and options
-  w_gc: 0.5
-  w_expr: 0.5
-  w_sp: 0.0
+  w_gc: 0.4
+  w_expr: 0.4
+  w_sp: 0.2
   use_gc: true
   use_expr: true
   speed_preset: ultra
@@ -73,20 +101,21 @@ module5:
   cap_margin_tau: 0.015
   cap_max_frac_soft: 0.05
   # Two-stage MiniBatchKMeans (fit on sample, predict all)
-  train_sample_per_block: 600000   # 每个 block 用于训练的采样上限
-  assign_chunk_size: 50000         # 预测阶段内部 chunk 尺寸（若 predict 内存充足可无视）
-  mbk_batch_size: 8192
-  mbk_max_iter: 80
+  train_sample_per_block: 20000
+  assign_chunk_size: 5000
+  mbk_batch_size: 512
+  mbk_max_iter: 60
 
 module6:
   h5ad_compression_override: true
   save_shape_summary: true
+  preserve_raw_counts: true
 
 module7:
-  scvi_epochs: 200
+  scvi_epochs: 150
   scvi_n_latent: 32
   scvi_lr: 0.001
-  scvi_batch_size: 1024
+  scvi_batch_size: 256
   # Optional: priority representations for annotation stage (default prefers X_dgi_gcn)
   rep_priority: ["X_dgi_gcn", "X_dgi_sage", "X_expr", "X_pca"]
   neighbors:
@@ -101,9 +130,9 @@ module7:
 
 module8:
   dgi_epochs: 150
-  enable_dgi_sage: true
-  dgi_hidden: 32
-  dgi_out: 32
+  enable_dgi_sage: false
+  dgi_hidden: 64
+  dgi_out: 64
   dgi_lr: 0.001
   dgi_weight_decay: 0.0001
   dgi_clip_grad: 1.0
@@ -111,12 +140,105 @@ module8:
 annotation:
   enable: true
   method: rapx
-  two_stage: true
+  unit: metadomain
+  decision_mode: independent
+  independent_mixed_score_delta: 0.75
+  independent_unknown_label: Unknown
+  independent_geometry_min_abs_r: 0.05
+  # Multi-track output: subcellular_candidate keeps the raw best label,
+  # subcellular_annotation uses hierarchical evidence-aware fallback, and
+  # subcellular_annotation_strict retains q<=subtype_fdr calls.
+  # hierarchical keeps ER/OMM/nuclear subtypes only when at least exploratory
+  # evidence exists; unsupported subtype candidates fall back to Cytosol or
+  # Nucleus while the raw choice remains in subcellular_candidate.
+  independent_assignment_mode: hierarchical  # strict | tiered | hierarchical
+  independent_exploratory_max_q: 0.30
+  independent_exploratory_min_channel_support: 2
+  independent_exploratory_min_score_gap: 0.50
+  independent_subtype_parent_margin: 0.0
+  independent_omm_competitor_margin: 0.0
+  two_stage: false
   spatial_channel: true
-  leiden_resolution: 1.0
+  # Legacy confidence fields remain for compatibility; independent mode also
+  # emits Strict/Exploratory/Candidate evidence tiers.
+  low_conf_policy: supported  # supported | adaptive | broad | keep
+  low_conf_relaxed_z: 1.25
+  low_conf_relaxed_q: 0.30
+  marker_set_target: 600
+  marker_min_weight: 0.05
+  marker_min_margin: 0.05
+  gold_column_normalize: false
+  min_channel_support: 2
+  enforce_geometry_consistency: false
+  geometry_quantile: 0.4
+  geometry_channel_weight: 0.0
+  # Adaptive calibration matches random marker sets by size, weights, detection
+  # rate, and mean expression to avoid marker-abundance-driven significance.
+  guard_mode: adaptive       # adaptive | fixed
+  subtype_fdr: 0.05
+  min_effective_markers: 10
+  null_permutations: 500
+  null_seed: 0
+  # Legacy single-argmax compatibility knobs; disabled in independent mode.
+  single_stage_compartment_score_weight: 0.0
+  single_stage_compartment_score_tau: 0.2
+  single_stage_compartment_guard: false
+  single_stage_compartment_min_abs_r: 0.05
+  single_stage_compartment_max_score_gap: 8.5
+  single_stage_compartment_min_z: 1.0
+  single_stage_compartment_max_q: 0.35
+  single_stage_compartment_min_channel_support: 1
+  # The fixed thresholds below are used only when guard_mode: fixed.
+  nuclear_pore_guard: false
+  nuclear_pore_min_margin: 0.75
+  nuclear_pore_non_nuclear_top2_min_margin: 5.0
+  nuclear_pore_max_q: 0.10
+  nuclear_pore_min_channel_support: 3
+  nuclear_pore_fallback_label: Nucleus
+  # Legacy fallback guards are disabled; unsupported labels become Unknown.
+  lamina_guard: false
+  lamina_min_margin: 1.0
+  lamina_non_nuclear_top2_min_margin: 3.0
+  lamina_max_q: 0.05
+  lamina_min_channel_support: 2
+  lamina_boundary_quantile: 0.5
+  lamina_fallback_label: Nucleus
+  # Retained only for legacy decision_mode.
+  omm_guard: false
+  omm_min_margin: 2.0
+  omm_max_q: 0.01
+  omm_min_channel_support: 3
+  omm_fallback_label: Cytosol
+  # Applies only to the bundled human Cell-2019 APEX raw log2FC table.
+  # ERM/Cytosol-shared genes keep their other reference scores but cannot act
+  # as OMM-specific markers.
+  apex_omm_specificity_filter: true
+  apex_omm_min_log2fc: 0.75
+  apex_omm_min_delta: 0.50
+  omm_metaspot_refinement: true
+  omm_metaspot_apply_to_primary: true
+  # Keep membrane ambiguity in audit columns, but make the primary annotation
+  # fall back to the strongest ER/Cytosol alternative instead of emitting an
+  # eighth "ER-OMM shared" prediction class.
+  omm_metaspot_ambiguous_policy: competitor  # competitor | explicit
+  omm_metaspot_min_informative_transcripts: 5
+  omm_metaspot_shrinkage_count: 20.0
+  omm_metaspot_posterior_high: 0.80
+  omm_metaspot_posterior_low: 0.20
+  omm_refinement_schema_version: 6
+  # RNALocate ER associations are broad and include many trafficking/membrane
+  # genes. Keep ER anchored to the APEX localization reference by default.
+  rnalocate_augment_er: false
+  rnalocate_species: ["Homo sapiens", "Mus musculus"]
+  use_manual_markers: false
+  # Build dedicated, finer annotation groups instead of reusing the coarse
+  # upstream Leiden partition. On the 388-domain test this yields about 30
+  # annotation groups rather than about 12.
+  fast: false
+  leiden_resolution: 5.0
   hvg_n_top_genes: 2000
   pca_n_comps: 32
-  neighbors_k: 32
+  neighbors_k: 20
   umap_min_dist: 0.3
   umap_spread: 1.0
   compute_umap: true
@@ -126,11 +248,7 @@ annotation:
   cluster_rep: "X_dgi_gcn"
 
 runtime:
-  n_jobs: 48
-  joblib_backend: loky
-  blas_threads: 2
+  n_jobs: 4
+  joblib_backend: threading
+  blas_threads: 4
   use_threadpoolctl: true
-
-ui:
-  show_sample: true
-  progress_style: rich

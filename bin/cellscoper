@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""Canonical CellScoper executable; the historical cellscope command remains an alias."""
+
+import os
+import sys
+
+
+def _cli_value(flag: str):
+    for index, token in enumerate(sys.argv[1:]):
+        if token == flag and index + 2 <= len(sys.argv[1:]):
+            return sys.argv[index + 2]
+        if token.startswith(flag + "="):
+            return token.split("=", 1)[1]
+    return None
+
+
+def _apply_lowmem_defaults():
+    config_path = _cli_value("--config") or os.environ.get("CELLSCOPE_CONFIG", "")
+    config_name = os.path.basename(config_path) if config_path else ""
+    if config_name not in {"params.lowmem.yaml", "params.ultralowmem.yaml"}:
+        return
+    for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ.setdefault(name, "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    os.environ.setdefault("CELLSCOPE_JOBLIB_BACKEND", "threading")
+    os.environ.setdefault("CELLSCOPE_CLUSTER_CHUNK", "8")
+    os.environ.setdefault(
+        "CELLSCOPE_N_JOBS",
+        "1" if config_name == "params.ultralowmem.yaml" else "2",
+    )
+
+
+repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+
+_apply_lowmem_defaults()
+
+from cellscope.cli import main
+
+
+if __name__ == "__main__":
+    main()

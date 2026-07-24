@@ -1,6 +1,6 @@
 cff-version: 1.2.0
-message: If you use CellScope in your research, please cite it as below.
-title: 
+message: If you use CellScoper in your research, please cite it as below.
+title: CellScoper
 version: 1.0.0
 authors:
   - family-names: ""

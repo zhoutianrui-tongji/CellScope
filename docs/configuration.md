@@ -1,8 +1,8 @@
-# CellScope Configuration Reference (params.yaml)
+# CellScoper Configuration Reference (params.yaml)
 
-This document describes the configuration options read from `CellScope/config/params.yaml`. All fields are optional unless stated otherwise. CLI flags control only high-level workflow; module hyperparameters are configured here.
+This document describes the configuration options read from `config/params.yaml`. All fields are optional unless stated otherwise. CLI flags control only high-level workflow; module hyperparameters are configured here.
 
-- File path: `CellScope/config/params.yaml`
+- File path: `config/params.yaml`
 - Format: YAML (UTF‑8)
 - Scope: IO behavior, resume policy, module parameters (M1–M8), annotation, and UI/runtime hints
 
@@ -25,6 +25,24 @@ This document describes the configuration options read from `CellScope/config/pa
 - `enable` (bool): Enable RAP-X style subcellular annotation (requires `scanpy`). Default: `true`.
 - `two_stage` (bool): Optional two-stage enrichment. Default: `false`.
 - `spatial_channel` (bool): Include spatial channel in annotation scoring. Default: `false`.
+- `guard_mode` (`adaptive|fixed`): In `adaptive` mode, subtype support is calibrated against label-specific random marker sets with matched set size and weight profile. `fixed` restores the legacy absolute margin/q/support thresholds. Default: `adaptive`.
+- `subtype_fdr` (float): Label-wise empirical FDR cutoff used by adaptive Nuclear Pore, Lamina, and OMM guards. Default: `0.05`.
+- `min_effective_markers` (int): Minimum measured markers required for a subtype to be testable. Labels below this coverage are reported as not testable and fall back to their broad compartment. Default: `10`.
+- `null_permutations` (int): Number of matched random marker sets per label. Empirical p-values use the add-one rule. Default: `500`.
+- `null_seed` (int): Random seed for empirical-null calibration. Default: `0`.
+- `omm_metaspot_refinement` (bool): Refine OMM versus ER/Cytosol at MetaSpot resolution after the domain-level RAP-X call. Default: `true`.
+- `omm_metaspot_apply_to_primary` (bool): Apply the MetaSpot OMM refinement to the primary `subcellular_annotation` output. Default: `true`.
+- `omm_metaspot_ambiguous_policy` (`competitor|explicit`): With `competitor`, ambiguous OMM/ER MetaSpots fall back to their strongest ER/Cytosol alternative so the primary output stays in the seven-class label space; ambiguity remains in the OMM audit columns. `explicit` retains the legacy `ER-OMM shared` prediction class. Default: `competitor`.
+- `single_stage_compartment_score_weight` (float): Weight of the bounded nuclear/cytoplasmic consistency score added before the single-stage ranking. All labels remain in one competition. Default: `6.0`; set to `0` to disable.
+- `single_stage_compartment_score_tau` (float): Smoothness of the signed-geometry score around the nuclear boundary. Default: `0.2`.
+- `single_stage_compartment_guard` (bool): Post-hoc rescue for a supported same-side candidate. Default: `true`.
+- `single_stage_compartment_min_abs_r`, `single_stage_compartment_max_score_gap`, `single_stage_compartment_min_z`, `single_stage_compartment_max_q`, `single_stage_compartment_min_channel_support`: boundary dead zone shared by joint scoring and thresholds for the legacy guard. Defaults: `0.05`, `8.5`, `1.0`, `0.35`, `1`.
+- `lamina_guard` (bool): Collapse weak or non-peripheral Lamina calls to `lamina_fallback_label`. Default: `true`.
+- `lamina_min_margin` (float): Minimum Lamina top-score margin against the runner-up in `guard_mode: fixed`. Default: `1.0`.
+- `lamina_non_nuclear_top2_min_margin` (float): Stricter margin when Lamina competes with a cytoplasmic label. Default: `3.0`.
+- `lamina_max_q` (float), `lamina_min_channel_support` (int): Statistical support required to retain Lamina in `guard_mode: fixed`. Defaults: `0.01`, `2`.
+- `lamina_boundary_quantile` (float): Quantile of group-level `d_nuc_norm_mean` among nuclear-side groups used as the maximum Lamina distance from the nuclear envelope. Smaller values are stricter. Default: `0.5`.
+- `lamina_fallback_label` (str): Broad label used for guarded Lamina calls. Default: `Nucleus`.
 - `leiden_resolution` (float): Leiden resolution for cluster finding. Default: `1.0`.
 - `hvg_n_top_genes` (int): HVG selection count. Default: `2000`.
 - `pca_n_comps` (int): PCA components. Default: `25`.
@@ -49,13 +67,26 @@ This document describes the configuration options read from `CellScope/config/pa
 - `bow_weight_mode` (`gaussian|uniform`): Neighbor weighting. Default: `gaussian`.
 - `use_tfidf` (bool), `tf_norm` (bool): SVD weighting and TF normalization. Default: `true`, `true`.
 - `parallel_chunk_cells` (int): Grouping factor for parallel TF blocks. Default: `128`.
+- `stream_local_embeddings` (bool): Compute transcript-level neighborhood expression inside Module 3 one cell at a time instead of storing dense embedding columns for all transcripts. Default: `true`.
 
-## module3 (Per-cell clustering)
+## module3 (Per-cell MetaSpot segmentation)
 - `hdbscan_min_cluster_size` (int): Minimum subcluster size. Default: `20`.
 - `hdbscan_allow_single_cluster` (bool): Allow single-cluster HDBSCAN. Default: `true`.
 - `hdbscan_min_samples_frac` (float): Fraction of min_cluster_size for `min_samples`. Default: `0.5`.
 - `kmeans_min_k`/`kmeans_max_k` (int): Bounds for KMeans fallback. Default: `2`, `6`.
 - `merge_min_size` (int): Merge clusters smaller than this threshold. Default: `25`.
+- `enforce_spatial_connectivity` (bool): Build every final `metaspot` as a connected XY region using spatially constrained Ward clustering.
+- `target_sites_per_metaspot` (int|null): Target number of unique XY sites per MetaSpot. When set, this determines the per-cell K and bypasses HDBSCAN as the primary segmenter. Default: `100`.
+- `min_metaspots_per_cell` (int): Lower bound for the per-cell K. Default: `2`; seqFISH profile: `20`.
+- `max_metaspots_per_cell` (int|null): Upper bound for the per-cell K. Default: `100`.
+- `spatial_connectivity_k` (int): Maximum nearby XY neighbors considered when constructing the local spatial graph. Default: `8`.
+- `spatial_radius_quantile` (float): Quantile of per-site nearest-neighbor distances used to estimate native point spacing. Default: `0.9`.
+- `spatial_radius_factor` (float): Multiplier applied to the estimated point spacing for the graph radius. Default: `1.5`.
+- `spatial_smoothing_iterations` (int): Local majority-smoothing passes used only if constrained Ward clustering cannot run. Default: `1`.
+- `spatial_smoothing_min_fraction` (float): Minimum weighted neighbor fraction required to change a site's preliminary label in that fallback. Default: `0.6`.
+- `spatial_min_component_size` (int): Connected components smaller than this transcript count are merged across their strongest shared boundary. Default: `20`.
+- `spatial_compactness` (float): Weight of standardized XY coordinates in the spatially constrained Ward clustering. Larger values make MetaSpots more compact; `0` uses features only while still restricting merges to spatial neighbors. Default: `1.0`.
+- `hdbscan_*`, `target_sub_size`, and `kmeans_*`: Legacy fallback controls used when `target_sites_per_metaspot` is null or spatial connectivity is disabled.
 
 ## module5 (Meta-domain clustering)
 - `block_size` (int): Chunk size for processing. Default: `50000`.

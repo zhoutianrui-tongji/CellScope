@@ -10,10 +10,10 @@ def setup_logger(out_dir: str, level: str = "INFO") -> logging.Logger:
         return logger
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
 
-    log_path = os.path.join(out_dir, "cellscope.log")
-    err_path = os.path.join(out_dir, "cellscope.error.log")
+    log_path = os.path.join(out_dir, "cellscoper.log")
+    err_path = os.path.join(out_dir, "cellscoper.error.log")
 
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s - %(message)s")
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] CellScoper - %(message)s")
 
     fh = RotatingFileHandler(log_path, maxBytes=5 * 1024 * 1024, backupCount=3)
     fh.setFormatter(fmt)

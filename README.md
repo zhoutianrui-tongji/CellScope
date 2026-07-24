@@ -1,8 +1,8 @@
-# CellScope
+# CellScoper
 
 Unsupervised subcellular clustering and annotation for high-resolution Spatial Transcriptomics
 
-CellScope is a computational pipeline for cell identification and subcellular annotation on high-resolution spatial transcriptomics data. It supports sequencing-based technologies (e.g., Stereo-seq, Seq-Scope) and imaging-based technologies (e.g., seqFISH+, Xenium). The repository provides a CLI and a configurable, modular pipeline with resume and lightweight checkpoints.
+CellScoper is a computational pipeline for cell identification and subcellular annotation on high-resolution spatial transcriptomics data. It supports sequencing-based technologies (e.g., Stereo-seq, Seq-Scope) and imaging-based technologies (e.g., seqFISH+, Xenium). The repository provides a CLI and a configurable, modular pipeline with resume and lightweight checkpoints.
 
 ![Pipeline overview](./src/CellScope_Framework.jpg)
 
@@ -29,7 +29,7 @@ PyYAML
 ```
 See `requirements.txt` for the full list.
 
-## Install CellScope
+## Install CellScoper
 ### Recommended (Conda environment)
 ```bash
 git clone https://github.com/zhoutianrui-tongji/CellScope.git
@@ -41,19 +41,19 @@ pip install -e .
 ```
 
 ## Documentation
-Configuration and usage are documented in this `README.md` and the `docs/` folder. The main configuration is `CellScope/config/params.yaml` (I/O, module parameters, annotation settings).
+Configuration and usage are documented in this `README.md` and the `docs/` folder. The main configuration is `config/params.yaml` (I/O, module parameters, annotation settings).
 
 ## Usage
 ```bash
-cellscope --help
-usage: cellscope [OPTIONS]
+cellscoper --help
+usage: cellscoper [OPTIONS]
 
 Options:
   --spatial PATH               Input transcripts CSV/Parquet
   --cell-boundaries PATH       Cell boundaries CSV/Parquet
   --nucleus-boundaries PATH    Nucleus boundaries CSV/Parquet
   --out-dir PATH               Output directory
-  --config PATH                YAML config (default: CellScope/config/params.yaml)
+  --config PATH                YAML config (default: config/params.yaml)
   --internal-progress          Show internal progress
   --no-resume                  Disable resume
   --no-save-intermediate       Do not persist intermediate artifacts
@@ -61,7 +61,7 @@ Options:
 ```
 Example:
 ```bash
-cellscope \
+cellscoper \
   --spatial test_data/test_transcripts_df.csv \
   --cell-boundaries test_data/test_cell_boundaries_df.csv \
   --nucleus-boundaries test_data/test_nucleus_boundaries_df.csv \
@@ -70,7 +70,7 @@ cellscope \
 
 ## Inputs
 
-CellScope expects three primary tabular inputs (CSV or Parquet), with required columns as below.
+CellScoper expects three primary tabular inputs (CSV or Parquet), with required columns as below.
 
 1) Transcripts table (`--spatial`)
 - Required columns: `cell_id`, `x_location`, `y_location`, `feature_name`, `overlaps_nucleus`
@@ -127,4 +127,6 @@ Notes:
 
 - `adata1.h5ad`: per‑cell/metaspot table (after M4–M5).
 - `adata2.h5ad`: meta‑domain table (after M6–M8).
-- `final_data.csv|parquet`: transcript‑level results including clustering and annotation.
+- `final_data.csv|parquet`: transcript-level results including the canonical `metaspot_in_cell`, `metaspot`, `meta-domain`, and annotation columns.
+
+The historical `cellscope` command remains available as a compatibility alias. Old checkpoints containing `cluster_in_cell` or `cell_sub` are migrated to `metaspot_in_cell` and `metaspot` when loaded.
