@@ -4,6 +4,7 @@ import os
 import pytest
 from click.testing import CliRunner
 
+from cellscope import cli
 from cellscope.cli import main
 from cellscope.run_lock import (
     LOCK_FILENAME,
@@ -15,6 +16,25 @@ from cellscope.run_lock import (
 def _load_lock_record(out_dir):
     with open(os.path.join(out_dir, LOCK_FILENAME), "r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def test_cli_run_makes_output_tree_group_readable(tmp_path):
+    @cli._with_output_directory_lock
+    def write_private_output(*, out_dir):
+        private_dir = os.path.join(out_dir, "intermediate_results")
+        os.mkdir(private_dir, 0o700)
+        private_file = os.path.join(private_dir, "atomic-output.tmp")
+        with open(private_file, "w", encoding="utf-8") as handle:
+            handle.write("result")
+        os.chmod(private_file, 0o600)
+
+    write_private_output(out_dir=str(tmp_path))
+
+    private_dir = tmp_path / "intermediate_results"
+    private_file = private_dir / "atomic-output.tmp"
+    assert private_dir.stat().st_mode & 0o050 == 0o050
+    assert private_file.stat().st_mode & 0o040
+    assert not private_file.stat().st_mode & 0o020
 
 
 def test_live_owner_blocks_second_run_and_reports_owner(tmp_path):

@@ -1,115 +1,131 @@
 import os
+import pathlib
 import pandas as pd
-from typing import Optional
+from typing import Iterable, Optional
 from shapely.geometry import Polygon
 from shapely import wkb
 
 
-_CELL_ID_SAMPLE_ROWS = 10000
+def _is_parquet(path: str) -> bool:
+    return pathlib.Path(path).suffix.lower() in {".parquet", ".pq"}
 
 
-def _cell_id_kind(path: str) -> str:
-    """Return the cheapest safe representation for cell_id in a CSV."""
+def _table_columns(path: str) -> list[str]:
+    if _is_parquet(path):
+        import pyarrow.parquet as pq
+
+        return list(pq.ParquetFile(path).schema_arrow.names)
+    return pd.read_csv(path, nrows=0).columns.astype(str).tolist()
+
+
+def read_table_preview(
+    path: str,
+    nrows: int = 5,
+    columns: Optional[Iterable[str]] = None,
+) -> pd.DataFrame:
+    """Read a bounded CSV/Parquet preview without loading a full Parquet column."""
+    selected = list(columns) if columns is not None else None
+    if not _is_parquet(path):
+        return pd.read_csv(path, nrows=nrows, usecols=selected)
+
+    import pyarrow.parquet as pq
+
+    parquet = pq.ParquetFile(path)
+    batches = parquet.iter_batches(
+        batch_size=max(1, int(nrows)),
+        columns=selected,
+    )
     try:
-        sample = pd.read_csv(path, usecols=["cell_id"], nrows=_CELL_ID_SAMPLE_ROWS, dtype={"cell_id": "string"})
-    except Exception:
-        return "string"
-    if sample.empty or "cell_id" not in sample.columns:
-        return "string"
-
-    s = sample["cell_id"].dropna().astype("string").str.strip()
-    if s.empty:
-        return "string"
-    if s.str.fullmatch(r"[0-9]+").all():
-        return "uint32"
-    if s.str.fullmatch(r"[0-9]+\.0+").all():
-        return "float_to_uint32"
-    return "string"
-
-
-def _compact_numeric_cell_id(series: pd.Series) -> pd.Series:
-    """Convert numeric-looking cell_id values to compact unsigned integers."""
-    if pd.api.types.is_unsigned_integer_dtype(series.dtype):
-        return series
-    if pd.api.types.is_integer_dtype(series.dtype):
-        return pd.to_numeric(series, downcast="unsigned")
-
-    numeric = pd.to_numeric(series, errors="raise")
-    if pd.api.types.is_float_dtype(numeric.dtype):
-        if numeric.isna().any():
-            raise ValueError("cell_id contains missing values")
-        rounded = numeric.round()
-        if not (numeric == rounded).all():
-            raise ValueError("cell_id contains non-integer numeric values")
-        numeric = rounded.astype("uint64", copy=False)
-    return pd.to_numeric(numeric, downcast="unsigned")
+        batch = next(batches)
+    except StopIteration:
+        return pd.DataFrame(columns=selected or parquet.schema_arrow.names)
+    return batch.to_pandas().iloc[:nrows].copy()
 
 
 def _normalize_cell_id(series: pd.Series) -> pd.Series:
-    """Normalize cell_id values to comparable string keys.
-
-    This keeps alphanumeric ids intact while mapping numeric-looking ids like
-    1, 1.0, '1', and '1.0' to the same canonical value '1'.
-    """
-    s = series.astype("string")
-    s = s.str.strip()
-    s = s.str.replace(r"\.0+$", "", regex=True)
+    """Preserve cell identifiers as validated, trimmed string keys."""
+    s = series.astype("string").str.strip()
+    invalid = s.isna() | s.eq("")
+    if invalid.any():
+        raise ValueError(
+            f"cell_id contains {int(invalid.sum())} missing or empty values"
+        )
     return s
 
 
 def read_spatial_transcripts(path: str) -> pd.DataFrame:
-    usecols = ["cell_id", "overlaps_nucleus", "x_location", "y_location", "feature_name"]
-    cell_kind = _cell_id_kind(path)
+    available = set(_table_columns(path))
+    required = {"cell_id", "x_location", "y_location", "feature_name"}
+    missing = required - available
+    if missing:
+        raise ValueError(f"Missing columns in spatial file {path}: {sorted(missing)}")
+    usecols = [
+        column
+        for column in (
+            "cell_id",
+            "overlaps_nucleus",
+            "x_location",
+            "y_location",
+            "feature_name",
+        )
+        if column in available
+    ]
     dtype_map = {
-        "overlaps_nucleus": "int8",
+        "cell_id": "string",
         "x_location": "float32",
         "y_location": "float32",
         "feature_name": "category",
     }
-    if cell_kind == "uint32":
-        dtype_map["cell_id"] = "uint32"
-    elif cell_kind == "float_to_uint32":
-        dtype_map["cell_id"] = "float64"
-    else:
-        dtype_map["cell_id"] = "string"
 
     # Read only the columns required by the pipeline and keep dtypes compact.
-    df = pd.read_csv(path, usecols=usecols, dtype=dtype_map)
-    if cell_kind in {"uint32", "float_to_uint32"}:
-        df["cell_id"] = _compact_numeric_cell_id(df["cell_id"])
+    if _is_parquet(path):
+        df = pd.read_parquet(path, columns=usecols)
     else:
-        df["cell_id"] = _normalize_cell_id(df["cell_id"])
-
-    required = {"cell_id", "x_location", "y_location", "feature_name"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing columns in spatial file {path}: {sorted(missing)}")
+        df = pd.read_csv(
+            path,
+            usecols=usecols,
+            dtype={k: v for k, v in dtype_map.items() if k in usecols},
+        )
+    df["cell_id"] = _normalize_cell_id(df["cell_id"])
+    for column in ("x_location", "y_location"):
+        df[column] = pd.to_numeric(df[column], errors="raise").astype("float32")
+    df["feature_name"] = df["feature_name"].astype("category")
+    if "overlaps_nucleus" in df.columns:
+        normalized = (
+            df["overlaps_nucleus"]
+            .astype("string")
+            .str.strip()
+            .str.lower()
+            .replace({"true": "1", "false": "0"})
+        )
+        numeric = pd.to_numeric(normalized, errors="raise")
+        if not numeric.dropna().isin([0, 1]).all():
+            raise ValueError("overlaps_nucleus must contain only boolean or 0/1 values")
+        df["overlaps_nucleus"] = numeric.astype("Int8")
     return df
 
 
 def read_boundaries(path: str) -> pd.DataFrame:
-    cell_kind = _cell_id_kind(path)
+    required = {"cell_id", "vertex_x", "vertex_y"}
+    available = set(_table_columns(path))
+    missing = required - available
+    if missing:
+        raise ValueError(f"Missing columns in boundaries file {path}: {sorted(missing)}")
     dtype_map = {
+        "cell_id": "string",
         "vertex_x": "float32",
         "vertex_y": "float32",
     }
-    if cell_kind == "uint32":
-        dtype_map["cell_id"] = "uint32"
-    elif cell_kind == "float_to_uint32":
-        dtype_map["cell_id"] = "float64"
-    else:
-        dtype_map["cell_id"] = "string"
 
-    df = pd.read_csv(path, dtype=dtype_map)
+    usecols = ["cell_id", "vertex_x", "vertex_y"]
+    if _is_parquet(path):
+        df = pd.read_parquet(path, columns=usecols)
+    else:
+        df = pd.read_csv(path, usecols=usecols, dtype=dtype_map)
     if "cell_id" in df.columns:
-        if cell_kind in {"uint32", "float_to_uint32"}:
-            df["cell_id"] = _compact_numeric_cell_id(df["cell_id"])
-        else:
-            df["cell_id"] = _normalize_cell_id(df["cell_id"])
-    required = {"cell_id", "vertex_x", "vertex_y"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing columns in boundaries file {path}: {sorted(missing)}")
+        df["cell_id"] = _normalize_cell_id(df["cell_id"])
+    for column in ("vertex_x", "vertex_y"):
+        df[column] = pd.to_numeric(df[column], errors="raise").astype("float32")
     return df
 
 

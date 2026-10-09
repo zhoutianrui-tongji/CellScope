@@ -225,3 +225,31 @@ def test_shuffled_final_table_maps_by_metaspot_and_preserves_domain_label():
         "transcript_weighted_soft_confirmed"
     ]
     np.testing.assert_allclose(actual_prevalence, expected_prevalence)
+
+
+def test_refinement_can_defer_transcript_broadcast_without_copying():
+    adata1, final_df, domain_states = _make_bimodal_inputs()
+
+    refined, deferred_final, metadata = refine_omm_metaspots(
+        adata1,
+        final_df,
+        POSITIVE_MARKERS,
+        ALTERNATIVE_MARKERS,
+        domain_states=domain_states,
+        min_measured_markers=2,
+        min_informative_transcripts=2,
+        min_eligible_spots=40,
+        min_cells=2,
+        min_component_spots=15,
+        min_anchor_spots=15,
+        min_anchor_cells=2,
+        random_state=7,
+        broadcast_to_final=False,
+    )
+
+    assert metadata["identifiable"] is True
+    assert deferred_final is final_df
+    assert not set(refined.obs.columns).isdisjoint(
+        {"omm_reference_posterior", "omm_refined_state"}
+    )
+    assert "omm_reference_posterior" not in deferred_final.columns

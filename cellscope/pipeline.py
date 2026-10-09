@@ -1,9 +1,41 @@
-from typing import Optional, Literal, Tuple, List, Callable, cast, Dict, Any, Union, Sequence
+from typing import Optional, Literal, Tuple, List, Callable, cast, Dict, Any, Union, Sequence, Mapping
+from contextlib import contextmanager
+import functools
 import os
 import re
 import math
+import hashlib
 import logging as _logging
+import tempfile
+import time as _time
+import warnings as _warnings
 from collections import defaultdict, Counter
+
+# Numba and Matplotlib otherwise try to cache beside read-only site-packages or
+# under a non-writable home in containers/HPC jobs. Keep caches process-local
+# and writable without changing numerical behavior.
+_runtime_cache_root = os.path.join(tempfile.gettempdir(), "cellscope-cache")
+os.environ.setdefault("NUMBA_CACHE_DIR", os.path.join(_runtime_cache_root, "numba"))
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(_runtime_cache_root, "matplotlib"))
+
+# Per-cell spatial graphs may contain several legitimate islands.  sklearn
+# connects those islands internally before constrained Ward clustering and
+# otherwise emits this warning once per affected cell.  The connectivity
+# contract is enforced again below, so keep only this exact repeated notice
+# out of user-facing progress output.
+def _quiet_expected_disconnected_connectivity_warning() -> None:
+    _warnings.filterwarnings(
+        "ignore",
+        message=(
+            r"the number of connected components of the connectivity matrix is "
+            r"\d+ > 1\. Completing it to avoid stopping the tree early\."
+        ),
+        category=UserWarning,
+        module=r"sklearn\.cluster\._agglomerative",
+    )
+
+
+_quiet_expected_disconnected_connectivity_warning()
 
 # Optional early config load so runtime.blas_threads / runtime.n_jobs in params.yaml
 # can cap BLAS/OMP threads before importing heavy numeric libs.
@@ -19,15 +51,9 @@ def _coerce_pos_int(v: object) -> Optional[int]:
     except Exception:
         return None
 
-from tqdm.auto import tqdm
-from scipy.stats import hypergeom, norm, rankdata, fisher_exact
-from scipy.special import erfc
-from statsmodels.stats.multitest import multipletests
-import matplotlib.pyplot as plt
-import seaborn as sns
-
 # Configure BLAS/OMP threads before importing numpy/scipy.
-# Priority: params.yaml runtime.blas_threads / runtime.n_jobs > env > fallback heuristic.
+# Priority: params.yaml runtime.blas_threads / runtime.n_jobs > fallback heuristic;
+# inherited BLAS environment values are deliberately overridden for reproducibility.
 _runtime_cfg_threads = {}
 try:
     if _load_params_yaml_threads:
@@ -38,23 +64,83 @@ except Exception:
 _cpu = os.cpu_count() or 8
 _fallback_threads = max(1, min(32, _cpu // 2 or 1))
 _yaml_threads = _coerce_pos_int(_runtime_cfg_threads.get("blas_threads")) or _coerce_pos_int(_runtime_cfg_threads.get("n_jobs"))
-_threads_default = str(_yaml_threads or _fallback_threads)
+_outer_jobs = (
+    _coerce_pos_int(os.environ.get("CELLSCOPE_N_JOBS"))
+    or _coerce_pos_int(_runtime_cfg_threads.get("n_jobs"))
+    or 1
+)
+_threaded_outer_parallelism = (
+    str(
+        os.environ.get("CELLSCOPE_JOBLIB_BACKEND")
+        or _runtime_cfg_threads.get("joblib_backend", "")
+    ).strip().lower()
+    == "threading"
+    and _outer_jobs > 1
+)
+# The bundled OpenBLAS was built with a maximum thread table of 64.  Above
+# that value it may warn at import time and subsequently segfault under BLAS
+# load, so keep both the initial import environment and runtime limits within
+# the compiled capability.
+_MAX_SAFE_BLAS_THREADS = 64
+_threads_default = str(
+    1
+    if _threaded_outer_parallelism
+    else min(_yaml_threads or _fallback_threads, _MAX_SAFE_BLAS_THREADS)
+)
+_numba_safe_threads = (
+    max(1, _MAX_SAFE_BLAS_THREADS // _outer_jobs)
+    if _threaded_outer_parallelism
+    else _MAX_SAFE_BLAS_THREADS
+)
+_numba_threads_default = str(
+    min(
+        _coerce_pos_int(_runtime_cfg_threads.get("numba_threads"))
+        or (1 if _threaded_outer_parallelism else (_yaml_threads or _fallback_threads)),
+        _numba_safe_threads,
+    )
+)
+_scanpy_threads_default = str(
+    min(
+        _coerce_pos_int(os.environ.get("SCANPY_N_JOBS"))
+        or _coerce_pos_int(_runtime_cfg_threads.get("scanpy_n_jobs"))
+        or 4,
+        int(_numba_threads_default),
+    )
+)
 _THREAD_ENV_DEFAULTS = {
-    "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS", _threads_default),
-    "OMP_NUM_THREADS":      os.environ.get("OMP_NUM_THREADS", _threads_default),
-    "MKL_NUM_THREADS":      os.environ.get("MKL_NUM_THREADS", _threads_default),
-    "NUMEXPR_MAX_THREADS":  os.environ.get("NUMEXPR_MAX_THREADS", _threads_default),
-    "BLIS_NUM_THREADS":     os.environ.get("BLIS_NUM_THREADS", _threads_default),
-    "VECLIB_MAXIMUM_THREADS": os.environ.get("VECLIB_MAXIMUM_THREADS", _threads_default),
-    "ACCELERATE_NUM_THREADS": os.environ.get("ACCELERATE_NUM_THREADS", _threads_default),
+    # These must be assigned before importing numpy/scipy.  ``setdefault``
+    # previously preserved a user's inherited OPENBLAS_NUM_THREADS value even
+    # when runtime.blas_threads requested a smaller safe limit; OpenBLAS then
+    # initialized with an oversized thread table and could segfault later.
+    "OPENBLAS_NUM_THREADS": _threads_default,
+    "OMP_NUM_THREADS": _threads_default,
+    "MKL_NUM_THREADS": _threads_default,
+    "NUMEXPR_MAX_THREADS": _threads_default,
+    "NUMEXPR_NUM_THREADS": _threads_default,
+    "BLIS_NUM_THREADS": _threads_default,
+    "VECLIB_MAXIMUM_THREADS": _threads_default,
+    "ACCELERATE_NUM_THREADS": _threads_default,
+    # Numba-backed UMAP kernels can call BLAS from their worker threads.  On
+    # hosts with more cores than OpenBLAS was compiled for, leaving Numba at
+    # os.cpu_count() can exhaust OpenBLAS' thread-metadata table even though
+    # OPENBLAS_NUM_THREADS itself is 1.
+    "NUMBA_NUM_THREADS": _numba_threads_default,
+    "SCANPY_N_JOBS": _scanpy_threads_default,
 }
 for _k, _v in _THREAD_ENV_DEFAULTS.items():
-    os.environ.setdefault(_k, str(_v))
-del _THREAD_ENV_DEFAULTS, _k, _v, _cpu, _threads_default, _fallback_threads, _yaml_threads, _runtime_cfg_threads
+    os.environ[_k] = str(_v)
+del _THREAD_ENV_DEFAULTS, _k, _v, _cpu, _threads_default, _fallback_threads, _yaml_threads, _runtime_cfg_threads, _outer_jobs, _threaded_outer_parallelism, _numba_safe_threads, _numba_threads_default, _scanpy_threads_default
 
+from tqdm.auto import tqdm
 import pandas as pd
 import numpy as np
 import anndata as ad
+from scipy.stats import binom, hypergeom, norm, rankdata, fisher_exact
+from scipy.special import erfc
+from statsmodels.stats.multitest import multipletests
+import matplotlib.pyplot as plt
+import seaborn as sns
+from matplotlib.ticker import PercentFormatter
 from sklearn.neighbors import KDTree
 def _kdtree_query(points: np.ndarray, k: int) -> Tuple[np.ndarray, np.ndarray]:
     """Build KDTree and query with tuned params; returns (indices, distances).
@@ -82,15 +168,90 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.cluster import KMeans
 from sklearn.cluster import AgglomerativeClustering
-from sklearn.metrics import pairwise_distances_argmin
+from sklearn.metrics import adjusted_rand_score, pairwise_distances_argmin
 import scipy.sparse as sp
 import gc
+
+from .plotting_style import (
+    PUBLICATION_PLOT_STYLE as _PUBLICATION_PLOT_STYLE,
+    SUBCELLULAR_LABEL_GROUPS as _SUBCELLULAR_LABEL_GROUPS,
+    SUBCELLULAR_LABEL_ORDER as _SUBCELLULAR_LABEL_ORDER,
+    SUBCELLULAR_LABEL_PALETTE as _SUBCELLULAR_LABEL_PALETTE,
+)
 
 
 METASPOT_COL = "metaspot"
 METASPOT_LOCAL_COL = "metaspot_in_cell"
 _LEGACY_METASPOT_COL = "cell_sub"
 _LEGACY_METASPOT_LOCAL_COL = "cluster_in_cell"
+
+METASPOT_GRAPH_SCHEMA_VERSION = 4
+METASPOT_DGI_SCHEMA_VERSION = 4
+METASPOT_DGI_KEY = "X_dgi_gcn_metaspot"
+METASPOT_DGI_SAGE_KEY = "X_dgi_sage_metaspot"
+METADOMAIN_DGI_KEY = "X_dgi_gcn_metadomain"
+METASPOT_GRAPH_KEY = "A_metaspot_norm"
+METASPOT_DMGI_EXPRESSION_KEY = "X_dmgi_expression_metaspot"
+METASPOT_DMGI_SPATIAL_KEY = "X_dmgi_spatial_metaspot"
+
+
+def _replace_frame_columns(
+    frame: pd.DataFrame,
+    columns: Mapping[str, Any],
+) -> pd.DataFrame:
+    """Return ``frame`` with many columns replaced in one column concat.
+
+    Repeated ``frame[name] = values`` calls create one pandas block at a time.
+    Annotation writes more than one hundred audit columns, so that pattern
+    fragments both ``AnnData.obs`` and transcript tables and makes every later
+    insertion emit ``PerformanceWarning``. Building the update frame first
+    keeps dtype inference (including categoricals and nullable booleans) while
+    avoiding the repeated insertion path.
+    """
+    if not columns:
+        return frame
+
+    updates: Dict[str, Any] = {}
+    for name, values in columns.items():
+        if isinstance(values, pd.Series):
+            updates[str(name)] = values.reindex(frame.index)
+        else:
+            updates[str(name)] = values
+    update_frame = pd.DataFrame(updates, index=frame.index)
+    base = frame.drop(columns=list(update_frame.columns), errors="ignore")
+    return pd.concat([base, update_frame], axis=1, copy=False)
+
+
+def _replace_obs_columns(
+    adata: ad.AnnData,
+    columns: Mapping[str, Any],
+) -> None:
+    """Bulk-replace AnnData observation columns without fragmenting obs."""
+    if columns:
+        adata.obs = _replace_frame_columns(adata.obs, columns)
+
+
+def _obs_names_checksum(obs_names: Sequence[object]) -> str:
+    """Return an order-sensitive digest for an AnnData observation index."""
+    digest = hashlib.sha256()
+    for value in obs_names:
+        digest.update(str(value).encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _membership_checksum(
+    obs_names: Sequence[object],
+    memberships: Sequence[object],
+) -> str:
+    """Return an order-sensitive digest of observation-to-group membership."""
+    digest = hashlib.sha256()
+    for obs_name, membership in zip(obs_names, memberships):
+        digest.update(str(obs_name).encode("utf-8"))
+        digest.update(b"\t")
+        digest.update(str(membership).encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _migrate_legacy_metaspot_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -225,10 +386,16 @@ class _LocalCompositionModel:
         return z, density
 
 
-# Set Scanpy parallel jobs if available (non-intrusive performance tweak)
+# Keep Scanpy/PyNNDescent within Numba's import-time thread ceiling.
 try:
     import scanpy as sc
-    sc.settings.n_jobs = max(1, int(os.environ.get("SCANPY_N_JOBS", "4")))
+    sc.settings.n_jobs = max(
+        1,
+        min(
+            int(os.environ.get("SCANPY_N_JOBS", "4")),
+            int(os.environ["NUMBA_NUM_THREADS"]),
+        ),
+    )
 except Exception:
     pass
 
@@ -362,31 +529,65 @@ from .io import (
     load_checkpoint,
 )
 from .logging_utils import setup_logger
-from .config import load_params_yaml, fingerprint_stage, fingerprint_modules_set
-import runpy
+from .config import (
+    dgi_unit_from_config,
+    fingerprint_modules_set,
+    fingerprint_stage,
+    load_params_yaml,
+    resolve_annotation_configuration,
+)
+from .provenance import (
+    atomic_write_json,
+    build_input_provenance,
+    bundled_reference_provenance,
+    sha256_mapping,
+    source_tree_provenance,
+)
+from .resource_paths import bundled_resource_path
 
 
-def load_inputs(spatial_path: str, cell_boundaries_path: str, nucleus_boundaries_path: str, out_dir: str, resume: bool, save_intermediate: bool):
+def load_inputs(
+    spatial_path: str,
+    cell_boundaries_path: str,
+    nucleus_boundaries_path: str,
+    out_dir: str,
+    resume: bool,
+    save_intermediate: bool,
+    *,
+    reuse_cached_inputs: Optional[bool] = None,
+):
+    """Load raw inputs and optionally maintain raw-input checkpoints.
+
+    ``resume`` controls whether raw checkpoints are persisted. Reuse is a
+    separate decision: when provenance selects ``load_inputs`` as the first
+    stage to rerun, existing checkpoints are stale and must be overwritten
+    from the source paths.
+    """
     cp_spatial = _checkpoint_path(out_dir, "spatial")
     cp_cell = _checkpoint_path(out_dir, "cell_boundaries")
     cp_nuc = _checkpoint_path(out_dir, "nucleus_boundaries")
     cache_inputs = bool(resume or save_intermediate)
+    reuse_cached_inputs = (
+        bool(resume)
+        if reuse_cached_inputs is None
+        else bool(reuse_cached_inputs)
+    )
 
-    if resume and os.path.exists(cp_spatial):
+    if reuse_cached_inputs and os.path.exists(cp_spatial):
         spatial_df = load_checkpoint(cp_spatial)
     else:
         spatial_df = read_spatial_transcripts(spatial_path)
         if cache_inputs:
             save_checkpoint(spatial_df, cp_spatial)
 
-    if resume and os.path.exists(cp_cell):
+    if reuse_cached_inputs and os.path.exists(cp_cell):
         cell_df = load_checkpoint(cp_cell)
     else:
         cell_df = read_boundaries(cell_boundaries_path)
         if cache_inputs:
             save_checkpoint(cell_df, cp_cell)
 
-    if resume and os.path.exists(cp_nuc):
+    if reuse_cached_inputs and os.path.exists(cp_nuc):
         nucleus_df = load_checkpoint(cp_nuc)
     else:
         nucleus_df = read_boundaries(nucleus_boundaries_path)
@@ -442,6 +643,229 @@ def _load_dataframe_checkpoint(base_dir: str, stem: str) -> Optional[pd.DataFram
     return None
 
 
+def _module3_membership_manifest_path(out_dir: str) -> str:
+    return os.path.join(
+        _intermediate_dir(out_dir),
+        "module3_metaspot_membership.manifest.json",
+    )
+
+
+def _save_module3_membership_checkpoint(
+    point_df: pd.DataFrame,
+    out_dir: str,
+    *,
+    module_fingerprints: Mapping[str, Any],
+) -> None:
+    """Persist compact M3 membership plus the upstream fingerprint chain."""
+    membership_columns = [
+        column
+        for column in (
+            "transcript_id",
+            "cell_id",
+            METASPOT_LOCAL_COL,
+            METASPOT_COL,
+        )
+        if column in point_df.columns
+    ]
+    required = {"cell_id", METASPOT_LOCAL_COL, METASPOT_COL}
+    if not required.issubset(membership_columns):
+        raise KeyError(
+            "Module 3 membership checkpoint requires cell_id, "
+            f"{METASPOT_LOCAL_COL}, and {METASPOT_COL}"
+        )
+    path = os.path.join(
+        _intermediate_dir(out_dir),
+        "module3_metaspot_membership.parquet",
+    )
+    _atomic_dataframe_write(
+        point_df.loc[:, membership_columns],
+        path,
+        file_format="parquet",
+    )
+    atomic_write_json(
+        _module3_membership_manifest_path(out_dir),
+        {
+            "schema_version": 1,
+            "rows": int(len(point_df)),
+            "n_cells": int(point_df["cell_id"].nunique(dropna=False)),
+            "n_metaspots": int(point_df[METASPOT_COL].nunique(dropna=False)),
+            "columns": membership_columns,
+            "module_fingerprints": {
+                key: str(module_fingerprints.get(key, ""))
+                for key in ("m1", "m2", "m3")
+            },
+        },
+    )
+
+
+def _load_module3_membership_checkpoint(
+    point_df: pd.DataFrame,
+    out_dir: str,
+    *,
+    module_fingerprints: Mapping[str, Any],
+) -> Optional[pd.DataFrame]:
+    """Restore M3 labels after a row-group-wise owner-cell alignment audit."""
+    import json
+
+    parquet_path = os.path.join(
+        _intermediate_dir(out_dir),
+        "module3_metaspot_membership.parquet",
+    )
+    manifest_path = _module3_membership_manifest_path(out_dir)
+    if not os.path.isfile(parquet_path) or not os.path.isfile(manifest_path):
+        return None
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        expected_fingerprints = {
+            key: str(module_fingerprints.get(key, ""))
+            for key in ("m1", "m2", "m3")
+        }
+        if manifest.get("module_fingerprints") != expected_fingerprints:
+            _logging.getLogger("cellscope").warning(
+                "Rejecting compact Module 3 membership: upstream module "
+                "fingerprints differ"
+            )
+            return None
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        parquet = pq.ParquetFile(parquet_path)
+        row_count = int(parquet.metadata.num_rows)
+        if row_count != len(point_df) or int(manifest.get("rows", -1)) != row_count:
+            _logging.getLogger("cellscope").warning(
+                "Rejecting compact Module 3 membership: rows=%d input_rows=%d",
+                row_count,
+                len(point_df),
+            )
+            return None
+        available = set(parquet.schema.names)
+        required = {"cell_id", METASPOT_LOCAL_COL, METASPOT_COL}
+        if not required.issubset(available):
+            return None
+
+        local_labels = np.empty(row_count, dtype=np.int32)
+        metaspot_chunks = []
+        offset = 0
+        owner_cells = point_df["cell_id"]
+        logger = _logging.getLogger("cellscope")
+        logger.info(
+            "Validating compact Module 3 membership | rows=%d | row_groups=%d",
+            row_count,
+            int(parquet.metadata.num_row_groups),
+        )
+        for row_group in range(parquet.metadata.num_row_groups):
+            table = parquet.read_row_group(
+                row_group,
+                columns=["cell_id", METASPOT_LOCAL_COL, METASPOT_COL],
+            )
+            chunk_rows = int(table.num_rows)
+            stop = offset + chunk_rows
+            cached_cells = table["cell_id"].combine_chunks().to_numpy(
+                zero_copy_only=False
+            )
+            current_cells = owner_cells.iloc[offset:stop].astype(str).to_numpy()
+            if not np.array_equal(
+                np.asarray(cached_cells, dtype=str),
+                np.asarray(current_cells, dtype=str),
+            ):
+                logger.warning(
+                    "Rejecting compact Module 3 membership: owner-cell order "
+                    "differs in row group %d",
+                    row_group,
+                )
+                return None
+            local_labels[offset:stop] = (
+                table[METASPOT_LOCAL_COL]
+                .combine_chunks()
+                .to_numpy(zero_copy_only=False)
+                .astype(np.int32, copy=False)
+            )
+            metaspot_chunks.append(table[METASPOT_COL].combine_chunks())
+            offset = stop
+        if offset != row_count:
+            return None
+
+        restored = point_df.copy(deep=False)
+        restored[METASPOT_LOCAL_COL] = local_labels
+        chunked_metaspots = pa.chunked_array(metaspot_chunks)
+        try:
+            restored[METASPOT_COL] = pd.Series(
+                pd.arrays.ArrowStringArray(chunked_metaspots),
+                index=restored.index,
+            )
+        except (AttributeError, TypeError):
+            restored[METASPOT_COL] = chunked_metaspots.to_pandas()
+        if int(restored[METASPOT_COL].nunique(dropna=False)) != int(
+            manifest.get("n_metaspots", -1)
+        ):
+            _logging.getLogger("cellscope").warning(
+                "Rejecting compact Module 3 membership: MetaSpot count differs"
+            )
+            return None
+        logger.info(
+            "Compact Module 3 membership validated and restored | "
+            "MetaSpots=%d",
+            int(manifest["n_metaspots"]),
+        )
+        return restored
+    except Exception as exc:
+        _logging.getLogger("cellscope").warning(
+            "Could not load compact Module 3 membership: %s",
+            exc,
+        )
+        return None
+
+
+def _load_late_point_resume_checkpoint(
+    out_dir: str,
+    spatial_df: pd.DataFrame,
+) -> Optional[pd.DataFrame]:
+    """Recover the aligned transcript-to-MetaSpot table in lite I/O mode.
+
+    ``module5_final_data`` is deliberately persisted for resume even when the
+    much larger Module 1--3 tables are omitted. It still contains every
+    upstream geometry and MetaSpot membership column. Reusing it is safe only
+    when its row count matches the current preprocessed input and its MetaSpot
+    population is strictly aligned with the Module 4 AnnData checkpoint.
+    """
+    base = _intermediate_dir(out_dir)
+    point_df = _load_dataframe_checkpoint(base, "module5_final_data")
+    if point_df is None:
+        return None
+    required = {
+        "cell_id",
+        "feature_name",
+        "x_location",
+        "y_location",
+        METASPOT_LOCAL_COL,
+        METASPOT_COL,
+    }
+    missing = sorted(required.difference(point_df.columns))
+    if missing or len(point_df) != len(spatial_df):
+        _logging.getLogger("cellscope").warning(
+            "Rejecting late point-table resume checkpoint: missing=%s | "
+            "cached_rows=%d | input_rows=%d",
+            missing,
+            len(point_df),
+            len(spatial_df),
+        )
+        return None
+    module4 = _load_adata_checkpoint(
+        os.path.join(base, "module4_adata1.h5ad")
+    )
+    if module4 is None:
+        return None
+    aligned, reason = _validate_adata1_point_df_alignment(module4, point_df)
+    if not aligned:
+        _logging.getLogger("cellscope").warning(
+            "Rejecting late point-table resume checkpoint: %s",
+            reason,
+        )
+        return None
+    return point_df
+
+
 def _load_adata_checkpoint(path: str) -> Optional[ad.AnnData]:
     if not os.path.exists(path):
         return None
@@ -462,6 +886,28 @@ def _resume_build_outputs(out_dir: str) -> Optional[Tuple[ad.AnnData, Optional[a
     adata2 = _load_adata_checkpoint(os.path.join(base, "module6_adata2.h5ad"))
     if adata2 is None:
         adata2 = _load_adata_checkpoint(os.path.join(out_dir, "adata2.h5ad"))
+    try:
+        resume_cfg = load_params_yaml() or {}
+        resume_graph_unit = _graph_unit_from_config(resume_cfg)
+    except Exception:
+        resume_graph_unit = "metadomain"
+    if resume_graph_unit == "metaspot":
+        if adata2 is None:
+            return None
+        dgi_meta = (
+            adata1.uns.get("dgi_embeddings", {}).get(METASPOT_DGI_KEY, {})
+        )
+        if (
+            METASPOT_DGI_KEY not in adata1.obsm
+            or adata1.obsm[METASPOT_DGI_KEY].shape[0] != adata1.n_obs
+            or dgi_meta.get("node_unit") != "metaspot"
+            or int(dgi_meta.get("schema_version", -1))
+            != METASPOT_DGI_SCHEMA_VERSION
+            or dgi_meta.get("node_id_checksum")
+            != _obs_names_checksum(adata1.obs_names)
+            or METADOMAIN_DGI_KEY not in adata2.obsm
+        ):
+            return None
     final_df = _load_dataframe_checkpoint(base, "module5_final_data")
     used_final_output = False
     if final_df is None:
@@ -473,6 +919,31 @@ def _resume_build_outputs(out_dir: str) -> Optional[Tuple[ad.AnnData, Optional[a
         used_final_output = final_df is not None
     if final_df is None:
         return adata1, adata2, None
+
+    if (
+        {METASPOT_COL, "meta-domain"}.issubset(final_df.columns)
+        and "meta-domain" in adata1.obs.columns
+    ):
+        mapping = (
+            final_df[[METASPOT_COL, "meta-domain"]]
+            .assign(
+                **{
+                    METASPOT_COL: lambda frame: frame[METASPOT_COL].astype(str),
+                    "meta-domain": lambda frame: frame["meta-domain"].astype(str),
+                }
+            )
+            .drop_duplicates()
+        )
+        if mapping[METASPOT_COL].duplicated().any():
+            return None
+        observed_mapping = mapping.set_index(METASPOT_COL)["meta-domain"]
+        expected_index = pd.Index(adata1.obs_names.astype(str))
+        expected_mapping = pd.Series(
+            adata1.obs["meta-domain"].astype(str).to_numpy(),
+            index=expected_index,
+        )
+        if not observed_mapping.reindex(expected_index).equals(expected_mapping):
+            return None
 
     if used_final_output:
         if not {"metaspot", "cell_id"}.issubset(final_df.columns):
@@ -544,31 +1015,61 @@ def _resume_build_outputs(out_dir: str) -> Optional[Tuple[ad.AnnData, Optional[a
     return adata1, adata2, final_df
 
 
-def _resume_annotation_outputs(out_dir: str) -> Optional[Tuple[Optional[ad.AnnData], Optional[pd.DataFrame]]]:
+def _resume_annotation_outputs(
+    out_dir: str,
+) -> Optional[
+    Tuple[
+        Optional[ad.AnnData],
+        Optional[ad.AnnData],
+        Optional[pd.DataFrame],
+    ]
+]:
     base = _intermediate_dir(out_dir)
     final_df = _load_dataframe_checkpoint(base, "annotated_final_csv")
     if final_df is None:
         return None
-    ann_adata2 = _load_adata_checkpoint(os.path.join(base, "annotated_adata2.h5ad"))
-    return ann_adata2, final_df
-
-
-def preprocess(spatial_df: pd.DataFrame, cell_df: pd.DataFrame, nucleus_df: pd.DataFrame, show_internal_progress: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Keep only cells where `overlaps_nucleus` has both 0 and 1; enforce consistent filtering across the three input tables.
-    """
-    if "overlaps_nucleus" not in spatial_df.columns:
-        raise ValueError(
-            "spatial_df is missing overlaps_nucleus; clear the spatial checkpoint and reload from the CSV"
-        )
-    unique_counts = (
-        spatial_df.groupby("cell_id")["overlaps_nucleus"].nunique().reset_index(name="n_unique")
+    ann_adata1 = _load_adata_checkpoint(
+        os.path.join(base, "annotated_adata1.h5ad")
     )
-    valid_cells = unique_counts.query("n_unique == 2")["cell_id"]
+    ann_adata2 = _load_adata_checkpoint(os.path.join(base, "annotated_adata2.h5ad"))
+    return ann_adata1, ann_adata2, final_df
 
-    spatial_df = spatial_df.query("cell_id in @valid_cells").copy()
-    cell_df = cell_df.query("cell_id in @valid_cells").copy()
-    nucleus_df = nucleus_df.query("cell_id in @valid_cells").copy()
+
+def preprocess(
+    spatial_df: pd.DataFrame,
+    cell_df: pd.DataFrame,
+    nucleus_df: pd.DataFrame,
+    show_internal_progress: bool = False,
+    use_input_nucleus_flags: bool = True,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Align input cells without leaking unused nuclear truth into selection.
+
+    When input nuclear flags are part of Module 1, retain the historical
+    requirement that a cell contain both nuclear and non-nuclear transcripts.
+    When geometry is recomputed from polygons, select only on membership in the
+    three input tables; ``overlaps_nucleus`` then has no influence on the sample.
+    """
+    del show_internal_progress  # reserved for future streaming validation
+    common_cells = (
+        set(spatial_df["cell_id"].dropna())
+        & set(cell_df["cell_id"].dropna())
+        & set(nucleus_df["cell_id"].dropna())
+    )
+
+    if use_input_nucleus_flags:
+        if "overlaps_nucleus" not in spatial_df.columns:
+            raise ValueError(
+                "spatial input is missing overlaps_nucleus while "
+                "module1.use_input_nucleus_flags=true"
+            )
+        unique_counts = spatial_df.groupby("cell_id", observed=True)[
+            "overlaps_nucleus"
+        ].nunique(dropna=True)
+        common_cells &= set(unique_counts[unique_counts == 2].index)
+
+    spatial_df = spatial_df[spatial_df["cell_id"].isin(common_cells)].copy()
+    cell_df = cell_df[cell_df["cell_id"].isin(common_cells)].copy()
+    nucleus_df = nucleus_df[nucleus_df["cell_id"].isin(common_cells)].copy()
 
     return spatial_df, cell_df, nucleus_df
 
@@ -604,6 +1105,7 @@ def build_point_geometry_v2(
     cell_boundaries_df: pd.DataFrame,
     sampled_cells: List,
     include_directional: bool = True,
+    use_input_nucleus_flags: bool = True,
     winsor_perc=(1, 99),
     show_internal_progress: bool = False,
 ) -> pd.DataFrame:
@@ -651,13 +1153,106 @@ def build_point_geometry_v2(
         return pd.concat(parts)
 
     def _build_nucleus_paths(nucleus_df: pd.DataFrame, cells) -> dict:
+        """Build valid nucleus polygons from boundary-point tables.
+
+        Some spatial formats store boundary pixels/vertices without contour
+        ordering. ``matplotlib.path.Path`` assumes ordered polygon vertices;
+        feeding an unordered point cloud can collapse the inferred nuclear
+        area and severely reduce nuclear recall. We preserve apparently
+        ordered contours and reconstruct clearly unordered contours with a
+        convex hull. Nuclei are typically close to convex, making this a
+        conservative and stable fallback for cross-platform input.
+        """
+        from scipy.spatial import ConvexHull
+        from scipy.spatial import QhullError
+
         paths = {}
         sub = nucleus_df[nucleus_df['cell_id'].isin(cells)]
         it = sub.groupby('cell_id', sort=False)
-        iterator = _progress_iter(it, desc='Build nucleus Path', total=it.ngroups, show=show_internal_progress)
+        iterator = _progress_iter(
+            it,
+            desc='Build nucleus Path',
+            total=it.ngroups,
+            show=show_internal_progress,
+        )
+
         for cid, g in iterator:
-            pts = g[['vertex_x', 'vertex_y']].to_numpy()
-            paths[cid] = Path(pts, closed=True) if len(pts) >= 3 else None
+            pts = (
+                g[['vertex_x', 'vertex_y']]
+                .apply(pd.to_numeric, errors='coerce')
+                .dropna()
+                .to_numpy(dtype=np.float64)
+            )
+            # ``np.unique(..., axis=0)`` sorts rows, which destroys contour
+            # order. Keep the first occurrence of each vertex instead.
+            if len(pts):
+                _, first_idx = np.unique(pts, axis=0, return_index=True)
+                pts = pts[np.sort(first_idx)]
+
+            if len(pts) < 3:
+                paths[cid] = None
+                continue
+
+            try:
+                tree = KDTree(pts)
+                nn_dist, _ = tree.query(pts, k=2, return_distance=True)
+                local_scale = float(np.nanmedian(nn_dist[:, 1]))
+            except Exception:
+                local_scale = np.nan
+
+            closed_pts = np.vstack([pts, pts[:1]])
+            path_steps = np.sqrt(
+                np.sum(np.diff(closed_pts, axis=0) ** 2, axis=1)
+            )
+            typical_step = float(np.nanmedian(path_steps))
+            upper_step = float(np.nanpercentile(path_steps, 95))
+
+            ordered = (
+                np.isfinite(local_scale)
+                and local_scale > 0
+                and typical_step <= 3.0 * local_scale
+                and upper_step <= 10.0 * local_scale
+            )
+
+            polygon_pts = pts
+
+            # A short vertex list can pass the step-size heuristic while still
+            # being self-intersecting (for example, bow-tie ordering). Treat
+            # only a valid, non-zero-area Shapely polygon as an ordered contour.
+            if ordered:
+                try:
+                    from shapely.geometry import Polygon as _Polygon
+
+                    candidate = _Polygon(pts)
+                    ordered = bool(
+                        candidate.is_valid
+                        and not candidate.is_empty
+                        and float(candidate.area) > 0.0
+                    )
+                except Exception:
+                    ordered = False
+
+            if not ordered:
+                try:
+                    hull = ConvexHull(pts)
+                    polygon_pts = pts[hull.vertices]
+                except QhullError:
+                    center = np.nanmedian(pts, axis=0)
+                    angle = np.arctan2(
+                        pts[:, 1] - center[1],
+                        pts[:, 0] - center[0],
+                    )
+                    polygon_pts = pts[np.argsort(angle)]
+
+            paths[cid] = (
+                # With ``closed=True`` Matplotlib treats the last vertex as a
+                # CLOSEPOLY placeholder. Repeat the first point explicitly so
+                # the final real vertex is not discarded.
+                Path(np.vstack([polygon_pts, polygon_pts[:1]]), closed=True)
+                if len(polygon_pts) >= 3
+                else None
+            )
+
         return paths
 
     # Avoid copying the full transcript table. We keep the original rows and
@@ -665,7 +1260,10 @@ def build_point_geometry_v2(
     df = transcripts_df[transcripts_df['cell_id'].isin(sampled_cells)]
     cell_kd = _build_kdtrees(cell_boundaries_df, sampled_cells, desc="Cell KDTree")
     nuc_kd = _build_kdtrees(nucleus_boundaries_df, sampled_cells, desc="Nucleus KDTree")
-    use_input_nucleus_flags = "overlaps_nucleus" in df.columns
+    use_input_nucleus_flags = bool(
+        use_input_nucleus_flags
+        and "overlaps_nucleus" in df.columns
+    )
     nuc_paths = (
         {}
         if use_input_nucleus_flags
@@ -1294,6 +1892,28 @@ def _select_top_variance_features(X: np.ndarray, n_features: int) -> np.ndarray:
     return X[:, order]
 
 
+def _target_metaspot_counts_from_site_counts(
+    site_counts: np.ndarray,
+    target_sites_per_metaspot: int,
+    min_metaspots_per_cell: int = 1,
+    max_metaspots_per_cell: Optional[int] = None,
+) -> np.ndarray:
+    """Vectorize the configured MetaSpot budget over per-cell site counts."""
+    n_sites = np.asarray(site_counts, dtype=np.int64)
+    if np.any(n_sites < 0):
+        raise ValueError("site_counts must be non-negative")
+
+    target_sites = max(1, int(target_sites_per_metaspot))
+    target_count = (n_sites + target_sites - 1) // target_sites
+    lower_bound = max(1, int(min_metaspots_per_cell))
+    target_count = np.maximum(lower_bound, target_count)
+    if isinstance(max_metaspots_per_cell, (int, float)):
+        upper_bound = max(lower_bound, int(max_metaspots_per_cell))
+        target_count = np.minimum(target_count, upper_bound)
+    target_count = np.minimum(target_count, n_sites)
+    return np.maximum(1, target_count).astype(np.int64, copy=False)
+
+
 def _target_metaspot_count(
     coordinates: np.ndarray,
     target_sites_per_metaspot: int,
@@ -1305,18 +1925,84 @@ def _target_metaspot_count(
     if xy.ndim != 2 or xy.shape[1] != 2:
         raise ValueError("coordinates must have shape (n_points, 2)")
     finite_xy = xy[np.isfinite(xy).all(axis=1)]
-    if len(finite_xy) == 0:
-        return 1
-
     n_sites = int(np.unique(finite_xy, axis=0).shape[0])
-    target_sites = max(1, int(target_sites_per_metaspot))
-    target_count = int(math.ceil(n_sites / float(target_sites)))
-    lower_bound = max(1, int(min_metaspots_per_cell))
-    target_count = max(lower_bound, target_count)
-    if isinstance(max_metaspots_per_cell, (int, float)):
-        upper_bound = max(lower_bound, int(max_metaspots_per_cell))
-        target_count = min(target_count, upper_bound)
-    return max(1, min(target_count, n_sites))
+    return int(
+        _target_metaspot_counts_from_site_counts(
+            np.asarray([n_sites], dtype=np.int64),
+            target_sites_per_metaspot=target_sites_per_metaspot,
+            min_metaspots_per_cell=min_metaspots_per_cell,
+            max_metaspots_per_cell=max_metaspots_per_cell,
+        )[0]
+    )
+
+
+def _allocate_partition_target_counts(
+    partition_coordinates: Sequence[np.ndarray],
+    target_sites_per_metaspot: int,
+    min_metaspots_per_cell: int = 1,
+    max_metaspots_per_cell: Optional[int] = None,
+) -> List[int]:
+    """Allocate one cell-level MetaSpot budget across spatial compartments.
+
+    Every non-empty compartment receives at least one MetaSpot.  The remaining
+    budget is assigned in proportion to unique XY sites, with deterministic
+    largest-remainder tie breaking.  This preserves the configured per-cell
+    cap while preventing any MetaSpot from crossing a compartment boundary.
+    """
+    partitions = [
+        np.asarray(coordinates, dtype=np.float32)
+        for coordinates in partition_coordinates
+        if len(coordinates)
+    ]
+    if not partitions:
+        return []
+
+    site_counts = np.asarray(
+        [
+            np.unique(
+                coordinates[np.isfinite(coordinates).all(axis=1)],
+                axis=0,
+            ).shape[0]
+            for coordinates in partitions
+        ],
+        dtype=np.int64,
+    )
+    site_counts = np.maximum(site_counts, 1)
+    combined = np.vstack(partitions)
+    total_target = _target_metaspot_count(
+        combined,
+        target_sites_per_metaspot=target_sites_per_metaspot,
+        min_metaspots_per_cell=max(
+            int(min_metaspots_per_cell),
+            len(partitions),
+        ),
+        max_metaspots_per_cell=max_metaspots_per_cell,
+    )
+    total_target = max(len(partitions), int(total_target))
+    total_target = min(int(site_counts.sum()), total_target)
+
+    raw = total_target * site_counts.astype(np.float64) / site_counts.sum()
+    allocation = np.floor(raw).astype(np.int64)
+    allocation = np.maximum(allocation, 1)
+    allocation = np.minimum(allocation, site_counts)
+
+    while int(allocation.sum()) < total_target:
+        candidates = np.flatnonzero(allocation < site_counts)
+        if candidates.size == 0:
+            break
+        residual = raw[candidates] - allocation[candidates]
+        chosen = int(candidates[np.argmax(residual)])
+        allocation[chosen] += 1
+
+    while int(allocation.sum()) > total_target:
+        candidates = np.flatnonzero(allocation > 1)
+        if candidates.size == 0:
+            break
+        residual = raw[candidates] - allocation[candidates]
+        chosen = int(candidates[np.argmin(residual)])
+        allocation[chosen] -= 1
+
+    return allocation.astype(int).tolist()
 
 
 def _enforce_spatially_connected_labels(
@@ -1383,17 +2069,30 @@ def _enforce_spatially_connected_labels(
     if n_sites <= 1:
         return np.zeros(n_points, dtype=np.int32)
 
-    # Pick a deterministic majority label at coordinates containing multiple
-    # transcripts. Most imaging datasets already agree exactly at each site.
-    site_labels = np.empty(n_sites, dtype=np.int32)
-    order = np.argsort(inverse, kind="stable")
-    sorted_sites = inverse[order]
-    starts = np.r_[0, np.flatnonzero(np.diff(sorted_sites)) + 1]
-    stops = np.r_[starts[1:], len(order)]
-    for start, stop in zip(starts, stops):
-        site = int(sorted_sites[start])
-        values, counts = np.unique(point_labels[order[start:stop]], return_counts=True)
-        site_labels[site] = int(values[np.argmax(counts)])
+    # Canonical spatial Ward segmentation starts from one constant label. Skip
+    # thousands of tiny majority-vote reductions in that common path.
+    point_label_values = np.unique(point_labels)
+    if point_label_values.size == 1:
+        site_labels = np.full(
+            n_sites,
+            int(point_label_values[0]),
+            dtype=np.int32,
+        )
+    else:
+        # Pick a deterministic majority label at coordinates containing
+        # multiple transcripts.
+        site_labels = np.empty(n_sites, dtype=np.int32)
+        order = np.argsort(inverse, kind="stable")
+        sorted_sites = inverse[order]
+        starts = np.r_[0, np.flatnonzero(np.diff(sorted_sites)) + 1]
+        stops = np.r_[starts[1:], len(order)]
+        for start, stop in zip(starts, stops):
+            site = int(sorted_sites[start])
+            values, counts = np.unique(
+                point_labels[order[start:stop]],
+                return_counts=True,
+            )
+            site_labels[site] = int(values[np.argmax(counts)])
 
     query_k = max(2, min(n_sites, int(connectivity_k) + 1))
     neighbor_idx, neighbor_dist = _kdtree_query(unique_xy, query_k)
@@ -1412,30 +2111,41 @@ def _enforce_spatially_connected_labels(
     if not np.isfinite(radius) or radius <= 0:
         return point_labels.copy()
 
-    local_edges = set()
-    knn_edges = set()
-    for i in range(n_sites):
-        for j, distance in zip(neighbor_idx[i], neighbor_dist[i]):
-            j = int(j)
-            if i == j or not np.isfinite(distance) or distance <= 0:
-                continue
-            a, b = (i, j) if i < j else (j, i)
-            knn_edges.add((a, b))
-            if distance <= radius:
-                local_edges.add((a, b))
+    edge_rows = np.repeat(
+        np.arange(n_sites, dtype=np.int64),
+        neighbor_idx.shape[1],
+    )
+    edge_cols = np.asarray(neighbor_idx, dtype=np.int64).ravel()
+    edge_distances = np.asarray(neighbor_dist, dtype=np.float64).ravel()
+    valid_edges = (
+        (edge_rows != edge_cols)
+        & np.isfinite(edge_distances)
+        & (edge_distances > 0.0)
+    )
+    edge_rows = edge_rows[valid_edges]
+    edge_cols = edge_cols[valid_edges]
+    edge_distances = edge_distances[valid_edges]
+    edge_low = np.minimum(edge_rows, edge_cols)
+    edge_high = np.maximum(edge_rows, edge_cols)
+    edge_codes = edge_low * np.int64(n_sites) + edge_high
+    knn_codes = np.unique(edge_codes)
+    local_codes = np.unique(edge_codes[edge_distances <= radius])
 
     # Feature-aware Ward clustering needs one connected neighborhood graph to
     # preserve its requested cluster count. Direct label splitting keeps the
     # stricter native-spacing radius so genuinely separated islands stay split.
-    edges = knn_edges if features is not None else local_edges
-    if not edges:
+    selected_codes = knn_codes if features is not None else local_codes
+    if selected_codes.size == 0:
         return point_labels.copy()
 
-    edge_list = sorted(edges)
-    adjacency = [[] for _ in range(n_sites)]
-    for a, b in edge_list:
-        adjacency[a].append(b)
-        adjacency[b].append(a)
+    edge_a = (selected_codes // np.int64(n_sites)).astype(
+        np.int32,
+        copy=False,
+    )
+    edge_b = (selected_codes % np.int64(n_sites)).astype(
+        np.int32,
+        copy=False,
+    )
 
     used_constrained_clustering = False
     if features is not None and n_sites > 1:
@@ -1459,23 +2169,22 @@ def _enforce_spatially_connected_labels(
         )
         requested_clusters = max(1, min(requested_clusters, n_sites))
         if requested_clusters > 1:
-            rows = np.fromiter(
-                (endpoint for edge in edge_list for endpoint in (edge[0], edge[1])),
-                dtype=np.int32,
-            )
-            cols = np.fromiter(
-                (endpoint for edge in edge_list for endpoint in (edge[1], edge[0])),
-                dtype=np.int32,
-            )
+            rows = np.concatenate((edge_a, edge_b))
+            cols = np.concatenate((edge_b, edge_a))
             connectivity = sp.csr_matrix(
                 (np.ones(len(rows), dtype=np.float32), (rows, cols)),
                 shape=(n_sites, n_sites),
             )
             try:
+                # Some runners prepend their own warning filters after this
+                # module is imported, so reassert the precise rule at the call
+                # site without wrapping or serializing parallel clustering.
+                _quiet_expected_disconnected_connectivity_warning()
                 site_labels = AgglomerativeClustering(
                     n_clusters=requested_clusters,
                     linkage="ward",
                     connectivity=connectivity,
+                    compute_full_tree=False,
                 ).fit_predict(combined_features).astype(np.int32)
                 used_constrained_clustering = True
             except Exception as exc:
@@ -1486,6 +2195,10 @@ def _enforce_spatially_connected_labels(
                 )
 
     if not used_constrained_clustering:
+        adjacency = [[] for _ in range(n_sites)]
+        for a, b in zip(edge_a, edge_b):
+            adjacency[int(a)].append(int(b))
+            adjacency[int(b)].append(int(a))
         smooth_fraction = float(np.clip(smoothing_min_fraction, 0.5, 1.0))
         for _ in range(max(0, int(smoothing_iterations))):
             updated = site_labels.copy()
@@ -1532,9 +2245,9 @@ def _enforce_spatially_connected_labels(
         return True
 
     # First split every original label into its XY-connected components.
-    for a, b in edge_list:
+    for a, b in zip(edge_a, edge_b):
         if site_labels[a] == site_labels[b]:
-            union(a, b)
+            union(int(a), int(b))
 
     min_size = max(1, int(min_component_size))
     for _ in range(32):
@@ -1550,8 +2263,8 @@ def _enforce_spatially_connected_labels(
             break
 
         boundary_contacts: Dict[int, Counter] = defaultdict(Counter)
-        for a, b in edge_list:
-            root_a, root_b = find(a), find(b)
+        for a, b in zip(edge_a, edge_b):
+            root_a, root_b = find(int(a)), find(int(b))
             if root_a == root_b:
                 continue
             boundary_contacts[root_a][root_b] += 1
@@ -1611,6 +2324,7 @@ def per_cell_clustering(
     small_backend_cells: int = 12000,
     sequential_cells: int = 256,
     enforce_spatial_connectivity: bool = False,
+    partition_by_nucleus: bool = False,
     spatial_connectivity_k: int = 8,
     spatial_radius_quantile: float = 0.9,
     spatial_radius_factor: float = 1.5,
@@ -1621,9 +2335,9 @@ def per_cell_clustering(
     target_sites_per_metaspot: Optional[int] = None,
     min_metaspots_per_cell: int = 1,
     max_metaspots_per_cell: Optional[int] = None,
+    parallel_chunk_cells: Optional[int] = None,
+    parallel_n_jobs: Optional[int] = None,
     ) -> pd.DataFrame:
-    import hdbscan  # lazy import
-
     MIN_SUB_PTS = int(hdbscan_min_cluster_size)
     # 使用更小的目标簇大小以促进细分，且不与最小簇大小绑定
     TARGET_SUB_SIZE = max(8, int(target_sub_size))
@@ -1645,6 +2359,7 @@ def per_cell_clustering(
         g: pd.DataFrame,
         labels: np.ndarray,
         features: Optional[np.ndarray] = None,
+        target_count_override: Optional[int] = None,
     ) -> np.ndarray:
         labels = np.asarray(labels, dtype=np.int32)
         if not bool(enforce_spatial_connectivity) or len(labels) <= 1:
@@ -1654,7 +2369,9 @@ def per_cell_clustering(
             copy=False,
         )
         target_count = int(np.unique(labels).size)
-        if TARGET_SITES_PER_METASPOT is not None:
+        if isinstance(target_count_override, (int, float)):
+            target_count = max(1, int(target_count_override))
+        elif TARGET_SITES_PER_METASPOT is not None:
             target_count = _target_metaspot_count(
                 coordinates,
                 target_sites_per_metaspot=TARGET_SITES_PER_METASPOT,
@@ -1773,17 +2490,98 @@ def per_cell_clustering(
 
     # Deterministic RNG for MiniBatchKMeans sampling inside _fit_one
     rng = np.random.default_rng(42)
+    # Keep process workers from serializing the full transcript table.
+    cell_comp_emb = getattr(point_df, '_cell_comp_emb', None)
 
-    def _fit_one(args):
+    def _fit_one(
+        args,
+        allow_nucleus_partition: bool = True,
+        target_count_override: Optional[int] = None,
+    ):
         cid, g = args
         # Ensure minimal geometry present; composition may be provided per-cell
         g = g.dropna(subset=['x_location', 'y_location'])
         if len(g) == 0:
             return cid, pd.Series([], dtype=np.int32, index=g.index)
+
+        if bool(partition_by_nucleus) and allow_nucleus_partition:
+            if "in_nucleus" in g.columns:
+                nucleus_flags = _coerce_bool_series(
+                    g["in_nucleus"],
+                    default=False,
+                )
+            elif "r_signed" in g.columns:
+                nucleus_flags = (
+                    pd.to_numeric(g["r_signed"], errors="coerce")
+                    .fillna(0.0)
+                    .lt(0.0)
+                )
+            else:
+                raise ValueError(
+                    "module3.partition_by_nucleus requires either "
+                    "'in_nucleus' or 'r_signed' in the Module 3 point table"
+                )
+
+            present_partitions = [
+                flag
+                for flag in (True, False)
+                if bool(nucleus_flags.eq(flag).any())
+            ]
+            if len(present_partitions) > 1:
+                partition_frames = [
+                    g.loc[nucleus_flags.eq(flag)]
+                    for flag in present_partitions
+                ]
+                if TARGET_SITES_PER_METASPOT is not None:
+                    partition_targets = _allocate_partition_target_counts(
+                        [
+                            frame[
+                                ["x_location", "y_location"]
+                            ].to_numpy(np.float32, copy=False)
+                            for frame in partition_frames
+                        ],
+                        target_sites_per_metaspot=TARGET_SITES_PER_METASPOT,
+                        min_metaspots_per_cell=min_metaspots_per_cell,
+                        max_metaspots_per_cell=max_metaspots_per_cell,
+                    )
+                else:
+                    partition_targets = [None] * len(partition_frames)
+
+                combined = pd.Series(
+                    index=g.index,
+                    dtype=np.int32,
+                )
+                label_offset = 0
+                for frame, partition_target in zip(
+                    partition_frames,
+                    partition_targets,
+                ):
+                    _, partition_labels = _fit_one(
+                        (cid, frame),
+                        allow_nucleus_partition=False,
+                        target_count_override=partition_target,
+                    )
+                    dense_labels = pd.factorize(
+                        partition_labels,
+                        sort=True,
+                    )[0].astype(np.int32)
+                    combined.loc[partition_labels.index] = (
+                        dense_labels + label_offset
+                    )
+                    label_offset += max(
+                        1,
+                        int(np.unique(dense_labels).size),
+                    )
+                return cid, combined.astype(np.int32)
+
         n = len(g)
         if n < MIN_SUB_PTS:
             labels = np.zeros(n, dtype=np.int32)
-            labels = _finalize_spatial_labels(g, labels)
+            labels = _finalize_spatial_labels(
+                g,
+                labels,
+                target_count_override=target_count_override,
+            )
             return cid, pd.Series(labels, index=g.index, dtype=np.int32)
         # Build local expression features for this cell only, then release them
         # after clustering. This avoids materializing dense embeddings globally.
@@ -1799,9 +2597,8 @@ def per_cell_clustering(
                 missing = len(comp_cols) - X_comp.shape[1]
                 X_comp = np.hstack([X_comp, np.zeros((len(g), missing), dtype=np.float32)])
         elif composition_model is None:
-            cell_emb = getattr(point_df, '_cell_comp_emb', None)
-            if cell_emb is not None and cid in cell_emb.index:
-                vec = cell_emb.loc[cid, comp_cols].to_numpy(dtype=np.float32)
+            if cell_comp_emb is not None and cid in cell_comp_emb.index:
+                vec = cell_comp_emb.loc[cid, comp_cols].to_numpy(dtype=np.float32)
                 X_comp = np.repeat(vec.reshape(1, -1), len(g), axis=0)
             else:
                 X_comp = np.zeros((len(g), len(comp_cols)), dtype=np.float32)
@@ -1823,7 +2620,12 @@ def per_cell_clustering(
         # HDBSCAN remains available as a legacy fallback when this target is off.
         if bool(enforce_spatial_connectivity) and TARGET_SITES_PER_METASPOT is not None:
             seed_labels = np.zeros(n, dtype=np.int32)
-            labels = _finalize_spatial_labels(g, seed_labels, Xz)
+            labels = _finalize_spatial_labels(
+                g,
+                seed_labels,
+                Xz,
+                target_count_override=target_count_override,
+            )
             return cid, pd.Series(labels, index=g.index, dtype=np.int32)
         # Fast path: large cells switch to sampled MiniBatchKMeans to avoid expensive HDBSCAN
         if n > int(hdbscan_max_points):
@@ -1850,10 +2652,17 @@ def per_cell_clustering(
             labels = km.predict(Xz).astype(np.int32)
             _min_size = int(merge_min_size) if merge_min_size is not None else int(MIN_SUB_PTS)
             labels = _merge_small_clusters(labels, Xz, min_size=_min_size)
-            labels = _finalize_spatial_labels(g, labels, Xz)
+            labels = _finalize_spatial_labels(
+                g,
+                labels,
+                Xz,
+                target_count_override=target_count_override,
+            )
             return cid, pd.Series(labels, index=g.index, dtype=np.int32)
 
         min_samples = max(3, int(round(MIN_SUB_PTS * MIN_SAMPLES_FRAC)))
+        import hdbscan
+
         clusterer = hdbscan.HDBSCAN(
             min_cluster_size=MIN_SUB_PTS,
             min_samples=min_samples,
@@ -1884,12 +2693,22 @@ def per_cell_clustering(
                 labels = km.fit_predict(Xz).astype(np.int32)
             _min_size = int(merge_min_size) if merge_min_size is not None else int(MIN_SUB_PTS)
             labels = _merge_small_clusters(labels, Xz, min_size=_min_size)
-            labels = _finalize_spatial_labels(g, labels, Xz)
+            labels = _finalize_spatial_labels(
+                g,
+                labels,
+                Xz,
+                target_count_override=target_count_override,
+            )
             return cid, pd.Series(labels, index=g.index, dtype=np.int32)
         labels = _assign_noise_to_nearest(hdb_labels, Xz)
         _min_size = int(merge_min_size) if merge_min_size is not None else int(MIN_SUB_PTS)
         labels = _merge_small_clusters(labels, Xz, min_size=_min_size)
-        labels = _finalize_spatial_labels(g, labels, Xz)
+        labels = _finalize_spatial_labels(
+            g,
+            labels,
+            Xz,
+            target_count_override=target_count_override,
+        )
         return cid, pd.Series(labels, index=g.index, dtype=np.int32)
 
     # Lightweight backend selection for small datasets to cut scheduler/IPC overhead
@@ -1900,12 +2719,19 @@ def per_cell_clustering(
         _backend = "threading"
     if use_sequential:
         iterator = _progress_iter(range(n_groups), desc='MetaSpot segmentation (seq)', total=n_groups, show=show_internal_progress)
-        results = []
+        labels_per_cell = pd.Series(
+            -1,
+            index=point_df.index,
+            dtype=np.int32,
+        )
         for chunk in _iter_group_chunks(point_df, 1):
             for pair in chunk:
-                results.append(_fit_one(pair))
-        labels_per_cell = pd.concat([s for _, s in results]).astype(np.int32)
-        point_df = point_df.copy()
+                _, labels = _fit_one(pair)
+                labels_per_cell.loc[labels.index] = labels.to_numpy(
+                    dtype=np.int32,
+                    copy=False,
+                )
+        point_df = point_df.copy(deep=False)
         point_df[METASPOT_LOCAL_COL] = labels_per_cell
         missing = point_df[METASPOT_LOCAL_COL].isna()
         if missing.any():
@@ -1919,15 +2745,25 @@ def per_cell_clustering(
         return point_df
 
     from joblib import Parallel, delayed
-    # Keep module 3 conservative on memory: use at most 2 workers for large runs.
-    N_JOBS = max(1, min(2, _preferred_n_jobs()))
+    # Ward/k-d tree work releases the GIL and each cell is bounded in size.
+    # Use several cells concurrently by default while keeping an explicit
+    # upper bound for large production runs.
+    available_jobs = _preferred_n_jobs()
+    if isinstance(parallel_n_jobs, (int, float)) and int(parallel_n_jobs) > 0:
+        N_JOBS = max(1, min(int(parallel_n_jobs), available_jobs))
+    else:
+        N_JOBS = max(1, min(8, available_jobs))
     # _backend already chosen above, but keep env override precedence
     if os.environ.get("CELLSCOPE_FORCE_THREADS", "").strip():
         _backend = "threading"
 
     # prefer larger chunk to reduce scheduler overhead
-    chunk_size = max(64, _cluster_chunk_size())
-    results = []
+    chunk_size = max(64, _cluster_chunk_size(parallel_chunk_cells))
+    labels_per_cell = pd.Series(
+        -1,
+        index=point_df.index,
+        dtype=np.int32,
+    )
     n_chunks = (n_groups + chunk_size - 1) // chunk_size if n_groups else 0
     iterator = _progress_iter(
         _iter_group_chunks(point_df, chunk_size),
@@ -1935,27 +2771,66 @@ def per_cell_clustering(
         total=n_chunks,
         show=show_internal_progress,
     )
-    for chunk in iterator:
-        try:
-            out = Parallel(
-                n_jobs=N_JOBS,
-                backend=_backend,
-                verbose=0,
-                pre_dispatch=f"3*{N_JOBS}",
-                batch_size="auto",
-                max_nbytes=None,
-            )(
-                delayed(_fit_one)(pair) for pair in chunk
-            )
-        except Exception as e:
-            # Fallback: sequential processing to avoid hard failure (e.g. OOM kill)
-            print(f"[WARN] Parallel cluster chunk failed, fallback sequential: {e}")
-            out = [ _fit_one(pair) for pair in chunk ]
-        results.extend(out)
-        gc.collect()
+    _logging.getLogger("cellscope").info(
+        "Module 3 parallel segmentation | cells=%d | workers=%d | backend=%s | chunk_cells=%d",
+        n_groups,
+        N_JOBS,
+        _backend,
+        chunk_size,
+    )
+    # Keep one executor for all chunks.  Recreating it for every small chunk
+    # dominated scheduling time on large COAD runs.
+    from contextlib import nullcontext
 
-    labels_per_cell = pd.concat([s for _, s in results]).astype(np.int32)
-    point_df = point_df.copy()
+    thread_limit = nullcontext()
+    if N_JOBS > 1:
+        try:
+            from threadpoolctl import threadpool_limits
+
+            # Prevent every concurrently segmented cell from starting another
+            # BLAS/OpenMP pool. This context is process-wide and therefore
+            # belongs outside the persistent joblib executor.
+            thread_limit = threadpool_limits(limits=1)
+        except Exception:
+            thread_limit = nullcontext()
+    with thread_limit:
+        with Parallel(
+            n_jobs=N_JOBS,
+            backend=_backend,
+            verbose=0,
+            pre_dispatch=f"3*{N_JOBS}",
+            batch_size="auto",
+            max_nbytes=None,
+        ) as parallel:
+            for chunk_index, chunk in enumerate(iterator, start=1):
+                try:
+                    out = parallel(delayed(_fit_one)(pair) for pair in chunk)
+                except Exception as e:
+                    # Fallback: sequential processing to avoid hard failure
+                    # (for example, a worker memory allocation failure).
+                    print(
+                        "[WARN] Parallel cluster chunk failed, fallback "
+                        f"sequential: {e}"
+                    )
+                    out = [_fit_one(pair) for pair in chunk]
+                if out:
+                    chunk_labels = pd.concat(
+                        [series for _, series in out]
+                    ).astype(np.int32, copy=False)
+                    labels_per_cell.loc[
+                        chunk_labels.index
+                    ] = chunk_labels.to_numpy(
+                        dtype=np.int32,
+                        copy=False,
+                    )
+                del out
+                # Periodic collection retains bounded temporary lifetimes
+                # without making collection the primary segmentation cost.
+                if chunk_index % 16 == 0:
+                    gc.collect()
+    gc.collect()
+
+    point_df = point_df.copy(deep=False)
     point_df[METASPOT_LOCAL_COL] = labels_per_cell
     missing = point_df[METASPOT_LOCAL_COL].isna()
     if missing.any():
@@ -1969,6 +2844,233 @@ def per_cell_clustering(
     return point_df
 
 
+def _metaspot_segmentation_audit(
+    point_df: pd.DataFrame,
+    *,
+    target_sites_per_metaspot: Optional[int] = None,
+    min_metaspots_per_cell: int = 1,
+    max_metaspots_per_cell: Optional[int] = None,
+    partition_by_nucleus: bool = False,
+) -> pd.DataFrame:
+    """Return compact per-cell checks for MetaSpot size and compartment mixing."""
+    required = {
+        "cell_id",
+        METASPOT_COL,
+        "x_location",
+        "y_location",
+    }
+    missing = sorted(required.difference(point_df.columns))
+    if missing:
+        raise KeyError(
+            "MetaSpot segmentation audit requires columns: "
+            + ", ".join(missing)
+        )
+
+    audit_source = point_df[
+        [
+            "cell_id",
+            METASPOT_COL,
+            "x_location",
+            "y_location",
+        ]
+    ].copy()
+    if "in_nucleus" in point_df.columns:
+        audit_source["_in_nucleus"] = _coerce_bool_series(
+            point_df["in_nucleus"],
+            default=False,
+        ).to_numpy()
+    elif "r_signed" in point_df.columns:
+        audit_source["_in_nucleus"] = (
+            pd.to_numeric(point_df["r_signed"], errors="coerce")
+            .fillna(0.0)
+            .lt(0.0)
+            .to_numpy()
+        )
+    else:
+        audit_source["_in_nucleus"] = False
+
+    grouped_spot = audit_source.groupby(
+        ["cell_id", METASPOT_COL],
+        sort=False,
+        observed=True,
+    )
+    spot_stats = grouped_spot.agg(
+        n_transcripts=(METASPOT_COL, "size"),
+        nucleus_min=("_in_nucleus", "min"),
+        nucleus_max=("_in_nucleus", "max"),
+    )
+    unique_sites = (
+        audit_source[
+            ["cell_id", METASPOT_COL, "x_location", "y_location"]
+        ].drop_duplicates(
+            ["cell_id", METASPOT_COL, "x_location", "y_location"]
+        )
+        .groupby(
+            ["cell_id", METASPOT_COL],
+            sort=False,
+            observed=True,
+        )
+        .size()
+        .rename("n_unique_sites")
+    )
+    spot_stats = spot_stats.join(unique_sites, how="left")
+    spot_stats["nucleus_mixed"] = (
+        spot_stats["nucleus_min"] != spot_stats["nucleus_max"]
+    )
+    spot_stats["mixed_transcripts"] = (
+        spot_stats["n_transcripts"]
+        * spot_stats["nucleus_mixed"].astype(np.int64)
+    )
+
+    per_cell = spot_stats.groupby(
+        level="cell_id",
+        sort=False,
+        observed=True,
+    ).agg(
+        actual_metaspots=("n_transcripts", "size"),
+        median_transcripts_per_metaspot=("n_transcripts", "median"),
+        max_transcripts_per_metaspot=("n_transcripts", "max"),
+        median_sites_per_metaspot=("n_unique_sites", "median"),
+        max_sites_per_metaspot=("n_unique_sites", "max"),
+        nucleus_mixed_metaspots=("nucleus_mixed", "sum"),
+        mixed_transcripts=("mixed_transcripts", "sum"),
+        n_transcripts=("n_transcripts", "sum"),
+    )
+    per_cell["nucleus_mixed_metaspot_fraction"] = (
+        per_cell["nucleus_mixed_metaspots"]
+        / per_cell["actual_metaspots"].clip(lower=1)
+    )
+    per_cell["nucleus_mixed_transcript_fraction"] = (
+        per_cell["mixed_transcripts"]
+        / per_cell["n_transcripts"].clip(lower=1)
+    )
+
+    unique_cell_sites = audit_source[
+        ["cell_id", "x_location", "y_location"]
+    ].drop_duplicates()
+    site_counts = unique_cell_sites.groupby(
+        "cell_id",
+        sort=False,
+        observed=True,
+    ).size()
+    per_cell["n_unique_sites"] = site_counts.reindex(per_cell.index).astype(int)
+    if isinstance(target_sites_per_metaspot, (int, float)):
+        unique_xy = unique_cell_sites[
+            ["x_location", "y_location"]
+        ].to_numpy(np.float32, copy=False)
+        finite_site_mask = np.isfinite(unique_xy).all(axis=1)
+        finite_site_counts = (
+            unique_cell_sites.loc[finite_site_mask, ["cell_id"]]
+            .groupby("cell_id", sort=False, observed=True)
+            .size()
+            .reindex(per_cell.index, fill_value=0)
+            .to_numpy(dtype=np.int64, copy=False)
+        )
+        per_cell["requested_metaspots"] = (
+            _target_metaspot_counts_from_site_counts(
+                finite_site_counts,
+                target_sites_per_metaspot=int(target_sites_per_metaspot),
+                min_metaspots_per_cell=min_metaspots_per_cell,
+                max_metaspots_per_cell=max_metaspots_per_cell,
+            )
+        )
+    else:
+        per_cell["requested_metaspots"] = np.nan
+    per_cell["actual_to_requested_ratio"] = (
+        per_cell["actual_metaspots"]
+        / pd.to_numeric(
+            per_cell["requested_metaspots"],
+            errors="coerce",
+        ).replace(0, np.nan)
+    )
+    per_cell["partition_by_nucleus"] = bool(partition_by_nucleus)
+    return per_cell.reset_index()
+
+
+def _grouped_nanmean_std(
+    codes: np.ndarray,
+    values: np.ndarray,
+    n_groups: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute NaN-aware population moments for contiguous integer groups."""
+    valid = np.isfinite(values)
+    counts = np.bincount(codes[valid], minlength=n_groups).astype(
+        np.int64,
+        copy=False,
+    )
+    sums = np.bincount(
+        codes[valid],
+        weights=values[valid],
+        minlength=n_groups,
+    )
+    sumsq = np.bincount(
+        codes[valid],
+        weights=np.square(values[valid], dtype=np.float64),
+        minlength=n_groups,
+    )
+    mean = np.full(n_groups, np.nan, dtype=np.float64)
+    np.divide(sums, counts, out=mean, where=counts > 0)
+    variance = np.full(n_groups, np.nan, dtype=np.float64)
+    np.divide(sumsq, counts, out=variance, where=counts > 0)
+    variance -= np.square(mean)
+    variance = np.maximum(variance, 0.0)
+    return mean.astype(np.float32), np.sqrt(variance).astype(np.float32)
+
+
+def _grouped_geometry_shape(
+    codes: np.ndarray,
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    n_groups: int,
+    *,
+    eps: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return sample-covariance elongation and spread for each MetaSpot."""
+    x_mean, _ = _grouped_nanmean_std(codes, x_values, n_groups)
+    y_mean, _ = _grouped_nanmean_std(codes, y_values, n_groups)
+    valid = np.isfinite(x_values) & np.isfinite(y_values)
+    counts = np.bincount(codes[valid], minlength=n_groups).astype(
+        np.int64,
+        copy=False,
+    )
+    x = x_values[valid].astype(np.float64, copy=False)
+    y = y_values[valid].astype(np.float64, copy=False)
+    grouped = lambda weights: np.bincount(
+        codes[valid], weights=weights, minlength=n_groups
+    )
+    sum_x = grouped(x)
+    sum_y = grouped(y)
+    sum_x2 = grouped(np.square(x))
+    sum_y2 = grouped(np.square(y))
+    sum_xy = grouped(x * y)
+    mx = x_mean.astype(np.float64, copy=False)
+    my = y_mean.astype(np.float64, copy=False)
+    count_float = counts.astype(np.float64, copy=False)
+    var_x = sum_x2 - 2.0 * mx * sum_x + count_float * np.square(mx)
+    var_y = sum_y2 - 2.0 * my * sum_y + count_float * np.square(my)
+    cov_xy = sum_xy - mx * sum_y - my * sum_x + count_float * mx * my
+    denominator = np.maximum(count_float - 1.0, 1.0)
+    var_x /= denominator
+    var_y /= denominator
+    cov_xy /= denominator
+    trace = np.maximum(var_x + var_y, 0.0)
+    discriminant = np.maximum(
+        np.square(trace) - 4.0 * (var_x * var_y - np.square(cov_xy)),
+        0.0,
+    )
+    root = np.sqrt(discriminant)
+    lambda_1 = np.maximum(0.5 * (trace + root), eps)
+    lambda_2 = np.maximum(0.5 * (trace - root), eps)
+    elongation = np.full(n_groups, np.nan, dtype=np.float32)
+    spread = np.full(n_groups, np.nan, dtype=np.float32)
+    valid_shape = counts >= 3
+    elongation[valid_shape] = (
+        lambda_1[valid_shape] / lambda_2[valid_shape]
+    ).astype(np.float32)
+    spread[valid_shape] = np.sqrt(trace[valid_shape]).astype(np.float32)
+    return elongation, spread
+
+
 def build_adata1(point_df: pd.DataFrame, show_internal_progress: bool = False) -> ad.AnnData:
     metaspot_cat = pd.Categorical(point_df[METASPOT_COL], ordered=False)
     row_codes = metaspot_cat.codes.astype(np.int64)
@@ -1979,67 +3081,53 @@ def build_adata1(point_df: pd.DataFrame, show_internal_progress: bool = False) -
         (np.ones(len(point_df), dtype=np.int32), (row_codes, gene_codes)),
         shape=(len(row_cats), len(gene_uni))
     ).tocsr()
+    del gene_codes
     adata1 = ad.AnnData(X=X, obs=pd.DataFrame(index=row_cats), var=pd.DataFrame(index=gene_uni))
 
-    need_cols = ['r_signed', 'd_cell_norm', 'd_nuc_norm', 'x_location', 'y_location']
-    arr = point_df[need_cols].to_numpy(dtype=np.float32, copy=False)
-    codes = row_codes
-    order = np.argsort(codes, kind='mergesort')
-    codes_sorted = codes[order]
-    A = arr[order, :]
-    unique_codes, counts = np.unique(codes_sorted, return_counts=True)
-    starts = np.empty_like(counts)
-    starts[0] = 0
-    np.cumsum(counts[:-1], out=starts[1:])
-    ends = starts + counts
+    n_groups = len(row_cats)
+    # Do not materialize a five-column, row-sorted transcript array.  The
+    # COAD run contains hundreds of millions of rows, so that copy alone was
+    # several GiB before any per-MetaSpot statistics were calculated.
+    codes = row_codes.astype(
+        np.int32 if n_groups <= np.iinfo(np.int32).max else np.int64,
+        copy=False,
+    )
+    if codes is not row_codes:
+        del row_codes
+    counts = np.bincount(codes, minlength=n_groups).astype(np.int64, copy=False)
 
-    n_groups = len(unique_codes)
-    EPS = 1e-8
-    r_mean = np.full(n_groups, np.nan, np.float32)
-    r_std = np.full(n_groups, np.nan, np.float32)
-    r_p10 = np.full(n_groups, np.nan, np.float32)
-    r_p50 = np.full(n_groups, np.nan, np.float32)
-    r_p90 = np.full(n_groups, np.nan, np.float32)
-    d1_mean = np.full(n_groups, np.nan, np.float32)
-    d2_mean = np.full(n_groups, np.nan, np.float32)
-    elong = np.full(n_groups, np.nan, np.float32)
-    spread = np.full(n_groups, np.nan, np.float32)
+    r_values = point_df['r_signed'].to_numpy(dtype=np.float32, copy=False)
+    r_mean, r_std = _grouped_nanmean_std(codes, r_values, n_groups)
+    # Pandas executes grouped quantiles in native code.  This preserves the
+    # exact NumPy interpolation rule used previously while avoiding one Python
+    # percentile call per MetaSpot.
+    quantiles = (
+        pd.Series(r_values, copy=False)
+        .groupby(codes, sort=True, observed=True)
+        .quantile([0.1, 0.5, 0.9])
+        .to_numpy(dtype=np.float32, copy=False)
+        .reshape(n_groups, 3)
+    )
+    r_p10, r_p50, r_p90 = quantiles.T
+    del quantiles, r_values
+
+    d1_values = point_df['d_cell_norm'].to_numpy(dtype=np.float32, copy=False)
+    d1_mean, _ = _grouped_nanmean_std(codes, d1_values, n_groups)
+    del d1_values
+    d2_values = point_df['d_nuc_norm'].to_numpy(dtype=np.float32, copy=False)
+    d2_mean, _ = _grouped_nanmean_std(codes, d2_values, n_groups)
+    del d2_values
+    x_values = point_df['x_location'].to_numpy(dtype=np.float32, copy=False)
+    y_values = point_df['y_location'].to_numpy(dtype=np.float32, copy=False)
+    elong, spread = _grouped_geometry_shape(
+        codes,
+        x_values,
+        y_values,
+        n_groups,
+        eps=1e-8,
+    )
+    del x_values, y_values
     log_n = np.log1p(counts).astype(np.float32)
-
-    rng_iter = _progress_iter(range(n_groups), desc='Aggregate domain stats', total=n_groups, show=show_internal_progress)
-    for i in rng_iter:
-        s, e = starts[i], ends[i]
-        if e - s < 1:
-            continue
-        r = A[s:e, 0]
-        d1 = A[s:e, 1]
-        d2 = A[s:e, 2]
-        xs = A[s:e, 3]
-        ys = A[s:e, 4]
-        r_mean[i] = np.nanmean(r)
-        r_std[i] = np.nanstd(r)
-        r_p10[i], r_p50[i], r_p90[i] = np.nanpercentile(r, [10, 50, 90])
-        d1_mean[i] = np.nanmean(d1)
-        d2_mean[i] = np.nanmean(d2)
-        n = e - s
-        if n >= 3:
-            mx, my = np.nanmean(xs), np.nanmean(ys)
-            cx, cy = xs - mx, ys - my
-            mask_xy = np.isfinite(cx) & np.isfinite(cy)
-            m = mask_xy.sum()
-            if m >= 3:
-                cxm, cym = cx[mask_xy], cy[mask_xy]
-                denom = max(m - 1, 1)
-                varx = float((cxm * cxm).sum() / denom)
-                vary = float((cym * cym).sum() / denom)
-                covxy = float((cxm * cym).sum() / denom)
-                trace = max(varx + vary, 0.0)
-                disc = max(trace * trace - 4.0 * (varx * vary - covxy * covxy), 0.0)
-                sq = np.sqrt(disc)
-                lam1 = max(0.5 * (trace + sq), EPS)
-                lam2 = max(0.5 * (trace - sq), EPS)
-                elong[i] = lam1 / lam2
-                spread[i] = np.sqrt(trace)
 
     md_stats = pd.DataFrame({
         METASPOT_COL: row_cats,
@@ -2058,6 +3146,438 @@ def build_adata1(point_df: pd.DataFrame, show_internal_progress: bool = False) -
         agg_comp.columns = [f"{a}_{b}" for a, b in agg_comp.columns]
         adata1.obs = adata1.obs.join(agg_comp, how='left')
     return adata1
+
+
+def _attach_metaspot_spatial_metadata(
+    adata1: ad.AnnData,
+    point_df: pd.DataFrame,
+) -> ad.AnnData:
+    """Attach one owning cell and one physical centroid to every MetaSpot."""
+    required = {METASPOT_COL, "x_location", "y_location"}
+    missing = sorted(required.difference(point_df.columns))
+    if missing:
+        raise ValueError(
+            "MetaSpot graph construction requires point_df columns "
+            f"{missing}"
+        )
+
+    columns = [METASPOT_COL, "x_location", "y_location"]
+    if "cell_id" in point_df.columns:
+        columns.append("cell_id")
+    frame = point_df.loc[:, columns].copy()
+    frame[METASPOT_COL] = frame[METASPOT_COL].astype(str)
+
+    grouped = frame.groupby(METASPOT_COL, observed=True, sort=False)
+    centroids = grouped[["x_location", "y_location"]].mean()
+    centroids.columns = ["x_centroid", "y_centroid"]
+
+    if "cell_id" in frame.columns:
+        owner_counts = grouped["cell_id"].nunique(dropna=False)
+        if owner_counts.ne(1).any():
+            bad = owner_counts.index[owner_counts.ne(1)].astype(str).tolist()[:5]
+            raise ValueError(
+                "Each MetaSpot must belong to exactly one cell; conflicting "
+                f"owners found for {bad}"
+            )
+        owners = grouped["cell_id"].first().astype(str).rename("cell_id")
+    elif "cell_id" in adata1.obs.columns:
+        owners = adata1.obs["cell_id"].astype(str)
+    else:
+        raise ValueError(
+            "MetaSpot graph construction requires cell_id in point_df or "
+            "adata1.obs"
+        )
+
+    target = pd.Index(adata1.obs_names.astype(str))
+    centroids.index = centroids.index.astype(str)
+    owners.index = owners.index.astype(str)
+    centroids = centroids.reindex(target)
+    owners = owners.reindex(target)
+    if centroids.isna().any(axis=None) or owners.isna().any():
+        missing_ids = target[
+            centroids.isna().any(axis=1).to_numpy() | owners.isna().to_numpy()
+        ].tolist()[:5]
+        raise ValueError(
+            "Missing MetaSpot centroid or owner for observations "
+            f"{missing_ids}"
+        )
+
+    adata1.obs = adata1.obs.copy()
+    adata1.obs["cell_id"] = owners.to_numpy(dtype=str)
+    adata1.obs["x_centroid"] = centroids["x_centroid"].to_numpy(np.float32)
+    adata1.obs["y_centroid"] = centroids["y_centroid"].to_numpy(np.float32)
+    return adata1
+
+
+def _metaspot_expression_embedding(
+    adata1: ad.AnnData,
+    n_components: int = 32,
+) -> np.ndarray:
+    """Build a compact TF-IDF/SVD expression representation per MetaSpot."""
+    X = (
+        adata1.X.tocsr().astype(np.float32)
+        if sp.issparse(adata1.X)
+        else sp.csr_matrix(np.asarray(adata1.X, dtype=np.float32))
+    )
+    if X.shape[0] == 0:
+        return np.zeros((0, 1), dtype=np.float32)
+
+    row_sum = np.asarray(X.sum(axis=1)).ravel().astype(np.float32)
+    row_sum[row_sum <= 0] = 1.0
+    tf = X.multiply(1.0 / row_sum[:, None])
+    gene_df = np.asarray((X > 0).sum(axis=0)).ravel().astype(np.float32)
+    idf = np.log1p(X.shape[0] / (1.0 + gene_df)).astype(np.float32)
+    tfidf = tf.multiply(idf)
+
+    max_components = min(
+        max(1, int(n_components)),
+        max(1, X.shape[0] - 1),
+        max(1, X.shape[1] - 1),
+    )
+    if X.shape[0] == 1 or X.shape[1] == 1:
+        latent = tfidf.toarray().astype(np.float32, copy=False)
+    else:
+        latent = TruncatedSVD(
+            n_components=max_components,
+            random_state=42,
+            n_iter=5,
+        ).fit_transform(tfidf).astype(np.float32)
+    latent = StandardScaler().fit_transform(latent).astype(np.float32)
+    latent[~np.isfinite(latent)] = 0.0
+    return latent
+
+
+def _symmetric_knn_connectivity(
+    values: np.ndarray,
+    n_neighbors: int,
+) -> sp.csr_matrix:
+    """Return a symmetric binary kNN graph with k clamped to data size."""
+    from sklearn.neighbors import kneighbors_graph
+
+    n_obs = int(values.shape[0])
+    if n_obs <= 1 or int(n_neighbors) <= 0:
+        return sp.csr_matrix((n_obs, n_obs), dtype=np.float32)
+    k = min(max(1, int(n_neighbors)), n_obs - 1)
+    # sklearn's brute-force distance kernel is already vectorized. Spawning a
+    # joblib task per query chunk is slower for both the global graph and the
+    # many small within-cell graphs, and can multiply BLAS pools. Keep the
+    # exact graph deterministic and single-scheduled; BLAS/OpenMP remains
+    # controlled by the process-level runtime settings.
+    graph = kneighbors_graph(
+        values,
+        n_neighbors=k,
+        mode="connectivity",
+        include_self=False,
+        n_jobs=1,
+    ).astype(np.float32)
+    graph = graph.maximum(graph.T).tocsr()
+    graph.eliminate_zeros()
+    graph.sort_indices()
+    return graph
+
+
+def _within_cell_spatial_connectivity(
+    coordinates: np.ndarray,
+    cell_ids: Sequence[object],
+    n_neighbors: int,
+) -> sp.csr_matrix:
+    """Build physical kNN edges, strictly within each owning cell."""
+    n_obs = int(coordinates.shape[0])
+    if n_obs == 0 or int(n_neighbors) <= 0:
+        return sp.csr_matrix((n_obs, n_obs), dtype=np.float32)
+
+    cells = np.asarray(cell_ids).astype(str)
+    cell_codes, _ = pd.factorize(cells, sort=False)
+    cell_codes = np.asarray(cell_codes, dtype=np.int64)
+    order = np.argsort(cell_codes, kind="stable").astype(
+        np.int64,
+        copy=False,
+    )
+    counts = np.bincount(cell_codes).astype(np.int64, copy=False)
+    offsets = np.zeros(counts.size + 1, dtype=np.int64)
+    offsets[1:] = np.cumsum(counts, dtype=np.int64)
+    rows: List[np.ndarray] = []
+    cols: List[np.ndarray] = []
+    for group_index in range(counts.size):
+        indices = order[offsets[group_index]:offsets[group_index + 1]]
+        if indices.size <= 1:
+            continue
+        local = _symmetric_knn_connectivity(
+            coordinates[indices],
+            min(int(n_neighbors), indices.size - 1),
+        ).tocoo()
+        if local.nnz:
+            rows.append(indices[local.row].astype(np.int64, copy=False))
+            cols.append(indices[local.col].astype(np.int64, copy=False))
+
+    if not rows:
+        return sp.csr_matrix((n_obs, n_obs), dtype=np.float32)
+    row = np.concatenate(rows)
+    col = np.concatenate(cols)
+    data = np.ones(row.size, dtype=np.float32)
+    graph = sp.csr_matrix((data, (row, col)), shape=(n_obs, n_obs))
+    graph = graph.maximum(graph.T).tocsr()
+    graph.eliminate_zeros()
+    graph.sort_indices()
+    return graph
+
+
+def _normalize_sparse_adjacency(
+    adjacency: sp.csr_matrix,
+    mode: str = "gcn",
+) -> sp.csr_matrix:
+    """Normalize an adjacency matrix after adding explicit self loops."""
+    from scipy.sparse import diags, eye
+
+    graph = adjacency.tocsr().astype(np.float32, copy=False)
+    graph = graph + eye(graph.shape[0], dtype=np.float32, format="csr")
+    graph.sum_duplicates()
+    graph.eliminate_zeros()
+    norm_mode = str(mode).strip().lower()
+    degree = np.asarray(graph.sum(axis=1)).ravel().astype(np.float32)
+    degree[degree <= 0] = 1.0
+    if norm_mode == "gcn":
+        scale = 1.0 / np.sqrt(degree)
+        graph = (diags(scale) @ graph @ diags(scale)).tocsr()
+    elif norm_mode == "rw":
+        graph = (diags(1.0 / degree) @ graph).tocsr()
+    elif norm_mode != "none":
+        raise ValueError(
+            "MetaSpot graph edge_norm must be one of {'gcn', 'rw', 'none'}"
+        )
+    graph = graph.astype(np.float32, copy=False)
+    graph.eliminate_zeros()
+    graph.sort_indices()
+    return graph
+
+
+def build_metaspot_graph(
+    adata1: ad.AnnData,
+    point_df: pd.DataFrame,
+    *,
+    k_expr: int = 15,
+    k_spatial: int = 6,
+    expr_n_components: int = 32,
+    alpha_expr: float = 0.8,
+    alpha_spatial: float = 0.2,
+    edge_norm: str = "gcn",
+    use_geometry_features: bool = False,
+    expression_cross_cell_only: bool = False,
+    max_full_batch_nodes: int = 200_000,
+    execution_profile: str = "exact",
+    knn_backend: str = "exact",
+    ann_candidate_multiplier: int = 4,
+    ann_query_chunk_nodes: int = 100_000,
+    ann_train_sample: int = 1_000_000,
+    faiss_hnsw_m: int = 32,
+    faiss_nprobe: int = 32,
+    faiss_pq_subvectors: int = 8,
+    faiss_pq_bits: int = 8,
+    faiss_use_gpu: Any = "auto",
+    faiss_gpu_device: int = 0,
+) -> ad.AnnData:
+    """Construct a genuine MetaSpot expression + within-cell spatial graph."""
+    graph_started = _time.perf_counter()
+    timing_seconds: Dict[str, float] = {}
+    if adata1.n_obs == 0:
+        raise ValueError("Cannot build a MetaSpot graph with zero observations")
+    profile = str(execution_profile).strip().lower()
+    if profile not in {"exact", "sampled", "streaming"}:
+        raise ValueError(
+            "execution_profile must be one of {'exact','sampled','streaming'}"
+        )
+    effective_knn_backend = str(knn_backend).strip().lower().replace(
+        "-", "_"
+    )
+    if effective_knn_backend == "auto":
+        effective_knn_backend = "exact"
+    if (
+        profile == "exact"
+        and int(max_full_batch_nodes) > 0
+        and adata1.n_obs > int(max_full_batch_nodes)
+    ):
+        raise ValueError(
+            f"MetaSpot full-batch graph mode received {adata1.n_obs:,} nodes, "
+            f"above module7.max_full_batch_nodes={int(max_full_batch_nodes):,}. "
+            "Use execution.profile: sampled/streaming with a supported ANN "
+            "backend; increasing this limit only removes the exact-path guard."
+        )
+    if float(alpha_expr) < 0 or float(alpha_spatial) < 0:
+        raise ValueError("MetaSpot graph fusion weights must be non-negative")
+    weight_sum = float(alpha_expr) + float(alpha_spatial)
+    if weight_sum <= 0:
+        raise ValueError("At least one MetaSpot graph fusion weight must be > 0")
+
+    step_started = _time.perf_counter()
+    adata1 = _attach_metaspot_spatial_metadata(adata1, point_df)
+    timing_seconds["attach_spatial_metadata"] = (
+        _time.perf_counter() - step_started
+    )
+    step_started = _time.perf_counter()
+    expression = _metaspot_expression_embedding(
+        adata1,
+        n_components=expr_n_components,
+    )
+    timing_seconds["expression_embedding"] = _time.perf_counter() - step_started
+    coordinates = adata1.obs[
+        ["x_centroid", "y_centroid"]
+    ].to_numpy(np.float32)
+    from .scalable_graph import build_knn_connectivity
+
+    step_started = _time.perf_counter()
+    expression_graph, ann_metadata = build_knn_connectivity(
+        expression,
+        n_neighbors=k_expr,
+        backend=effective_knn_backend,
+        excluded_groups=(
+            adata1.obs["cell_id"].astype(str).to_numpy()
+            if expression_cross_cell_only
+            else None
+        ),
+        candidate_multiplier=ann_candidate_multiplier,
+        query_chunk_size=ann_query_chunk_nodes,
+        train_sample=ann_train_sample,
+        hnsw_m=faiss_hnsw_m,
+        nprobe=faiss_nprobe,
+        pq_subvectors=faiss_pq_subvectors,
+        pq_bits=faiss_pq_bits,
+        faiss_use_gpu=faiss_use_gpu,
+        faiss_gpu_device=faiss_gpu_device,
+        random_seed=42,
+        n_jobs=_preferred_n_jobs(),
+    )
+    timing_seconds["expression_knn"] = _time.perf_counter() - step_started
+    step_started = _time.perf_counter()
+    spatial_graph = _within_cell_spatial_connectivity(
+        coordinates,
+        adata1.obs["cell_id"].astype(str).to_numpy(),
+        k_spatial,
+    )
+    timing_seconds["within_cell_spatial"] = _time.perf_counter() - step_started
+    if expression_cross_cell_only:
+        if int(ann_metadata.get("nodes_below_available_degree", 0)) > 0:
+            raise RuntimeError(
+                "Cross-cell MetaSpot expression graph could not provide all "
+                "globally available neighbors; increase ANN search quality "
+                "or use module7.knn_backend='exact'"
+            )
+        if expression_graph.nnz == 0:
+            raise ValueError(
+                "Cross-cell MetaSpot expression graph contains no edges; "
+                "disable module7.metaspot_expr_cross_cell_only or provide "
+                "more than one cell"
+            )
+
+    step_started = _time.perf_counter()
+    expr_weight = float(alpha_expr) / weight_sum
+    spatial_weight = float(alpha_spatial) / weight_sum
+    fused = (
+        expr_weight * expression_graph
+        + spatial_weight * spatial_graph
+    ).tocsr()
+    fused = ((fused + fused.T) * 0.5).tocsr()
+    fused.eliminate_zeros()
+    fused.sort_indices()
+
+    adata1.obsm["X_expr_metaspot"] = expression
+    adata1.obsm["X_expr_metaspot_scaled"] = expression.copy()
+    feature_keys = ["X_expr_metaspot_scaled"]
+
+    if use_geometry_features:
+        geometry_columns = [
+            column
+            for column in [
+                "r_mean",
+                "r_std",
+                "r_p50",
+                "d_cell_norm_mean",
+                "d_nuc_norm_mean",
+                "elongation",
+                "spread",
+                "log_n",
+            ]
+            if column in adata1.obs.columns
+        ]
+        geometry = adata1.obs[geometry_columns].to_numpy(
+            dtype=np.float32,
+            copy=True,
+        )
+        for column_index in range(geometry.shape[1]):
+            values = geometry[:, column_index]
+            finite = np.isfinite(values)
+            fill_value = float(np.median(values[finite])) if finite.any() else 0.0
+            values[~finite] = fill_value
+            geometry[:, column_index] = values
+        geometry = StandardScaler().fit_transform(geometry).astype(np.float32)
+        geometry[~np.isfinite(geometry)] = 0.0
+        adata1.obsm["X_geom_metaspot_scaled"] = geometry
+        feature_keys.append("X_geom_metaspot_scaled")
+
+    adata1.obsp["metaspot_expr_connectivities"] = expression_graph
+    adata1.obsp["metaspot_spatial_connectivities"] = spatial_graph
+    adata1.obsp[METASPOT_GRAPH_KEY] = _normalize_sparse_adjacency(
+        fused,
+        mode=edge_norm,
+    )
+    checksum = _obs_names_checksum(adata1.obs_names)
+    timing_seconds["fusion_and_attach"] = _time.perf_counter() - step_started
+    timing_seconds["total"] = _time.perf_counter() - graph_started
+    adata1.uns["metaspot_graph"] = {
+        "schema_version": int(METASPOT_GRAPH_SCHEMA_VERSION),
+        "node_unit": "metaspot",
+        "node_id_checksum": checksum,
+        "n_nodes": int(adata1.n_obs),
+        "k_expr": int(min(max(0, k_expr), max(0, adata1.n_obs - 1))),
+        "k_spatial": int(max(0, k_spatial)),
+        "alpha_expr": expr_weight,
+        "alpha_spatial": spatial_weight,
+        "edge_norm": str(edge_norm).lower(),
+        "expression_edges_nnz": int(expression_graph.nnz),
+        "spatial_edges_nnz": int(spatial_graph.nnz),
+        "fused_edges_nnz": int(fused.nnz),
+        "spatial_edges_within_cell_only": True,
+        "expression_edges_cross_cell_only": bool(
+            expression_cross_cell_only
+        ),
+        "uses_boundary_geometry_features": bool(use_geometry_features),
+        "max_full_batch_nodes": int(max_full_batch_nodes),
+        "execution_profile": profile,
+        "knn_backend": str(ann_metadata.get("backend", knn_backend)),
+        "ann_metadata": ann_metadata,
+        "timing_seconds": {
+            key: float(value) for key, value in timing_seconds.items()
+        },
+        "feature_keys": feature_keys,
+    }
+    return adata1
+
+
+def _metaspot_cache_matches(
+    cached: ad.AnnData,
+    reference: ad.AnnData,
+    *,
+    required_obsm: Sequence[str] = (),
+    required_obsp: Sequence[str] = (),
+) -> Tuple[bool, str]:
+    """Validate MetaSpot graph/embedding caches before downstream reuse."""
+    cached_names = pd.Index(cached.obs_names.astype(str))
+    reference_names = pd.Index(reference.obs_names.astype(str))
+    if not cached_names.equals(reference_names):
+        return False, "MetaSpot observation order differs"
+    for key in required_obsm:
+        if key not in cached.obsm or cached.obsm[key].shape[0] != cached.n_obs:
+            return False, f"missing or misaligned obsm[{key!r}]"
+    for key in required_obsp:
+        if key not in cached.obsp or cached.obsp[key].shape != (
+            cached.n_obs,
+            cached.n_obs,
+        ):
+            return False, f"missing or misaligned obsp[{key!r}]"
+    expected_checksum = _obs_names_checksum(reference_names)
+    graph_meta = cached.uns.get("metaspot_graph", {})
+    if graph_meta and graph_meta.get("node_id_checksum") != expected_checksum:
+        return False, "MetaSpot graph node checksum differs"
+    return True, "aligned"
 
 
 def _validate_adata1_point_df_alignment(
@@ -2312,6 +3832,537 @@ def _choose_K_simple(
     return max(2, K)
 
 
+def _stratified_metaspot_sample(
+    cell_ids: np.ndarray,
+    sample_n: int,
+    *,
+    seed: int,
+) -> np.ndarray:
+    """Sample MetaSpots while preventing large cells from dominating."""
+    cell_ids = np.asarray(cell_ids).astype(str)
+    n = int(cell_ids.size)
+    sample_n = max(1, min(int(sample_n), n))
+    rng = np.random.default_rng(int(seed))
+    if sample_n >= n:
+        return rng.permutation(n).astype(np.int64, copy=False)
+
+    _, cell_codes = np.unique(cell_ids, return_inverse=True)
+    n_cells = int(cell_codes.max()) + 1 if cell_codes.size else 0
+    if n_cells == 0:
+        return rng.choice(n, size=sample_n, replace=False)
+
+    # Sort once so looking up a cell does not repeatedly scan all MetaSpots.
+    # This matters when both n and the number of cells are very large.
+    order = np.argsort(cell_codes, kind="stable")
+    cell_counts = np.bincount(cell_codes, minlength=n_cells)
+    cell_offsets = np.concatenate(
+        [
+            np.asarray([0], dtype=np.int64),
+            np.cumsum(cell_counts, dtype=np.int64),
+        ]
+    )
+
+    def _members(code: int) -> np.ndarray:
+        return order[cell_offsets[code]:cell_offsets[code + 1]]
+
+    selected: List[np.ndarray] = []
+    if sample_n < n_cells:
+        chosen_cells = rng.choice(n_cells, size=sample_n, replace=False)
+        for code in chosen_cells:
+            members = _members(int(code))
+            selected.append(
+                np.asarray([rng.choice(members)], dtype=np.int64)
+            )
+    else:
+        quota = max(1, sample_n // n_cells)
+        for code in range(n_cells):
+            members = _members(code)
+            take = min(quota, members.size)
+            if take:
+                selected.append(
+                    rng.choice(members, size=take, replace=False)
+                )
+
+    chosen = (
+        np.concatenate(selected).astype(np.int64, copy=False)
+        if selected
+        else np.empty(0, dtype=np.int64)
+    )
+    chosen = np.unique(chosen)
+    remaining = sample_n - chosen.size
+    if remaining > 0:
+        available = np.ones(n, dtype=bool)
+        available[chosen] = False
+        pool = np.flatnonzero(available)
+        chosen = np.concatenate(
+            [chosen, rng.choice(pool, size=remaining, replace=False)]
+        )
+    rng.shuffle(chosen)
+    return chosen.astype(np.int64, copy=False)
+
+
+def _assign_to_metadomain_centers(
+    values: np.ndarray,
+    centers: np.ndarray,
+    *,
+    use_cosine: bool,
+    chunk_size: int,
+) -> Tuple[np.ndarray, float]:
+    """Assign rows to centers and return mean held-out distortion."""
+    from sklearn.preprocessing import normalize
+
+    values = np.asarray(values, dtype=np.float32)
+    centers = np.asarray(centers, dtype=np.float32)
+    n = int(values.shape[0])
+    labels = np.empty(n, dtype=np.int32)
+    total_loss = 0.0
+    step = max(256, int(chunk_size))
+
+    if use_cosine:
+        centers_eval = normalize(centers, norm="l2").astype(
+            np.float32,
+            copy=False,
+        )
+        for start in range(0, n, step):
+            end = min(n, start + step)
+            similarity = values[start:end] @ centers_eval.T
+            local_labels = np.argmax(similarity, axis=1)
+            labels[start:end] = local_labels.astype(np.int32, copy=False)
+            total_loss += float(
+                np.sum(
+                    1.0
+                    - similarity[
+                        np.arange(end - start),
+                        local_labels,
+                    ]
+                )
+            )
+    else:
+        center_norm = np.einsum("ij,ij->i", centers, centers)
+        for start in range(0, n, step):
+            end = min(n, start + step)
+            chunk = values[start:end]
+            chunk_norm = np.einsum("ij,ij->i", chunk, chunk)
+            distance = (
+                chunk_norm[:, None]
+                + center_norm[None, :]
+                - 2.0 * (chunk @ centers.T)
+            )
+            local_labels = np.argmin(distance, axis=1)
+            labels[start:end] = local_labels.astype(np.int32, copy=False)
+            total_loss += float(
+                np.sum(
+                    distance[
+                        np.arange(end - start),
+                        local_labels,
+                    ]
+                )
+            )
+    return labels, total_loss / max(1, n)
+
+
+def _sampled_knee_candidates(
+    *,
+    n_sub: int,
+    train_n: int,
+    auto_k_min: int,
+    auto_k_max: int,
+    min_average_size: int,
+    max_average_size: int,
+    min_train_per_cluster: int,
+    n_candidates: int,
+) -> np.ndarray:
+    """Build a logarithmic K grid with data-size and sample-size guards."""
+    low = max(
+        2,
+        int(auto_k_min),
+        int(math.ceil(n_sub / max(1, int(max_average_size)))),
+    )
+    high = min(
+        int(auto_k_max),
+        max(2, int(n_sub // max(1, int(min_average_size)))),
+        max(2, int(train_n // max(1, int(min_train_per_cluster)))),
+    )
+    if high < low:
+        low = high
+    if high <= 2:
+        return np.asarray([2], dtype=np.int32)
+    if low == high:
+        return np.asarray([low], dtype=np.int32)
+
+    candidates = np.unique(
+        np.rint(
+            np.geomspace(
+                low,
+                high,
+                num=max(3, int(n_candidates)),
+            )
+        ).astype(np.int32)
+    )
+    return candidates[(candidates >= 2) & (candidates <= high)]
+
+
+def _select_sampled_knee(
+    candidate_k: np.ndarray,
+    distortion: np.ndarray,
+    stability: np.ndarray,
+    small_fraction: np.ndarray,
+    *,
+    stability_min: float,
+    max_small_fraction: float,
+    fallback_k: int,
+) -> Tuple[int, int, str, np.ndarray]:
+    """Select the distortion knee, backing off when quality guards fail."""
+    candidate_k = np.asarray(candidate_k, dtype=np.int32)
+    distortion = np.asarray(distortion, dtype=float)
+    stability = np.asarray(stability, dtype=float)
+    small_fraction = np.asarray(small_fraction, dtype=float)
+    finite = np.isfinite(distortion)
+    if not finite.any():
+        chosen = int(
+            candidate_k[
+                np.argmin(np.abs(candidate_k.astype(float) - fallback_k))
+            ]
+        )
+        return chosen, chosen, "sqrt_fallback_no_valid_fit", finite
+
+    valid_indices = np.flatnonzero(finite)
+    k_valid = candidate_k[valid_indices].astype(float)
+    d_valid = distortion[valid_indices]
+    if len(valid_indices) >= 3 and np.ptp(d_valid) > 1e-12:
+        x = np.log(k_valid)
+        x = (x - x.min()) / max(np.ptp(x), 1e-12)
+        y = (d_valid - d_valid.min()) / max(np.ptp(d_valid), 1e-12)
+        knee_local = int(np.argmax((1.0 - x) - y))
+        knee_index = int(valid_indices[knee_local])
+    else:
+        knee_index = int(
+            valid_indices[
+                np.argmin(
+                    np.abs(k_valid - float(fallback_k))
+                )
+            ]
+        )
+    knee_k = int(candidate_k[knee_index])
+
+    stability_ok = np.isnan(stability) | (
+        stability >= float(stability_min)
+    )
+    small_ok = np.isnan(small_fraction) | (
+        small_fraction <= float(max_small_fraction)
+    )
+    feasible = finite & stability_ok & small_ok
+
+    at_or_below_knee = np.flatnonzero(
+        feasible & (candidate_k <= knee_k)
+    )
+    if at_or_below_knee.size:
+        selected_index = int(at_or_below_knee[-1])
+        reason = (
+            "distortion_knee"
+            if selected_index == knee_index
+            else "guarded_lower_k"
+        )
+        return (
+            int(candidate_k[selected_index]),
+            knee_k,
+            reason,
+            feasible,
+        )
+
+    feasible_indices = np.flatnonzero(feasible)
+    if feasible_indices.size:
+        selected_index = int(
+            feasible_indices[
+                np.argmin(
+                    np.abs(
+                        candidate_k[feasible_indices].astype(float)
+                        - float(knee_k)
+                    )
+                )
+            ]
+        )
+        return (
+            int(candidate_k[selected_index]),
+            knee_k,
+            "nearest_feasible_k",
+            feasible,
+        )
+
+    selected_index = int(
+        valid_indices[
+            np.argmin(
+                np.abs(k_valid - float(fallback_k))
+            )
+        ]
+    )
+    return (
+        int(candidate_k[selected_index]),
+        knee_k,
+        "sqrt_fallback_no_feasible_k",
+        feasible,
+    )
+
+
+def _choose_K_sampled_knee(
+    values: np.ndarray,
+    cell_ids: np.ndarray,
+    *,
+    use_cosine: bool,
+    config: Mapping[str, Any],
+) -> Tuple[int, Dict[str, Any]]:
+    """Choose MetaDomain K on a bounded sample using a held-out knee.
+
+    Candidate models are fit only on a cell-balanced sample. The selected
+    model size is the held-out cosine/Euclidean distortion knee, with
+    cross-seed stability and tiny-cluster guards. This keeps automatic K
+    selection bounded for very large datasets.
+    """
+    values = np.asarray(values, dtype=np.float32)
+    n_sub = int(values.shape[0])
+    if n_sub < 4:
+        selected = max(2, min(n_sub, int(round(math.sqrt(n_sub)))))
+        return selected, {
+            "method": "sampled_knee",
+            "selection_reason": "tiny_dataset_fallback",
+            "selected_k": int(selected),
+            "knee_k": int(selected),
+            "candidate_k": np.asarray([selected], dtype=np.int32),
+            "distortion": np.asarray([np.nan], dtype=np.float32),
+            "stability_ari": np.asarray([np.nan], dtype=np.float32),
+            "small_cluster_fraction": np.asarray(
+                [np.nan],
+                dtype=np.float32,
+            ),
+        }
+
+    train_cap = max(20, int(config.get("auto_k_train_sample", 50000)))
+    validation_cap = max(
+        20,
+        int(config.get("auto_k_validation_sample", 3000)),
+    )
+    validation_n = min(
+        validation_cap,
+        max(20, int(round(0.25 * n_sub))),
+        n_sub - 2,
+    )
+    train_n = min(train_cap, n_sub - validation_n)
+    if train_n < 20:
+        train_n = max(2, n_sub - max(1, n_sub // 5))
+        validation_n = n_sub - train_n
+
+    seeds_raw = config.get("auto_k_seeds", [42, 43])
+    if isinstance(seeds_raw, (int, np.integer)):
+        seeds = [int(seeds_raw)]
+    elif isinstance(seeds_raw, Sequence) and not isinstance(
+        seeds_raw,
+        (str, bytes),
+    ):
+        seeds = [int(seed) for seed in seeds_raw]
+    else:
+        seeds = [42, 43]
+    seeds = list(dict.fromkeys(seeds)) or [42, 43]
+
+    sample_seed = int(config.get("auto_k_sample_seed", 2026))
+    sampled = _stratified_metaspot_sample(
+        np.asarray(cell_ids),
+        train_n + validation_n,
+        seed=sample_seed,
+    )
+    train_indices = sampled[:train_n]
+    validation_indices = sampled[train_n:]
+    X_train = values[train_indices]
+    X_validation = values[validation_indices]
+
+    auto_k_max = int(
+        config.get("auto_k_max", config.get("K_max", 8000))
+    )
+    candidates = _sampled_knee_candidates(
+        n_sub=n_sub,
+        train_n=train_n,
+        auto_k_min=int(config.get("auto_k_min", 20)),
+        auto_k_max=auto_k_max,
+        min_average_size=int(
+            config.get("auto_k_min_average_size", 20)
+        ),
+        max_average_size=int(
+            config.get("auto_k_max_average_size", 500)
+        ),
+        min_train_per_cluster=int(
+            config.get("auto_k_min_train_per_cluster", 10)
+        ),
+        n_candidates=int(config.get("auto_k_n_candidates", 8)),
+    )
+
+    search_batch_size = max(
+        256,
+        min(
+            int(config.get("auto_k_batch_size", 2048)),
+            train_n,
+        ),
+    )
+    search_max_iter = max(
+        5,
+        int(config.get("auto_k_max_iter", 30)),
+    )
+    assign_chunk = max(
+        256,
+        int(config.get("assign_chunk_size", 50000)),
+    )
+    full_eval_max = max(
+        validation_n,
+        int(config.get("auto_k_full_eval_max", 100000)),
+    )
+    if n_sub <= full_eval_max:
+        X_occupancy = values
+        occupancy_scale = 1.0
+    else:
+        X_occupancy = values[sampled]
+        occupancy_scale = n_sub / max(1, sampled.size)
+
+    rows: List[Dict[str, float]] = []
+    for candidate in candidates:
+        validation_labels: List[np.ndarray] = []
+        candidate_distortion: List[float] = []
+        first_centers: Optional[np.ndarray] = None
+        for seed in seeds:
+            try:
+                model = MiniBatchKMeans(
+                    n_clusters=int(candidate),
+                    init="k-means++",
+                    n_init=1,
+                    random_state=int(seed),
+                    batch_size=search_batch_size,
+                    max_iter=search_max_iter,
+                    reassignment_ratio=0.01,
+                    verbose=0,
+                )
+                model.fit(X_train)
+                labels, loss = _assign_to_metadomain_centers(
+                    X_validation,
+                    model.cluster_centers_,
+                    use_cosine=use_cosine,
+                    chunk_size=assign_chunk,
+                )
+                validation_labels.append(labels)
+                candidate_distortion.append(float(loss))
+                if first_centers is None:
+                    first_centers = model.cluster_centers_.astype(
+                        np.float32,
+                        copy=True,
+                    )
+            except Exception:
+                validation_labels = []
+                candidate_distortion = []
+                first_centers = None
+                break
+
+        if not candidate_distortion or first_centers is None:
+            rows.append(
+                {
+                    "k": float(candidate),
+                    "distortion": np.nan,
+                    "stability_ari": np.nan,
+                    "small_cluster_fraction": np.nan,
+                    "empty_cluster_fraction": np.nan,
+                }
+            )
+            continue
+
+        pairwise_stability: List[float] = []
+        for left in range(len(validation_labels)):
+            for right in range(left + 1, len(validation_labels)):
+                pairwise_stability.append(
+                    float(
+                        adjusted_rand_score(
+                            validation_labels[left],
+                            validation_labels[right],
+                        )
+                    )
+                )
+        stability = (
+            float(np.mean(pairwise_stability))
+            if pairwise_stability
+            else np.nan
+        )
+
+        occupancy_labels, _ = _assign_to_metadomain_centers(
+            X_occupancy,
+            first_centers,
+            use_cosine=use_cosine,
+            chunk_size=assign_chunk,
+        )
+        occupancy = np.bincount(
+            occupancy_labels,
+            minlength=int(candidate),
+        ).astype(float)
+        expected_full_occupancy = occupancy * occupancy_scale
+        tiny = expected_full_occupancy < int(
+            config.get("min_domain_size", 5)
+        )
+        small_fraction = float(
+            occupancy[tiny].sum() / max(1, occupancy.sum())
+        )
+        rows.append(
+            {
+                "k": float(candidate),
+                "distortion": float(np.mean(candidate_distortion)),
+                "stability_ari": stability,
+                "small_cluster_fraction": small_fraction,
+                "empty_cluster_fraction": float(np.mean(occupancy == 0)),
+            }
+        )
+
+    diagnostics = pd.DataFrame(rows).sort_values("k")
+    candidate_array = diagnostics["k"].to_numpy(np.int32)
+    fallback_k = int(
+        np.clip(
+            round(math.sqrt(n_sub)),
+            candidate_array.min(),
+            candidate_array.max(),
+        )
+    )
+    stability_min = float(config.get("auto_k_stability_min", 0.4))
+    max_small_fraction = float(
+        config.get("auto_k_max_small_cluster_fraction", 0.01)
+    )
+    selected_k, knee_k, reason, feasible = _select_sampled_knee(
+        candidate_array,
+        diagnostics["distortion"].to_numpy(float),
+        diagnostics["stability_ari"].to_numpy(float),
+        diagnostics["small_cluster_fraction"].to_numpy(float),
+        stability_min=stability_min,
+        max_small_fraction=max_small_fraction,
+        fallback_k=fallback_k,
+    )
+
+    result: Dict[str, Any] = {
+        "method": "sampled_knee",
+        "selection_reason": reason,
+        "selected_k": int(selected_k),
+        "knee_k": int(knee_k),
+        "fallback_k": int(fallback_k),
+        "train_size": int(train_n),
+        "validation_size": int(validation_n),
+        "use_cosine": bool(use_cosine),
+        "stability_min": stability_min,
+        "max_small_cluster_fraction": max_small_fraction,
+        "candidate_k": candidate_array,
+        "distortion": diagnostics["distortion"].to_numpy(np.float32),
+        "stability_ari": diagnostics["stability_ari"].to_numpy(
+            np.float32
+        ),
+        "small_cluster_fraction": diagnostics[
+            "small_cluster_fraction"
+        ].to_numpy(np.float32),
+        "empty_cluster_fraction": diagnostics[
+            "empty_cluster_fraction"
+        ].to_numpy(np.float32),
+        "feasible": np.asarray(feasible, dtype=bool),
+    }
+    return int(selected_k), result
+
+
 def _cap_relax_factor(n_c: int) -> float:
     return float(1.0 + 0.6 * np.exp(-n_c / 80.0))
 
@@ -2451,6 +4502,134 @@ def _two_stage_mb_kmeans_assign(
     return labels
 
 
+def _metadomain_feature_matrix(
+    adata1: ad.AnnData,
+    point_df: pd.DataFrame,
+    *,
+    cluster_rep: str,
+    cluster_rep_decell: bool,
+    speed_preset: str,
+    use_spatial_feats: bool,
+    use_decell: bool,
+    use_cosine: bool,
+    w_gc: float,
+    w_expr: float,
+    w_sp: float,
+    use_gc: bool,
+    use_expr: bool,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Select either the learned MetaSpot representation or legacy features."""
+    from sklearn.preprocessing import normalize
+
+    rep = str(cluster_rep).strip()
+    if rep.lower() in {"", "legacy", "legacy_features", "auto"}:
+        return _construct_features_simple(
+            adata1,
+            point_df,
+            speed_preset=speed_preset,
+            use_spatial_feats=use_spatial_feats,
+            use_decell=use_decell,
+            use_cosine=use_cosine,
+            w_gc=w_gc,
+            w_expr=w_expr,
+            w_sp=w_sp,
+            use_gc=use_gc,
+            use_expr=use_expr,
+        )
+
+    if rep not in adata1.obsm:
+        raise KeyError(
+            f"module5.cluster_rep={rep!r} is missing from adata1.obsm; "
+            "refusing to fall back to legacy features"
+        )
+    values = np.asarray(adata1.obsm[rep], dtype=np.float32)
+    if values.ndim != 2 or values.shape[0] != adata1.n_obs:
+        raise ValueError(
+            f"adata1.obsm[{rep!r}] must have shape (n_metaspots, d), "
+            f"got {values.shape}"
+        )
+    if values.shape[1] == 0 or not np.isfinite(values).all():
+        raise ValueError(
+            f"adata1.obsm[{rep!r}] must be finite and have at least one feature"
+        )
+
+    if "cell_id" not in adata1.obs.columns:
+        if not {METASPOT_COL, "cell_id"}.issubset(point_df.columns):
+            raise ValueError(
+                "Embedding-based MetaDomain clustering requires cell_id"
+            )
+        owners = (
+            point_df[[METASPOT_COL, "cell_id"]]
+            .assign(**{METASPOT_COL: lambda frame: frame[METASPOT_COL].astype(str)})
+            .drop_duplicates()
+            .set_index(METASPOT_COL)["cell_id"]
+            .astype(str)
+        )
+        if owners.index.duplicated().any():
+            raise ValueError("A MetaSpot has more than one owning cell")
+        adata1.obs = adata1.obs.copy()
+        adata1.obs["cell_id"] = owners.reindex(
+            adata1.obs_names.astype(str)
+        ).to_numpy()
+    cell_ids = adata1.obs["cell_id"].astype(str).to_numpy()
+    unique_cells, cell_codes = np.unique(cell_ids, return_inverse=True)
+
+    matrix = StandardScaler().fit_transform(values).astype(np.float32)
+    if cluster_rep_decell:
+        sums = np.zeros((len(unique_cells), matrix.shape[1]), dtype=np.float32)
+        np.add.at(sums, cell_codes, matrix)
+        counts = np.bincount(cell_codes).astype(np.float32)
+        means = sums / np.maximum(counts[:, None], 1.0)
+        matrix = matrix - means[cell_codes]
+        matrix = StandardScaler().fit_transform(matrix).astype(np.float32)
+    if use_cosine:
+        matrix = normalize(matrix, norm="l2").astype(np.float32)
+    matrix[~np.isfinite(matrix)] = 0.0
+    return matrix, cell_ids, unique_cells, cell_codes
+
+
+def _merge_small_metadomain_clusters(
+    labels: np.ndarray,
+    values: np.ndarray,
+    min_size: int,
+    *,
+    use_cosine: bool,
+) -> np.ndarray:
+    """Merge tiny clusters into the closest sufficiently sized prototype."""
+    labels = np.asarray(labels, dtype=np.int32).copy()
+    min_size = max(1, int(min_size))
+    if min_size <= 1 or labels.size == 0:
+        return labels
+
+    cluster_ids, counts = np.unique(labels, return_counts=True)
+    large_ids = cluster_ids[counts >= min_size]
+    small_ids = cluster_ids[counts < min_size]
+    if large_ids.size == 0 or small_ids.size == 0:
+        return labels
+
+    centers = np.vstack(
+        [values[labels == cluster_id].mean(axis=0) for cluster_id in large_ids]
+    ).astype(np.float32)
+    points = values
+    if use_cosine:
+        centers = centers / (
+            np.linalg.norm(centers, axis=1, keepdims=True) + 1e-8
+        )
+        points = values / (
+            np.linalg.norm(values, axis=1, keepdims=True) + 1e-8
+        )
+        for cluster_id in small_ids:
+            indices = np.flatnonzero(labels == cluster_id)
+            nearest = np.argmax(points[indices] @ centers.T, axis=1)
+            labels[indices] = large_ids[nearest]
+    else:
+        for cluster_id in small_ids:
+            indices = np.flatnonzero(labels == cluster_id)
+            nearest = pairwise_distances_argmin(values[indices], centers)
+            labels[indices] = large_ids[nearest]
+    return labels
+
+
 def run_module5_simple(
     adata1: ad.AnnData,
     point_df: pd.DataFrame,
@@ -2461,6 +4640,7 @@ def run_module5_simple(
     enable_cap: bool = True,
     show_internal_progress: bool = False,
     progress_callback: Optional[Callable[[str], None]] = None,
+    module5_config_override: Optional[Mapping[str, Any]] = None,
 ):
     import time as _time
     _module_label = "Module 5 · Meta-domain Clustering"
@@ -2486,6 +4666,11 @@ def run_module5_simple(
         _m5 = _cfg.get('module5', {}) if _cfg else {}
     except Exception:
         _m5 = {}
+    if module5_config_override:
+        _m5 = {
+            **_m5,
+            **dict(module5_config_override),
+        }
     w_gc = float(_m5.get('w_gc', 0.4))
     w_expr = float(_m5.get('w_expr', 0.6))
     w_sp = float(_m5.get('w_sp', 0.0))
@@ -2496,15 +4681,59 @@ def run_module5_simple(
     enable_cap = bool(_m5.get('enable_cap', enable_cap))
     use_gc = bool(_m5.get('use_gc', True))
     use_expr = bool(_m5.get('use_expr', True))
+    cluster_rep = str(_m5.get("cluster_rep", "legacy_features"))
+    cluster_rep_decell = bool(_m5.get("cluster_rep_decell", False))
+    clustering_method = str(
+        _m5.get("clustering_method", "minibatch_kmeans")
+    ).strip().lower().replace("-", "_")
+    clustering_aliases = {
+        "minibatch_kmeans": "minibatch_kmeans",
+        "kmeans": "minibatch_kmeans",
+        "legacy": "minibatch_kmeans",
+        "consensus_leiden": "consensus_leiden",
+        "stability_leiden": "consensus_leiden",
+        "leiden": "consensus_leiden",
+    }
+    if clustering_method not in clustering_aliases:
+        raise ValueError(
+            "module5.clustering_method must be one of "
+            "{'minibatch_kmeans', 'consensus_leiden'}"
+        )
+    clustering_method = clustering_aliases[clustering_method]
+    large_scale_method = str(
+        _m5.get("large_scale_method", "auto")
+    ).strip().lower().replace("-", "_")
+    if large_scale_method == "auto":
+        effective_clustering_method = clustering_method
+    elif large_scale_method in {
+        "hierarchical_prototype",
+        "hierarchical",
+        "prototype",
+    }:
+        effective_clustering_method = "hierarchical_prototype"
+    elif large_scale_method in {"consensus_leiden", "exact"}:
+        effective_clustering_method = "consensus_leiden"
+    elif large_scale_method == "minibatch_kmeans":
+        effective_clustering_method = "minibatch_kmeans"
+    else:
+        raise ValueError(
+            "module5.large_scale_method must be one of "
+            "{'auto','minibatch_kmeans','consensus_leiden',"
+            "'hierarchical_prototype'}"
+        )
+    min_domain_size = max(1, int(_m5.get("min_domain_size", 1)))
+    random_seed = int(_m5.get("random_seed", 42))
     # More aggressive speed defaults for large cohorts; can still be overridden in params.yaml
     train_sample_per_block = int(_m5.get('train_sample_per_block', 300000))
     assign_chunk_size = int(_m5.get('assign_chunk_size', _m5.get('block_size', 50000) or 50000))
     mbk_batch_size = int(_m5.get('mbk_batch_size', 8192))
     mbk_max_iter = int(_m5.get('mbk_max_iter', 60 if str(speed_preset).lower() == 'ultra' else 80))
     # feature construction
-    X_all, cell_ids, u_cells, cell_codes = _construct_features_simple(
+    X_all, cell_ids, u_cells, cell_codes = _metadomain_feature_matrix(
         adata1,
         point_df,
+        cluster_rep=cluster_rep,
+        cluster_rep_decell=cluster_rep_decell,
         speed_preset=speed_preset,
         use_spatial_feats=use_spatial_feats,
         use_decell=use_decell,
@@ -2517,10 +4746,174 @@ def run_module5_simple(
     )
     n_sub = X_all.shape[0]
     n_cells = len(u_cells)
-    # K estimation params
-    if str(_m5.get('estimate_k', 'auto')).lower() == 'fixed':
+    if effective_clustering_method == "hierarchical_prototype":
+        from .hierarchical_metadomain import (
+            run_hierarchical_prototype_clustering,
+        )
+
+        split_by_nucleus = bool(_m5.get("split_by_nucleus", True))
+        if split_by_nucleus and "r_p50" in adata1.obs.columns:
+            threshold = float(_m5.get("nucleus_threshold", 0.0))
+            side_labels = np.where(
+                adata1.obs["r_p50"].to_numpy(np.float32) < threshold,
+                "N",
+                "C",
+            )
+        else:
+            side_labels = np.full(n_sub, "A", dtype=object)
+        t0_hierarchical = _step_start(
+            "cell-aligned local prototypes and global prototype clustering"
+        )
+        global_labels, metadata, diagnostic_table = (
+            run_hierarchical_prototype_clustering(
+                X_all,
+                cell_ids,
+                side_labels=side_labels,
+                config=_m5,
+            )
+        )
+        global_labels = _merge_small_metadomain_clusters(
+            global_labels,
+            X_all,
+            min_domain_size,
+            use_cosine=use_cosine,
+        )
+        unique = np.unique(global_labels)
+        remap = {int(value): index for index, value in enumerate(unique)}
+        dense = np.asarray(
+            [remap[int(value)] for value in global_labels],
+            dtype=np.int32,
+        )
+        _step_done("hierarchical prototype clustering", t0_hierarchical)
+        adata1.obs["meta-domain"] = pd.Categorical(dense.astype(str))
+        metadata = {
+            **metadata,
+            "cluster_rep": cluster_rep,
+            "cluster_rep_decell": bool(cluster_rep_decell),
+            "split_by_nucleus": bool(split_by_nucleus),
+            "min_domain_size": int(min_domain_size),
+            "random_seed": int(random_seed),
+            "n_metadomains_after_small_cluster_merge": int(unique.size),
+        }
+        adata1.uns["module5_metadomain_clustering"] = metadata
+        _logging.getLogger("cellscope").info(
+            "Module 5 hierarchical prototypes: MetaSpots=%d "
+            "local_prototypes=%d MetaDomains=%d blocks=%d",
+            int(n_sub),
+            int(metadata["n_local_prototypes"]),
+            int(unique.size),
+            int(metadata["n_blocks"]),
+        )
+        return adata1, diagnostic_table
+
+    if effective_clustering_method == "consensus_leiden":
+        from .consensus_clustering import run_stability_consensus_leiden
+
+        split_by_nucleus = bool(_m5.get("split_by_nucleus", True))
+        if split_by_nucleus and "r_p50" in adata1.obs.columns:
+            threshold = float(_m5.get("nucleus_threshold", 0.0))
+            is_nuclear = (
+                adata1.obs["r_p50"].to_numpy(np.float32) < threshold
+            )
+            blocks = [
+                ("N", np.flatnonzero(is_nuclear)),
+                ("C", np.flatnonzero(~is_nuclear)),
+            ]
+        else:
+            blocks = [("A", np.arange(n_sub, dtype=np.int64))]
+        global_labels = np.empty(n_sub, dtype=np.int32)
+        offset = 0
+        consensus_by_block: Dict[str, Any] = {}
+        diagnostic_rows: List[Dict[str, Any]] = []
+        t0_consensus = _step_start("stability consensus Leiden")
+        for prefix, indices in blocks:
+            if indices.size == 0:
+                continue
+            local_labels, metadata = run_stability_consensus_leiden(
+                X_all[indices],
+                cell_ids[indices],
+                config=_m5,
+                n_jobs=_preferred_n_jobs(),
+            )
+            local_labels = _merge_small_metadomain_clusters(
+                local_labels,
+                X_all[indices],
+                min_domain_size,
+                use_cosine=use_cosine,
+            )
+            unique = np.unique(local_labels)
+            remap = {value: index for index, value in enumerate(unique)}
+            dense = np.asarray(
+                [remap[value] for value in local_labels],
+                dtype=np.int32,
+            )
+            global_labels[indices] = dense + offset
+            offset += int(dense.max()) + 1
+            consensus_by_block[prefix] = metadata
+            candidate_resolution = np.asarray(
+                metadata["candidate_resolution"], dtype=float
+            )
+            selected_resolution = float(metadata["selected_resolution"])
+            selected_index = int(
+                np.argmin(np.abs(candidate_resolution - selected_resolution))
+            )
+            diagnostic_rows.append(
+                {
+                    "block": prefix,
+                    "n_metaspots": int(indices.size),
+                    "selected_resolution": selected_resolution,
+                    "selected_stability_ari": float(
+                        np.asarray(
+                            metadata["candidate_stability_ari"], dtype=float
+                        )[selected_index]
+                    ),
+                    "selected_candidate_clusters": int(
+                        np.asarray(
+                            metadata["candidate_n_clusters"], dtype=int
+                        )[selected_index]
+                    ),
+                    "final_clusters": int(unique.size),
+                    "selection_reason": str(metadata["selection_reason"]),
+                }
+            )
+        _step_done("stability consensus Leiden", t0_consensus)
+        adata1.obs["meta-domain"] = pd.Categorical(
+            global_labels.astype(str)
+        )
+        adata1.uns["module5_metadomain_clustering"] = {
+            "clustering_method": "consensus_leiden",
+            "cluster_rep": cluster_rep,
+            "cluster_rep_decell": bool(cluster_rep_decell),
+            "split_by_nucleus": bool(split_by_nucleus),
+            "min_domain_size": int(min_domain_size),
+            "random_seed": int(random_seed),
+            "n_metaspots": int(n_sub),
+            "n_metadomains": int(
+                adata1.obs["meta-domain"].nunique()
+            ),
+            "consensus_by_block": consensus_by_block,
+        }
+        _logging.getLogger("cellscope").info(
+            "Module 5 consensus Leiden: MetaSpots=%d MetaDomains=%d blocks=%s",
+            int(n_sub),
+            int(adata1.obs["meta-domain"].nunique()),
+            [row["block"] for row in diagnostic_rows],
+        )
+        return adata1, pd.DataFrame(diagnostic_rows)
+
+    # K estimation. "auto" is a sampled held-out distortion knee; the
+    # historical count-only heuristic remains available as "legacy_auto".
+    estimate_k_mode = str(_m5.get("estimate_k", "auto")).strip().lower()
+    if estimate_k_mode == "fixed":
         K_total = int(_m5.get('fixed_k', 1024))
-    else:
+        k_selection: Dict[str, Any] = {
+            "method": "fixed",
+            "selection_reason": "configured_fixed_k",
+            "selected_k": int(K_total),
+            "knee_k": int(K_total),
+            "candidate_k": np.asarray([K_total], dtype=np.int32),
+        }
+    elif estimate_k_mode in {"legacy_auto", "legacy"}:
         K_total = _choose_K_simple(
             n_sub=n_sub,
             n_cells=n_cells,
@@ -2528,6 +4921,38 @@ def run_module5_simple(
             target_cluster_per_cell=float(_m5.get('target_cluster_per_cell', 1.0)),
             K_min=int(_m5.get('K_min', 200)),
             K_max=int(_m5.get('K_max', 8000)),
+        )
+        k_selection = {
+            "method": "legacy_auto",
+            "selection_reason": "legacy_count_heuristic",
+            "selected_k": int(K_total),
+            "knee_k": int(K_total),
+            "candidate_k": np.asarray([K_total], dtype=np.int32),
+        }
+    elif estimate_k_mode in {"auto", "sampled_knee"}:
+        t0_auto_k = _step_start("sampled automatic K selection")
+        K_total, k_selection = _choose_K_sampled_knee(
+            X_all,
+            cell_ids,
+            use_cosine=use_cosine,
+            config=_m5,
+        )
+        _step_done("sampled automatic K selection", t0_auto_k)
+        _logging.getLogger("cellscope").info(
+            "Module 5 automatic K: selected=%d knee=%d reason=%s "
+            "candidates=%s",
+            int(K_total),
+            int(k_selection.get("knee_k", K_total)),
+            str(k_selection.get("selection_reason", "")),
+            np.asarray(
+                k_selection.get("candidate_k", [K_total])
+            ).tolist(),
+        )
+    else:
+        raise ValueError(
+            "module5.estimate_k must be one of "
+            "{'auto', 'sampled_knee', 'legacy_auto', 'fixed'}, "
+            f"got {estimate_k_mode!r}"
         )
     # split by nucleus/cytoplasm using r_p50
     split_by_nucleus = bool(_m5.get('split_by_nucleus', True))
@@ -2552,7 +4977,7 @@ def run_module5_simple(
         y = _two_stage_mb_kmeans_assign(
             Xi,
             K=K_blk,
-            seed=42 + (0 if prefix == 'N' else 1),
+            seed=random_seed + (1 if prefix == 'C' else 0),
             sample_n=train_sample_per_block,
             batch_size=mbk_batch_size,
             assign_chunk=assign_chunk_size,
@@ -2570,6 +4995,12 @@ def run_module5_simple(
                 max_frac_soft=float(_m5.get('cap_max_frac_soft', 0.05)),
                 use_cosine=use_cosine,
             )
+        y = _merge_small_metadomain_clusters(
+            y,
+            Xi,
+            min_domain_size,
+            use_cosine=use_cosine,
+        )
         u = np.unique(y); remap = {u_i: i for i, u_i in enumerate(u)}
         dense = np.vectorize(remap.get, otypes=[np.int32])(y)
         global_labels[idx] = dense + offset
@@ -2579,7 +5010,34 @@ def run_module5_simple(
     if not show_internal_progress:
         _step_done('block clustering', t0_main)
     adata1.obs["meta-domain"] = pd.Categorical(global_labels.astype(str))
-    return adata1, pd.DataFrame(dict(n_sub=[n_sub], n_cells=[n_cells], K_total=[K_total], final_K=[int(adata1.obs["meta-domain"].nunique())]))
+    adata1.uns["module5_metadomain_clustering"] = {
+        "clustering_method": "minibatch_kmeans",
+        "cluster_rep": cluster_rep,
+        "cluster_rep_decell": bool(cluster_rep_decell),
+        "split_by_nucleus": bool(split_by_nucleus),
+        "min_domain_size": int(min_domain_size),
+        "random_seed": int(random_seed),
+        "n_metaspots": int(n_sub),
+        "n_metadomains": int(adata1.obs["meta-domain"].nunique()),
+        "k_selection": k_selection,
+    }
+    return adata1, pd.DataFrame(
+        {
+            "n_sub": [n_sub],
+            "n_cells": [n_cells],
+            "K_total": [K_total],
+            "knee_K": [int(k_selection.get("knee_k", K_total))],
+            "selection_method": [
+                str(k_selection.get("method", estimate_k_mode))
+            ],
+            "selection_reason": [
+                str(k_selection.get("selection_reason", ""))
+            ],
+            "final_K": [
+                int(adata1.obs["meta-domain"].nunique())
+            ],
+        }
+    )
 
 
 def build_adata2_from_adata1_and_pointdf(
@@ -2587,6 +5045,9 @@ def build_adata2_from_adata1_and_pointdf(
     point_df: pd.DataFrame,
     show_internal_progress: bool = False,
     progress_callback: Optional[Callable[[str], None]] = None,
+    module6_config_override: Optional[Mapping[str, Any]] = None,
+    graph_unit_override: Optional[str] = None,
+    pool_output_key_map: Optional[Mapping[str, str]] = None,
 ) -> ad.AnnData:
     import time as _time
     _module_label = "Module 6 · Aggregate Domains into Cluster Feature Table (adata2)"
@@ -2647,21 +5108,149 @@ def build_adata2_from_adata1_and_pointdf(
     X2_counts = (G @ X1).tocsr().astype(np.float32, copy=False)
     adata2 = ad.AnnData(X=X2, obs=pd.DataFrame(index=clu_uni), var=adata1.var.copy())
     adata2.layers["counts"] = X2_counts
+    adata2.obs["n_metaspots"] = row_sum.astype(np.int64)
     adata2.uns["matrix_semantics"] = {
         "X": "mean MetaSpot transcript-frequency profile; rows sum to approximately one",
         "layers_counts": "sum of raw MetaSpot gene counts per MetaDomain",
     }
+
+    try:
+        module6_config = (load_params_yaml() or {}).get("module6", {}) or {}
+    except Exception:
+        module6_config = {}
+    if module6_config_override:
+        module6_config = {
+            **module6_config,
+            **dict(module6_config_override),
+        }
+    pool_reps = module6_config.get("pool_reps", [])
+    if isinstance(pool_reps, str):
+        pool_reps = [
+            value.strip()
+            for value in pool_reps.split(",")
+            if value.strip()
+        ]
+    elif not isinstance(pool_reps, (list, tuple)):
+        pool_reps = []
+    pool_normalize = bool(module6_config.get("pool_normalize", True))
+    if graph_unit_override is None:
+        graph_unit = str(
+            ((load_params_yaml() or {}).get("module7", {}) or {}).get(
+                "graph_unit",
+                "metadomain",
+            )
+        ).strip().lower()
+    else:
+        graph_unit = str(graph_unit_override).strip().lower()
+
+    pooled_metadata: Dict[str, Any] = {}
+    group_mean = G.multiply(1.0 / row_sum[:, None]).tocsr()
+    output_key_map = {
+        METASPOT_DGI_KEY: METADOMAIN_DGI_KEY,
+        METASPOT_DGI_SAGE_KEY: "X_dgi_sage_metadomain",
+        "X_expr_metaspot": "X_expr_metadomain",
+    }
+    if pool_output_key_map:
+        output_key_map.update(
+            {
+                str(source): str(target)
+                for source, target in pool_output_key_map.items()
+            }
+        )
+    compatibility_aliases = {
+        METASPOT_DGI_KEY: "X_dgi_gcn",
+        METASPOT_DGI_SAGE_KEY: "X_dgi_sage",
+        "X_expr_metaspot": "X_expr",
+    }
+    for source_key in [str(value) for value in pool_reps]:
+        if source_key not in adata1.obsm:
+            if graph_unit == "metaspot":
+                raise KeyError(
+                    f"module6.pool_reps requested {source_key!r}, but it is "
+                    "missing from adata1.obsm"
+                )
+            continue
+        source = np.asarray(adata1.obsm[source_key], dtype=np.float32)
+        if source.ndim != 2 or source.shape[0] != adata1.n_obs:
+            raise ValueError(
+                f"adata1.obsm[{source_key!r}] is not aligned to MetaSpots"
+            )
+        if not np.isfinite(source).all():
+            raise ValueError(
+                f"adata1.obsm[{source_key!r}] contains non-finite values"
+            )
+        if pool_normalize:
+            source_norm = np.linalg.norm(source, axis=1, keepdims=True)
+            source = source / np.maximum(source_norm, 1e-8)
+        pooled = np.asarray(group_mean @ source, dtype=np.float32)
+        if pool_normalize:
+            pooled_norm = np.linalg.norm(pooled, axis=1, keepdims=True)
+            pooled = pooled / np.maximum(pooled_norm, 1e-8)
+        output_key = output_key_map.get(
+            source_key,
+            f"{source_key}_metadomain",
+        )
+        adata2.obsm[output_key] = pooled
+        alias = compatibility_aliases.get(source_key)
+        if alias:
+            adata2.obsm[alias] = pooled.copy()
+        pooled_metadata[output_key] = {
+            "source_key": source_key,
+            "source_unit": "metaspot",
+            "target_unit": "metadomain",
+            "pooling": "equal_metaspot_mean",
+            "l2_normalized": bool(pool_normalize),
+            "compatibility_alias": alias or "",
+        }
+    if graph_unit == "metaspot" and METADOMAIN_DGI_KEY not in adata2.obsm:
+        raise RuntimeError(
+            "MetaSpot graph mode requires pooled MetaDomain DGI embedding "
+            f"{METADOMAIN_DGI_KEY!r}"
+        )
+    if pooled_metadata:
+        adata2.uns["embedding_pooling"] = {
+            "schema_version": 1,
+            "membership_checksum": _membership_checksum(
+                adata1.obs_names,
+                adata1.obs["meta-domain"].astype(str).to_numpy(),
+            ),
+            "representations": pooled_metadata,
+        }
     _step_done("Aggregate metaspots -> cluster means", t0)
     if _m6_prog and _m6_task is not None:
         try: _m6_prog.advance(_m6_task, 1)
         except Exception: pass
     # 4) aggregate geometry stats
     t0 = _step_start("Aggregate geometry stats per cluster")
-    want_cols = [c for c in ['r_mean','r_std','r_p50','d_cell_norm_mean','d_nuc_norm_mean','elongation','spread','log_n'] if c in adata1.obs.columns]
-    agg = (adata1.obs[want_cols + ['meta-domain']]
-            .groupby('meta-domain', sort=False, observed=True)
-           .agg({'r_mean':'mean','r_std':'mean','r_p50':'mean','d_cell_norm_mean':'mean','d_nuc_norm_mean':'mean','elongation':'median','spread':'median','log_n':'mean'}))
-    adata2.obs = adata2.obs.join(agg, how='left')
+    geometry_columns = [
+        column
+        for column in (
+            "r_mean",
+            "r_std",
+            "r_p50",
+            "d_cell_norm_mean",
+            "d_nuc_norm_mean",
+            "elongation",
+            "spread",
+            "log_n",
+        )
+        if column in adata1.obs.columns
+    ]
+    if geometry_columns:
+        aggregation = {
+            column: (
+                "median"
+                if column in {"elongation", "spread"}
+                else "mean"
+            )
+            for column in geometry_columns
+        }
+        agg = (
+            adata1.obs[geometry_columns + ["meta-domain"]]
+            .groupby("meta-domain", sort=False, observed=True)
+            .agg(aggregation)
+        )
+        adata2.obs = adata2.obs.join(agg, how="left")
     _step_done("Aggregate geometry stats per cluster", t0)
     if _m6_prog and _m6_task is not None:
         try: _m6_prog.advance(_m6_task, 1)
@@ -3038,70 +5627,1083 @@ def build_module7_graph(
     return adata2
 
 
-def run_module8_dgi(adata1: ad.AnnData, adata2: ad.AnnData, show_internal_progress: bool = False, dgi_epochs: int = 100, enable_dgi_sage: bool = False, out_dir: Optional[str] = None, progress_callback: Optional[Callable[[str], None]] = None) -> Tuple[ad.AnnData, ad.AnnData]:
+def _build_groupwise_corruption_plan(
+    group_values: Sequence[Any],
+) -> Dict[str, np.ndarray]:
+    """Precompute indices for a random non-self permutation within groups.
+
+    Missing group labels are treated as separate singleton groups so that they
+    can never leak features between cells.
+    """
+    values = np.asarray(group_values, dtype=object).reshape(-1).copy()
+    missing = pd.isna(values)
+    for index in np.flatnonzero(missing):
+        values[index] = f"__cellscope_missing_group_{int(index)}"
+    codes, _ = pd.factorize(values, sort=False)
+    codes = np.asarray(codes, dtype=np.int64)
+    order = np.argsort(codes, kind="stable").astype(np.int64, copy=False)
+    position = np.empty(order.size, dtype=np.int64)
+    position[order] = np.arange(order.size, dtype=np.int64)
+    n_groups = int(codes.max()) + 1 if codes.size else 0
+    sizes = np.bincount(codes, minlength=n_groups).astype(np.int64)
+    starts = np.zeros(n_groups, dtype=np.int64)
+    if n_groups > 1:
+        starts[1:] = np.cumsum(sizes[:-1], dtype=np.int64)
+    return {
+        "codes": codes,
+        "order": order,
+        "position": position,
+        "starts": starts,
+        "sizes": sizes,
+        "missing_count": np.asarray([int(missing.sum())], dtype=np.int64),
+    }
+
+
+def _draw_groupwise_corruption_index(
+    plan: Mapping[str, np.ndarray],
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Draw one cyclic, non-self feature permutation per non-singleton group."""
+    codes = np.asarray(plan["codes"], dtype=np.int64)
+    if codes.size == 0:
+        return np.empty(0, dtype=np.int64)
+    order = np.asarray(plan["order"], dtype=np.int64)
+    position = np.asarray(plan["position"], dtype=np.int64)
+    starts = np.asarray(plan["starts"], dtype=np.int64)
+    sizes = np.asarray(plan["sizes"], dtype=np.int64)
+    shifts = np.zeros(sizes.size, dtype=np.int64)
+    for group_index, size in enumerate(sizes):
+        if size > 1:
+            shifts[group_index] = int(rng.integers(1, int(size)))
+    within_position = position - starts[codes]
+    corrupted_position = (
+        starts[codes]
+        + (within_position + shifts[codes]) % sizes[codes]
+    )
+    return order[corrupted_position]
+
+
+def _sample_local_contrastive_pairs(
+    adjacency: sp.spmatrix,
+    group_values: Optional[Sequence[Any]],
+    n_samples: int,
+    seed: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Sample positive graph edges and non-edge negatives for local DGI loss.
+
+    When group labels are supplied, negatives are restricted to the source
+    node's group. Pairs without an eligible within-group non-neighbor are
+    skipped instead of silently crossing cell boundaries.
+    """
+    requested = max(0, int(n_samples))
+    graph = adjacency.tocsr().astype(np.float32)
+    graph = graph.maximum(graph.T).tocsr()
+    graph.setdiag(0)
+    graph.eliminate_zeros()
+    graph.sort_indices()
+    upper = sp.triu(graph, k=1, format="coo")
+    if group_values is None:
+        codes = np.zeros(graph.shape[0], dtype=np.int64)
+        members = [np.arange(graph.shape[0], dtype=np.int64)]
+    else:
+        plan = _build_groupwise_corruption_plan(group_values)
+        codes = np.asarray(plan["codes"], dtype=np.int64)
+        if codes.size != graph.shape[0]:
+            raise ValueError(
+                "Local contrastive group labels are not aligned to graph nodes"
+            )
+        same_group_edge = codes[upper.row] == codes[upper.col]
+        upper = sp.coo_matrix(
+            (
+                upper.data[same_group_edge],
+                (upper.row[same_group_edge], upper.col[same_group_edge]),
+            ),
+            shape=upper.shape,
+        )
+        members = [
+            plan["order"][start:start + size]
+            for start, size in zip(plan["starts"], plan["sizes"])
+        ]
+    if requested == 0 or upper.nnz == 0:
+        empty = np.empty(0, dtype=np.int64)
+        return empty, empty.copy(), empty.copy()
+
+    rng = np.random.default_rng(int(seed))
+    take = min(requested, int(upper.nnz))
+    selected = (
+        np.arange(upper.nnz, dtype=np.int64)
+        if take == upper.nnz
+        else rng.choice(upper.nnz, size=take, replace=False)
+    )
+    source = np.asarray(upper.row[selected], dtype=np.int64)
+    positive = np.asarray(upper.col[selected], dtype=np.int64)
+
+    kept_source: List[int] = []
+    kept_positive: List[int] = []
+    kept_negative: List[int] = []
+    for src, pos in zip(source, positive):
+        candidates = members[int(codes[src])]
+        if candidates.size <= 1:
+            continue
+        row_start, row_end = graph.indptr[src], graph.indptr[src + 1]
+        neighbors = graph.indices[row_start:row_end]
+        negative = -1
+        # Sparse graphs normally succeed immediately; bounded random trials
+        # avoid materializing a large candidate mask for every sampled edge.
+        for _ in range(min(32, max(4, int(candidates.size)))):
+            candidate = int(candidates[int(rng.integers(candidates.size))])
+            if candidate == src:
+                continue
+            location = np.searchsorted(neighbors, candidate)
+            if location >= neighbors.size or neighbors[location] != candidate:
+                negative = candidate
+                break
+        if negative < 0:
+            # Deterministic fallback makes small/dense test graphs exact.
+            for candidate_value in candidates:
+                candidate = int(candidate_value)
+                if candidate == src:
+                    continue
+                location = np.searchsorted(neighbors, candidate)
+                if location >= neighbors.size or neighbors[location] != candidate:
+                    negative = candidate
+                    break
+        if negative < 0:
+            continue
+        kept_source.append(int(src))
+        kept_positive.append(int(pos))
+        kept_negative.append(negative)
+
+    return (
+        np.asarray(kept_source, dtype=np.int64),
+        np.asarray(kept_positive, dtype=np.int64),
+        np.asarray(kept_negative, dtype=np.int64),
+    )
+
+
+def _run_module8_cell_aware_dmgi(
+    adata1: ad.AnnData,
+    adata2: ad.AnnData,
+    *,
+    module8_config: Mapping[str, Any],
+    feature_keys: Sequence[str],
+    output_key: str,
+    compatibility_alias: bool,
+    broadcast_to_adata1: bool,
+    out_dir: Optional[str],
+    progress_callback: Optional[Callable[[str], None]],
+    show_internal_progress: bool,
+) -> Tuple[ad.AnnData, ad.AnnData]:
+    """Train the MetaSpot-only CA-DMGI backbone."""
+    if broadcast_to_adata1:
+        raise ValueError(
+            "module8.dgi_framework='cell_aware_dmgi' requires native "
+            "MetaSpot execution (module8.dgi_unit='metaspot')"
+        )
+    expression_graph_key = str(
+        module8_config.get(
+            "dmgi_expression_graph_key",
+            "metaspot_expr_connectivities",
+        )
+    ).strip()
+    spatial_graph_key = str(
+        module8_config.get(
+            "dmgi_spatial_graph_key",
+            "metaspot_spatial_connectivities",
+        )
+    ).strip()
+    missing_graphs = [
+        key
+        for key in (expression_graph_key, spatial_graph_key)
+        if key not in adata2.obsp
+    ]
+    if missing_graphs:
+        raise KeyError(f"Missing CA-DMGI relation graphs: {missing_graphs}")
+    if "cell_id" not in adata2.obs.columns:
+        raise KeyError("CA-DMGI requires adata.obs['cell_id']")
+    missing_features = [
+        key for key in feature_keys if key not in adata2.obsm
+    ]
+    if missing_features:
+        raise KeyError(f"Missing CA-DMGI node features: {missing_features}")
+    feature_arrays = [
+        np.asarray(adata2.obsm[key], dtype=np.float32)
+        for key in feature_keys
+    ]
+    if any(array.shape[0] != adata2.n_obs for array in feature_arrays):
+        raise ValueError("CA-DMGI node features are not aligned to observations")
+    features = np.concatenate(feature_arrays, axis=1).astype(
+        np.float32,
+        copy=False,
+    )
+    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if progress_callback:
+        progress_callback(
+            "Module 8 · CA-DMGI relation-specific expression/spatial training"
+        )
+
+    requested_training_mode = str(
+        module8_config.get("training_mode", "auto")
+    ).strip().lower().replace("-", "_")
+    execution_plan = adata2.uns.get("execution_plan", {})
+    if requested_training_mode == "auto":
+        effective_training_mode = str(
+            execution_plan.get("dgi_training_mode", "full_batch")
+        ).strip().lower().replace("-", "_")
+    else:
+        effective_training_mode = requested_training_mode
+    if effective_training_mode not in {"full_batch", "neighbor_sampled"}:
+        raise ValueError(
+            "module8.training_mode must resolve to 'full_batch' or "
+            "'neighbor_sampled'"
+        )
+    effective_module8_config = dict(module8_config)
+    effective_module8_config["training_mode"] = effective_training_mode
+    if effective_training_mode == "neighbor_sampled":
+        effective_module8_config["dgi_epochs"] = int(
+            module8_config.get(
+                "sampled_dgi_epochs",
+                module8_config.get("dgi_epochs", 100),
+            )
+        )
+        if out_dir:
+            effective_module8_config["sampled_checkpoint_dir"] = os.path.join(
+                _intermediate_dir(out_dir), "module8_sampled_checkpoints"
+            )
+        from .sampled_multiplex_dgi import (
+            train_sampled_cell_aware_dmgi as train_cell_aware_dmgi,
+        )
+    else:
+        from .multiplex_dgi import train_cell_aware_dmgi
+
+    def _training_progress(epoch: int, epochs: int, loss: float) -> None:
+        _logging.getLogger("cellscope").info(
+            "[CA-DMGI] epoch %d/%d loss=%.4f",
+            epoch,
+            epochs,
+            loss,
+        )
+
+    result = train_cell_aware_dmgi(
+        features,
+        adata2.obsp[expression_graph_key],
+        adata2.obsp[spatial_graph_key],
+        adata2.obs["cell_id"].astype(str).to_numpy(),
+        config=effective_module8_config,
+        progress_callback=_training_progress,
+    )
+    consensus = np.asarray(result["embedding"], dtype=np.float32)
+    expression = np.asarray(
+        result["expression_embedding"], dtype=np.float32
+    )
+    spatial = np.asarray(result["spatial_embedding"], dtype=np.float32)
+    expression_gate = np.asarray(
+        result["expression_gate"], dtype=np.float32
+    )
+    adata2.obsm[output_key] = consensus
+    adata2.obsm[METASPOT_DMGI_EXPRESSION_KEY] = expression
+    adata2.obsm[METASPOT_DMGI_SPATIAL_KEY] = spatial
+    adata2.obs = adata2.obs.copy()
+    adata2.obs["dmgi_expression_gate"] = expression_gate
+    adata2.obs["dmgi_spatial_gate"] = 1.0 - expression_gate
+    if compatibility_alias and output_key != "X_dgi_gcn":
+        adata2.obsm["X_dgi_gcn"] = consensus.copy()
+
+    history = result["history"]
+    metrics = result["metrics"]
+    runtime = result["runtime"]
+    provenance = dict(adata2.uns.get("dgi_embeddings", {}))
+    provenance[output_key] = {
+        "schema_version": int(METASPOT_DGI_SCHEMA_VERSION),
+        "framework": "cell_aware_dmgi",
+        "training_mode_requested": requested_training_mode,
+        "training_mode": effective_training_mode,
+        "objective": "relation_specific_local_infomax",
+        "node_unit": "metaspot",
+        "node_id_checksum": _obs_names_checksum(adata2.obs_names),
+        "graph_key": "multiplex",
+        "expression_graph_key": expression_graph_key,
+        "spatial_graph_key": spatial_graph_key,
+        "feature_keys": [str(key) for key in feature_keys],
+        "n_nodes": int(adata2.n_obs),
+        "n_features": int(features.shape[1]),
+        "embedding_dim": int(consensus.shape[1]),
+        "expression_embedding_key": METASPOT_DMGI_EXPRESSION_KEY,
+        "spatial_embedding_key": METASPOT_DMGI_SPATIAL_KEY,
+        "gate_obs_key": "dmgi_expression_gate",
+        "encoder": str(module8_config.get("dgi_encoder", "residual")),
+        "message_passing_layers": int(
+            module8_config.get("dgi_layers", 2)
+        ),
+        "hidden_dim": int(module8_config.get("dgi_hidden", 64)),
+        "dropout": float(module8_config.get("dgi_dropout", 0.1)),
+        "residual_alpha": float(
+            module8_config.get("dgi_residual_alpha", 0.1)
+        ),
+        "layer_norm": bool(module8_config.get("dgi_layer_norm", True)),
+        "corruption_mode_effective": "same_cell",
+        "negative_semantics": "corrupted_features_not_real_nodes",
+        "expression_loss_weight": float(
+            module8_config.get("dmgi_expression_weight", 1.0)
+        ),
+        "spatial_loss_weight": float(
+            module8_config.get("dmgi_spatial_weight", 1.0)
+        ),
+        "consensus_loss_weight": float(
+            module8_config.get("dmgi_consensus_weight", 0.1)
+        ),
+        "gate_floor": float(module8_config.get("dmgi_gate_floor", 0.1)),
+        "epochs_requested": int(
+            effective_module8_config.get("dgi_epochs", 100)
+        ),
+        "epochs": int(metrics["epochs_run"]),
+        "best_epoch": int(metrics["best_epoch"]),
+        "early_stopped": bool(metrics["early_stopped"]),
+        "learning_rate": float(module8_config.get("dgi_lr", 1e-3)),
+        "weight_decay": float(
+            module8_config.get("dgi_weight_decay", 1e-4)
+        ),
+        "gradient_clip": float(
+            module8_config.get("dgi_clip_grad", 1.0)
+        ),
+        "random_seed": int(module8_config.get("random_seed", 42)),
+        "training_loss": history["loss"],
+        "validation_loss": history.get("validation_loss", []),
+        "training_expression_infomax_loss": history[
+            "expression_infomax_loss"
+        ],
+        "training_spatial_infomax_loss": history[
+            "spatial_infomax_loss"
+        ],
+        "training_consensus_loss": history["consensus_loss"],
+        "training_loss_ema": history["loss_ema"],
+        "training_expression_gate_mean": history[
+            "expression_gate_mean"
+        ],
+        "final_training_loss": float(history["loss"][-1]),
+        "final_expression_infomax_loss": float(
+            history["expression_infomax_loss"][-1]
+        ),
+        "final_spatial_infomax_loss": float(
+            history["spatial_infomax_loss"][-1]
+        ),
+        "final_consensus_loss": float(history["consensus_loss"][-1]),
+        **{str(key): value for key, value in metrics.items()},
+        **{str(key): value for key, value in runtime.items()},
+        "compatibility_alias": (
+            "X_dgi_gcn"
+            if compatibility_alias and output_key != "X_dgi_gcn"
+            else ""
+        ),
+    }
+    adata2.uns["dgi_embeddings"] = provenance
+
+    training_history = pd.DataFrame(
+        {
+            "epoch": np.arange(1, len(history["loss"]) + 1),
+            "total_loss": history["loss"],
+            "validation_loss": history.get(
+                "validation_loss",
+                np.full(len(history["loss"]), np.nan, dtype=np.float32),
+            ),
+            "expression_infomax_loss": history[
+                "expression_infomax_loss"
+            ],
+            "spatial_infomax_loss": history["spatial_infomax_loss"],
+            "consensus_loss": history["consensus_loss"],
+            "total_loss_ema": history["loss_ema"],
+            "mean_expression_gate": history["expression_gate_mean"],
+        }
+    )
+    summary_fields = {
+        "framework": "cell_aware_dmgi",
+        "training_mode_requested": requested_training_mode,
+        "training_mode": effective_training_mode,
+        "objective": "relation_specific_local_infomax",
+        "negative_semantics": "corrupted_features_not_real_nodes",
+        "n_nodes": int(adata2.n_obs),
+        "n_features": int(features.shape[1]),
+        "embedding_dim": int(consensus.shape[1]),
+        "epochs_requested": int(
+            effective_module8_config.get("dgi_epochs", 100)
+        ),
+        "epochs_run": int(metrics["epochs_run"]),
+        "best_epoch": int(metrics["best_epoch"]),
+        "early_stopped": bool(metrics["early_stopped"]),
+        "device": str(runtime["device"]),
+        "device_requested": str(runtime["device_requested"]),
+        "cuda_device_name": str(runtime["cuda_device_name"]),
+        "cpu_threads": int(runtime["cpu_threads"]),
+        "sparse_layout": str(runtime["sparse_layout"]),
+        "sparse_index_dtype": str(runtime["sparse_index_dtype"]),
+        "fused_corruption_pass": bool(
+            runtime["fused_corruption_pass"]
+        ),
+        "tf32_enabled": bool(runtime["tf32_enabled"]),
+        "expression_edges_nnz": int(runtime["expression_edges_nnz"]),
+        "spatial_edges_nnz": int(runtime["spatial_edges_nnz"]),
+        "corruption_group_count": int(runtime["corruption_group_count"]),
+        "final_expression_gate_mean": float(
+            metrics["final_expression_gate_mean"]
+        ),
+        "final_expression_gate_std": float(
+            metrics["final_expression_gate_std"]
+        ),
+        "final_relation_cosine": float(metrics["final_relation_cosine"]),
+        "final_expression_context_cosine": float(
+            metrics["final_expression_context_cosine"]
+        ),
+        "final_spatial_context_cosine": float(
+            metrics["final_spatial_context_cosine"]
+        ),
+    }
+    try:
+        _save_dataframe(
+            training_history,
+            out_dir or os.getcwd(),
+            "module8_ca_dmgi_training_history",
+            diagnostic=True,
+        )
+        _save_dataframe(
+            pd.DataFrame([summary_fields]),
+            out_dir or os.getcwd(),
+            "module8_ca_dmgi_summary",
+            diagnostic=True,
+        )
+    except Exception as exc:
+        _logging.getLogger("cellscope").warning(
+            "CA-DMGI training audit tables skipped: %s",
+            exc,
+        )
+
+    try:
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4.4))
+        epochs_axis = np.arange(1, len(history["loss"]) + 1)
+        axes[0].plot(
+            epochs_axis,
+            history["expression_infomax_loss"],
+            label="Expression-relation Infomax",
+        )
+        axes[0].plot(
+            epochs_axis,
+            history["spatial_infomax_loss"],
+            label="Within-cell spatial Infomax",
+        )
+        axes[0].plot(
+            epochs_axis,
+            history["loss_ema"],
+            linestyle="--",
+            label="Total loss EMA",
+        )
+        axes[0].set_xlabel("Epoch")
+        axes[0].set_ylabel("Loss")
+        axes[0].set_title("Relation-specific training objectives")
+        axes[0].legend(frameon=False)
+        axes[1].plot(
+            epochs_axis,
+            history["expression_gate_mean"],
+            color="#4C78A8",
+        )
+        axes[1].axhline(0.5, color="#999999", linestyle="--")
+        axes[1].set_ylim(0.0, 1.0)
+        axes[1].set_xlabel("Epoch")
+        axes[1].set_ylabel("Mean expression-relation gate")
+        axes[1].set_title("Learned multiplex consensus gate")
+        fig.suptitle(
+            "Cell-Aware Deep Multiplex Graph Infomax (CA-DMGI) training",
+            fontweight="bold",
+        )
+        fig.tight_layout()
+        _save_fig(
+            fig,
+            out_dir or os.getcwd(),
+            "module8_ca_dmgi_training",
+        )
+        plt.close(fig)
+    except Exception as exc:
+        _logging.getLogger("cellscope").warning(
+            "CA-DMGI training plot skipped: %s", exc
+        )
+    return adata1, adata2
+
+
+def run_module8_dgi(
+    adata1: ad.AnnData,
+    adata2: ad.AnnData,
+    show_internal_progress: bool = False,
+    dgi_epochs: int = 100,
+    enable_dgi_sage: bool = False,
+    out_dir: Optional[str] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
+    *,
+    graph_key: str = "A_norm",
+    feature_keys: Optional[Sequence[str]] = None,
+    output_key: str = "X_dgi_gcn",
+    sage_output_key: str = "X_dgi_sage",
+    broadcast_to_adata1: bool = True,
+    compatibility_alias: bool = False,
+) -> Tuple[ad.AnnData, ad.AnnData]:
     import numpy as np
     import torch
+    if feature_keys is None:
+        feature_keys = ("X_expr_scaled", "X_geom_scaled")
+
+    # Load DGI hyperparameters from config. The residual encoder separates
+    # representation depth from graph-propagation depth: two message-passing
+    # layers remain the default, while input/output projections provide the
+    # additional nonlinear capacity without forcing a wider graph receptive
+    # field.
+    dgi_encoder = "residual"
+    dgi_layers = 2
+    dgi_hidden = 64
+    dgi_out = 32
+    dgi_dropout = 0.1
+    dgi_residual_alpha = 0.1
+    dgi_layer_norm = True
+    dgi_framework = "standard_dgi"
+    dgi_corruption_mode = "auto"
+    dgi_local_loss_weight = 0.2
+    dgi_local_temperature = 0.2
+    dgi_local_samples = 65536
+    dgi_local_graph_key = "auto"
+    dgi_cpu_backend = "auto"
+    dgi_lr = 1e-3
+    dgi_wd = 1e-4
+    dgi_clip = 1.0
+    dgi_device_requested = "auto"
+    dgi_cpu_threads = 0
+    dgi_tf32 = True
+    dgi_amp_requested = True
+    dgi_seed = 42
+    _m8: Mapping[str, Any] = {}
+    try:
+        _cfg = load_params_yaml() or {}
+        _m8 = _cfg.get('module8', {}) if _cfg else {}
+        if not isinstance(_m8, Mapping):
+            raise TypeError("module8 must be a mapping")
+        dgi_epochs = int(_m8.get('dgi_epochs', dgi_epochs))
+        enable_dgi_sage = bool(_m8.get('enable_dgi_sage', enable_dgi_sage))
+        dgi_encoder = str(_m8.get("dgi_encoder", dgi_encoder)).strip().lower()
+        dgi_layers = int(_m8.get("dgi_layers", dgi_layers))
+        dgi_hidden = int(_m8.get('dgi_hidden', dgi_hidden))
+        dgi_out = int(_m8.get('dgi_out', dgi_out))
+        dgi_dropout = float(_m8.get("dgi_dropout", dgi_dropout))
+        dgi_residual_alpha = float(
+            _m8.get("dgi_residual_alpha", dgi_residual_alpha)
+        )
+        dgi_layer_norm = bool(_m8.get("dgi_layer_norm", dgi_layer_norm))
+        dgi_framework = str(
+            _m8.get("dgi_framework", dgi_framework)
+        ).strip().lower()
+        dgi_corruption_mode = str(
+            _m8.get("dgi_corruption_mode", dgi_corruption_mode)
+        ).strip().lower()
+        dgi_local_loss_weight = float(
+            _m8.get("dgi_local_loss_weight", dgi_local_loss_weight)
+        )
+        dgi_local_temperature = float(
+            _m8.get("dgi_local_temperature", dgi_local_temperature)
+        )
+        dgi_local_samples = int(
+            _m8.get("dgi_local_samples", dgi_local_samples)
+        )
+        dgi_local_graph_key = str(
+            _m8.get("dgi_local_graph_key", dgi_local_graph_key)
+        ).strip()
+        dgi_cpu_backend = str(
+            _m8.get("dgi_cpu_backend", dgi_cpu_backend)
+        ).strip().lower()
+        dgi_lr = float(_m8.get('dgi_lr', dgi_lr))
+        dgi_wd = float(_m8.get('dgi_weight_decay', dgi_wd))
+        dgi_clip = float(_m8.get('dgi_clip_grad', dgi_clip))
+        dgi_device_requested = str(
+            _m8.get("dgi_device", dgi_device_requested)
+        ).strip().lower()
+        dgi_cpu_threads = int(
+            _m8.get("dgi_cpu_threads", dgi_cpu_threads)
+        )
+        dgi_tf32 = bool(_m8.get("dgi_tf32", dgi_tf32))
+        dgi_amp_requested = bool(_m8.get('amp', dgi_amp_requested))
+        dgi_seed = int(_m8.get("random_seed", dgi_seed))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid module8 DGI configuration: {exc}") from exc
+
+    encoder_aliases = {
+        "plain": "plain",
+        "gcn": "plain",
+        "residual": "residual",
+        "residual_gcn": "residual",
+        "residual-gcn": "residual",
+    }
+    if dgi_encoder not in encoder_aliases:
+        raise ValueError(
+            "module8.dgi_encoder must be one of "
+            "{'plain', 'residual'}, "
+            f"got {dgi_encoder!r}"
+        )
+    dgi_encoder = encoder_aliases[dgi_encoder]
+    framework_aliases = {
+        "standard_dgi": "standard_dgi",
+        "standard-dgi": "standard_dgi",
+        "dgi": "standard_dgi",
+        "cell_aware_dmgi": "cell_aware_dmgi",
+        "cell-aware-dmgi": "cell_aware_dmgi",
+        "ca_dmgi": "cell_aware_dmgi",
+        "ca-dmgi": "cell_aware_dmgi",
+        "ch_dmgi": "cell_aware_dmgi",  # legacy compatibility only
+        "ch-dmgi": "cell_aware_dmgi",  # legacy compatibility only
+        "dmgi": "cell_aware_dmgi",
+    }
+    if dgi_framework not in framework_aliases:
+        raise ValueError(
+            "module8.dgi_framework must be one of "
+            "{'standard_dgi', 'cell_aware_dmgi'}"
+        )
+    dgi_framework = framework_aliases[dgi_framework]
+    corruption_aliases = {
+        "auto": "auto",
+        "global": "global",
+        "global_shuffle": "global",
+        "global-shuffle": "global",
+        "same_cell": "same_cell",
+        "same-cell": "same_cell",
+        "within_cell": "same_cell",
+        "within-cell": "same_cell",
+    }
+    if dgi_corruption_mode not in corruption_aliases:
+        raise ValueError(
+            "module8.dgi_corruption_mode must be one of "
+            "{'auto', 'global', 'same_cell'}, "
+            f"got {dgi_corruption_mode!r}"
+        )
+    dgi_corruption_mode = corruption_aliases[dgi_corruption_mode]
+    if dgi_epochs < 1:
+        raise ValueError("module8.dgi_epochs must be >= 1")
+    if dgi_layers < 1:
+        raise ValueError("module8.dgi_layers must be >= 1")
+    if dgi_hidden < 1 or dgi_out < 1:
+        raise ValueError("module8.dgi_hidden and module8.dgi_out must be >= 1")
+    if not 0.0 <= dgi_dropout < 1.0:
+        raise ValueError("module8.dgi_dropout must be in [0, 1)")
+    if not 0.0 <= dgi_residual_alpha <= 1.0:
+        raise ValueError("module8.dgi_residual_alpha must be in [0, 1]")
+    if dgi_lr <= 0.0 or dgi_wd < 0.0:
+        raise ValueError(
+            "module8.dgi_lr must be > 0 and dgi_weight_decay must be >= 0"
+        )
+    if dgi_clip is not None and dgi_clip <= 0.0:
+        raise ValueError("module8.dgi_clip_grad must be > 0")
+    if dgi_cpu_threads < 0:
+        raise ValueError("module8.dgi_cpu_threads must be >= 0")
+    if dgi_local_loss_weight < 0.0:
+        raise ValueError("module8.dgi_local_loss_weight must be >= 0")
+    if dgi_local_temperature <= 0.0:
+        raise ValueError("module8.dgi_local_temperature must be > 0")
+    if dgi_local_samples < 0:
+        raise ValueError("module8.dgi_local_samples must be >= 0")
+    if not dgi_local_graph_key:
+        raise ValueError("module8.dgi_local_graph_key must not be empty")
+    cpu_backend_aliases = {
+        "auto": "auto",
+        "pyg": "pyg",
+        "coo": "pyg",
+        "torch_csr": "torch_csr",
+        "torch-csr": "torch_csr",
+        "csr": "torch_csr",
+    }
+    if dgi_cpu_backend not in cpu_backend_aliases:
+        raise ValueError(
+            "module8.dgi_cpu_backend must be one of "
+            "{'auto', 'pyg', 'torch_csr'}"
+        )
+    dgi_cpu_backend = cpu_backend_aliases[dgi_cpu_backend]
+    if dgi_framework == "cell_aware_dmgi":
+        effective_dmgi_config = {
+            **dict(_m8),
+            "dgi_framework": dgi_framework,
+            "dgi_epochs": int(dgi_epochs),
+            "dgi_encoder": dgi_encoder,
+            "dgi_layers": int(dgi_layers),
+            "dgi_hidden": int(dgi_hidden),
+            "dgi_out": int(dgi_out),
+            "dgi_dropout": float(dgi_dropout),
+            "dgi_residual_alpha": float(dgi_residual_alpha),
+            "dgi_layer_norm": bool(dgi_layer_norm),
+            "dgi_lr": float(dgi_lr),
+            "dgi_weight_decay": float(dgi_wd),
+            "dgi_clip_grad": float(dgi_clip),
+            "random_seed": int(dgi_seed),
+        }
+        return _run_module8_cell_aware_dmgi(
+            adata1,
+            adata2,
+            module8_config=effective_dmgi_config,
+            feature_keys=tuple(str(key) for key in feature_keys),
+            output_key=output_key,
+            compatibility_alias=compatibility_alias,
+            broadcast_to_adata1=broadcast_to_adata1,
+            out_dir=out_dir,
+            progress_callback=progress_callback,
+            show_internal_progress=show_internal_progress,
+        )
+
+    # Standard DGI uses the fused graph. Delay this comparatively expensive
+    # PyG conversion and feature copy until after the CA-DMGI early return;
+    # CA-DMGI consumes its two native sparse relation graphs directly.
+    from .multiplex_dgi import resolve_dgi_device
     import torch.nn as nn
     import torch.nn.functional as F
     from torch_geometric.nn import GCNConv, SAGEConv
     from torch_geometric.nn.models import DeepGraphInfomax
     from torch_geometric.utils import from_scipy_sparse_matrix
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    A_norm = adata2.obsp["A_norm"].tocsr()
+
+    device = resolve_dgi_device(torch, dgi_device_requested)
+    if device.type == "cpu":
+        available_cpus = (
+            len(os.sched_getaffinity(0))
+            if hasattr(os, "sched_getaffinity")
+            else int(os.cpu_count() or 1)
+        )
+        torch.set_num_threads(
+            dgi_cpu_threads
+            if dgi_cpu_threads > 0
+            else min(32, max(1, available_cpus))
+        )
+    elif hasattr(torch.backends, "cuda"):
+        torch.backends.cuda.matmul.allow_tf32 = dgi_tf32
+    dgi_amp = dgi_amp_requested and device.type == "cuda"
+    if graph_key not in adata2.obsp:
+        raise KeyError(f"Missing DGI graph adata.obsp[{graph_key!r}]")
+    A_norm = adata2.obsp[graph_key].tocsr()
     edge_index, edge_weight = from_scipy_sparse_matrix(A_norm)
-    edge_weight = torch.clamp(torch.nan_to_num(edge_weight, nan=0.0, posinf=0.0, neginf=0.0), min=1e-8)
-    X_all = np.concatenate([adata2.obsm["X_expr_scaled"], adata2.obsm["X_geom_scaled"]], axis=1).astype(np.float32)
-    x = torch.from_numpy(np.nan_to_num(X_all, nan=0.0)).to(torch.float32).to(device)
+    edge_weight = torch.clamp(
+        torch.nan_to_num(
+            edge_weight, nan=0.0, posinf=0.0, neginf=0.0
+        ),
+        min=1e-8,
+    )
+    missing_features = [
+        key for key in feature_keys if key not in adata2.obsm
+    ]
+    if missing_features:
+        raise KeyError(f"Missing DGI node features: {missing_features}")
+    feature_arrays = [
+        np.asarray(adata2.obsm[key], dtype=np.float32)
+        for key in feature_keys
+    ]
+    if any(array.shape[0] != adata2.n_obs for array in feature_arrays):
+        raise ValueError("DGI node features are not aligned to observations")
+    X_all = np.concatenate(feature_arrays, axis=1).astype(np.float32)
+    x = torch.from_numpy(np.nan_to_num(X_all, nan=0.0)).to(
+        dtype=torch.float32,
+        device=device,
+    )
     x = F.normalize(x, p=2, dim=1)
     ei = edge_index.to(device, non_blocking=True)
     ew = edge_weight.to(device, non_blocking=True).to(torch.float32)
+    effective_gcn_backend = (
+        "torch_csr"
+        if device.type == "cpu" and dgi_cpu_backend in {"auto", "torch_csr"}
+        else "pyg"
+    )
+    np.random.seed(dgi_seed)
+    torch.manual_seed(dgi_seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(dgi_seed)
 
-    # Load DGI hyperparameters from config (with safe defaults)
-    dgi_hidden = 64
-    dgi_out = 32
-    dgi_lr = 1e-3
-    dgi_wd = 1e-4
-    dgi_clip = 1.0
-    dgi_amp = (device.type == "cuda")
-    try:
-        _cfg = load_params_yaml()
-        _m8 = _cfg.get('module8', {}) if _cfg else {}
-        dgi_epochs = int(_m8.get('dgi_epochs', dgi_epochs))
-        enable_dgi_sage = bool(_m8.get('enable_dgi_sage', enable_dgi_sage))
-        dgi_hidden = int(_m8.get('dgi_hidden', dgi_hidden))
-        dgi_out = int(_m8.get('dgi_out', dgi_out))
-        dgi_lr = float(_m8.get('dgi_lr', dgi_lr))
-        dgi_wd = float(_m8.get('dgi_weight_decay', dgi_wd))
-        dgi_clip = float(_m8.get('dgi_clip_grad', dgi_clip))
-        dgi_amp = bool(_m8.get('amp', dgi_amp))
-    except Exception:
-        pass
+    cell_group_key = "cell_id"
+    has_cell_groups = cell_group_key in adata2.obs.columns
+    if dgi_corruption_mode == "auto":
+        effective_corruption_mode = (
+            "same_cell"
+            if not broadcast_to_adata1 and has_cell_groups
+            else "global"
+        )
+    else:
+        effective_corruption_mode = dgi_corruption_mode
+    if effective_corruption_mode == "same_cell" and not has_cell_groups:
+        raise ValueError(
+            "module8.dgi_corruption_mode='same_cell' requires "
+            "adata.obs['cell_id'] aligned to DGI graph nodes"
+        )
+
+    corruption_plan = None
+    corruption_tensors = None
+    if effective_corruption_mode == "same_cell":
+        corruption_plan = _build_groupwise_corruption_plan(
+            adata2.obs[cell_group_key].to_numpy()
+        )
+        corruption_tensors = {
+            key: torch.as_tensor(
+                corruption_plan[key], dtype=torch.long, device=device
+            )
+            for key in ("codes", "order", "position", "starts", "sizes")
+        }
+
+    effective_local_graph_key = ""
+    local_pair_arrays = (
+        np.empty(0, dtype=np.int64),
+        np.empty(0, dtype=np.int64),
+        np.empty(0, dtype=np.int64),
+    )
+    if dgi_local_loss_weight > 0.0 and dgi_local_samples > 0:
+        if dgi_local_graph_key.lower() == "auto":
+            effective_local_graph_key = (
+                "metaspot_spatial_connectivities"
+                if "metaspot_spatial_connectivities" in adata2.obsp
+                else graph_key
+            )
+        else:
+            effective_local_graph_key = dgi_local_graph_key
+        if effective_local_graph_key not in adata2.obsp:
+            raise KeyError(
+                "Missing local DGI graph "
+                f"adata.obsp[{effective_local_graph_key!r}]"
+            )
+        local_groups = (
+            adata2.obs[cell_group_key].to_numpy()
+            if has_cell_groups
+            else None
+        )
+        local_pair_arrays = _sample_local_contrastive_pairs(
+            adata2.obsp[effective_local_graph_key],
+            local_groups,
+            n_samples=dgi_local_samples,
+            seed=dgi_seed + 17,
+        )
+    local_pair_tensors = tuple(
+        torch.as_tensor(values, dtype=torch.long, device=device)
+        for values in local_pair_arrays
+    )
+
+    cpu_gcn_adjacency = None
+    if effective_gcn_backend == "torch_csr":
+        # GCNConv with ``normalize=False`` computes A^T @ (XW) under PyG's
+        # source-to-target edge convention.  The graph is already normalized,
+        # so a single CSR SpMM is mathematically equivalent and substantially
+        # faster than COO scatter on CPU for million-edge MetaSpot graphs.
+        cpu_graph = A_norm.transpose().tocsr().astype(
+            np.float32,
+            copy=True,
+        )
+        cpu_graph.data = np.clip(
+            np.nan_to_num(
+                cpu_graph.data,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ),
+            1e-8,
+            None,
+        )
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Sparse CSR tensor support is in beta state.*",
+                category=UserWarning,
+            )
+            cpu_gcn_adjacency = torch.sparse_csr_tensor(
+                torch.from_numpy(cpu_graph.indptr.astype(np.int64, copy=False)),
+                torch.from_numpy(cpu_graph.indices.astype(np.int64, copy=False)),
+                torch.from_numpy(cpu_graph.data),
+                size=cpu_graph.shape,
+                dtype=torch.float32,
+                device=device,
+            )
+        _logging.getLogger("cellscope").info(
+            "Module 8 CPU GCN backend | requested=%s | effective=%s | "
+            "nodes=%d | edges=%d",
+            dgi_cpu_backend,
+            effective_gcn_backend,
+            int(A_norm.shape[0]),
+            int(A_norm.nnz),
+        )
+
+    class _TorchCSRGCNConv(nn.Module):
+        """GCN linear transform plus pre-normalized CSR aggregation."""
+
+        def __init__(self, input_dim: int, output_dim: int):
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty(output_dim, input_dim))
+            self.bias = nn.Parameter(torch.empty(output_dim))
+            # ``GCNConv`` constructs and initializes its internal Linear once,
+            # then calls ``GCNConv.reset_parameters`` and initializes it a
+            # second time. Mirror that RNG consumption so the optimized CSR
+            # backend preserves seeded initialization as well as graph math.
+            self.reset_parameters()
+            self.reset_parameters()
+
+        def reset_parameters(self):
+            nn.init.xavier_uniform_(self.weight)
+            nn.init.zeros_(self.bias)
+
+        def forward(self, values, edge_index=None, edge_weight=None):
+            if cpu_gcn_adjacency is None:
+                raise RuntimeError("CPU CSR GCN adjacency is unavailable")
+            transformed = F.linear(values, self.weight, bias=None)
+            return torch.sparse.mm(
+                cpu_gcn_adjacency,
+                transformed,
+            ) + self.bias
 
     class Encoder(nn.Module):
-        def __init__(self, in_channels, hidden=64, out_channels=32, conv_type="gcn", dropout=0.0):
+        """Configurable plain or initial-residual graph encoder for DGI."""
+
+        def __init__(
+            self,
+            in_channels,
+            hidden=64,
+            out_channels=32,
+            conv_type="gcn",
+            architecture="residual",
+            num_layers=2,
+            dropout=0.1,
+            residual_alpha=0.1,
+            layer_norm=True,
+        ):
             super().__init__()
             Conv = {"gcn": GCNConv, "sage": SAGEConv}[conv_type]
-            if conv_type == "gcn":
-                self.conv1 = Conv(in_channels, hidden, normalize=False, improved=True, add_self_loops=False)
-                self.conv2 = Conv(hidden, out_channels, normalize=False, improved=True, add_self_loops=False)
+            self.architecture = str(architecture)
+            self.num_layers = int(num_layers)
+            self.conv_type = conv_type
+            self.residual_alpha = float(residual_alpha)
+            self.drop = nn.Dropout(float(dropout))
+
+            def make_conv(input_dim, output_dim):
+                if conv_type == "gcn":
+                    if effective_gcn_backend == "torch_csr":
+                        return _TorchCSRGCNConv(input_dim, output_dim)
+                    return Conv(
+                        input_dim,
+                        output_dim,
+                        normalize=False,
+                        improved=True,
+                        add_self_loops=False,
+                    )
+                return Conv(input_dim, output_dim)
+
+            if self.architecture == "plain":
+                dimensions = (
+                    [int(in_channels)]
+                    + [int(hidden)] * max(0, self.num_layers - 1)
+                    + [int(out_channels)]
+                )
+                self.convs = nn.ModuleList(
+                    make_conv(dimensions[index], dimensions[index + 1])
+                    for index in range(self.num_layers)
+                )
+                self.activations = nn.ModuleList(
+                    nn.PReLU() for _ in range(max(0, self.num_layers - 1))
+                )
+                self.input_projection = None
+                self.output_projection = None
+                self.norms = nn.ModuleList()
+                self.input_activation = None
             else:
-                self.conv1 = Conv(in_channels, hidden)
-                self.conv2 = Conv(hidden, out_channels)
-            self.act = nn.PReLU(); self.drop = nn.Dropout(dropout); self.conv_type = conv_type
-        def forward(self, x, edge_index, edge_weight=None):
+                self.input_projection = nn.Linear(in_channels, hidden)
+                self.input_activation = nn.PReLU()
+                self.convs = nn.ModuleList(
+                    make_conv(hidden, hidden) for _ in range(self.num_layers)
+                )
+                self.activations = nn.ModuleList(
+                    nn.PReLU() for _ in range(self.num_layers)
+                )
+                self.norms = nn.ModuleList(
+                    nn.LayerNorm(hidden) if layer_norm else nn.Identity()
+                    for _ in range(self.num_layers)
+                )
+                self.output_projection = nn.Linear(hidden, out_channels)
+
+        def _convolve(self, conv, values, edge_index, edge_weight):
             if self.conv_type == "gcn":
-                x = self.conv1(x, edge_index, edge_weight=edge_weight); x = self.act(x); x = self.drop(x); x = self.conv2(x, edge_index, edge_weight=edge_weight)
-            else:
-                x = self.conv1(x, edge_index); x = self.act(x); x = self.drop(x); x = self.conv2(x, edge_index)
-            return x
+                return conv(values, edge_index, edge_weight=edge_weight)
+            return conv(values, edge_index)
+
+        def forward(self, x, edge_index, edge_weight=None):
+            if self.architecture == "plain":
+                values = x
+                for layer_index, conv in enumerate(self.convs):
+                    values = self._convolve(
+                        conv,
+                        values,
+                        edge_index,
+                        edge_weight,
+                    )
+                    if layer_index < self.num_layers - 1:
+                        values = self.activations[layer_index](values)
+                        values = self.drop(values)
+                return values
+
+            initial = self.input_activation(self.input_projection(x))
+            values = self.drop(initial)
+            for layer_index, conv in enumerate(self.convs):
+                previous = values
+                message = self._convolve(
+                    conv,
+                    values,
+                    edge_index,
+                    edge_weight,
+                )
+                message = self.activations[layer_index](message)
+                message = self.drop(message)
+                message = (
+                    (1.0 - self.residual_alpha) * message
+                    + self.residual_alpha * initial
+                )
+                values = self.norms[layer_index](previous + message)
+            return self.output_projection(values)
+
         @torch.no_grad()
         def get_embeddings(self, x, edge_index, edge_weight=None):
-            self.eval(); return self.forward(x, edge_index, edge_weight)
+            self.eval()
+            return self.forward(x, edge_index, edge_weight)
 
     def build_dgi(conv_type="gcn", hidden=dgi_hidden, out_channels=dgi_out):
-        enc = Encoder(in_channels=x.size(-1), hidden=hidden, out_channels=out_channels, conv_type=conv_type, dropout=0.0).to(device)
+        enc = Encoder(
+            in_channels=x.size(-1),
+            hidden=hidden,
+            out_channels=out_channels,
+            conv_type=conv_type,
+            architecture=dgi_encoder,
+            num_layers=dgi_layers,
+            dropout=dgi_dropout,
+            residual_alpha=dgi_residual_alpha,
+            layer_norm=dgi_layer_norm,
+        ).to(device)
         def corruption(x_in, edge_index, edge_weight=None):
-            perm = torch.randperm(x_in.size(0), device=x_in.device); x_cor = x_in[perm]; return x_cor, edge_index, edge_weight
+            if effective_corruption_mode == "global":
+                permutation = torch.randperm(
+                    x_in.size(0), device=x_in.device
+                )
+            else:
+                assert corruption_tensors is not None
+                codes = corruption_tensors["codes"]
+                order = corruption_tensors["order"]
+                position = corruption_tensors["position"]
+                starts = corruption_tensors["starts"]
+                sizes = corruption_tensors["sizes"]
+                shifts = torch.zeros_like(sizes)
+                nonsingleton = sizes > 1
+                shifts[nonsingleton] = (
+                    torch.floor(
+                        torch.rand(
+                            int(nonsingleton.sum().item()),
+                            device=x_in.device,
+                        )
+                        * (sizes[nonsingleton] - 1).to(torch.float32)
+                    ).to(torch.long)
+                    + 1
+                )
+                within_position = position - starts[codes]
+                corrupted_position = (
+                    starts[codes]
+                    + (within_position + shifts[codes]) % sizes[codes]
+                )
+                permutation = order[corrupted_position]
+            return x_in[permutation], edge_index, edge_weight
         model = DeepGraphInfomax(hidden_channels=out_channels, encoder=enc, summary=lambda z, *args, **kwargs: torch.sigmoid(z.mean(dim=0)), corruption=corruption).to(device)
         return model, enc
 
@@ -3131,8 +6733,33 @@ def run_module8_dgi(adata1: ad.AnnData, adata2: ad.AnnData, show_internal_progre
                 pass
         scaler = _make_scaler(use_amp)
         model.train()
-        losses_hist, ema_hist = [], []
+        losses_hist, dgi_losses_hist, local_losses_hist, ema_hist = [], [], [], []
         ema = None
+        local_source, local_positive, local_negative = local_pair_tensors
+
+        def _objective():
+            pos_z, neg_z, summary = model(x, ei, ew)
+            dgi_loss = model.loss(pos_z, neg_z, summary)
+            if (
+                dgi_local_loss_weight > 0.0
+                and local_source.numel() > 0
+            ):
+                normalized = F.normalize(pos_z, p=2, dim=1)
+                positive_similarity = (
+                    normalized[local_source]
+                    * normalized[local_positive]
+                ).sum(dim=1) / dgi_local_temperature
+                negative_similarity = (
+                    normalized[local_source]
+                    * normalized[local_negative]
+                ).sum(dim=1) / dgi_local_temperature
+                local_loss = F.softplus(
+                    negative_similarity - positive_similarity
+                ).mean()
+            else:
+                local_loss = pos_z.sum() * 0.0
+            total_loss = dgi_loss + dgi_local_loss_weight * local_loss
+            return total_loss, dgi_loss, local_loss
         # Progress bar per-epoch when internal progress enabled
         _m8_console = None; _m8_prog = None; _m8_task = None
         if show_internal_progress:
@@ -3155,7 +6782,7 @@ def run_module8_dgi(adata1: ad.AnnData, adata2: ad.AnnData, show_internal_progre
                 except Exception:
                     ctx = torch.cuda.amp.autocast(dtype=torch.float16)
                 with ctx:
-                    pos_z, neg_z, summary = model(x, ei, ew); loss = model.loss(pos_z, neg_z, summary)
+                    loss, dgi_loss_value, local_loss_value = _objective()
                 try:
                     scaler.scale(loss).backward(); scaler.unscale_(opt)
                 except Exception:
@@ -3166,7 +6793,7 @@ def run_module8_dgi(adata1: ad.AnnData, adata2: ad.AnnData, show_internal_progre
                 except Exception:
                     opt.step()
             else:
-                pos_z, neg_z, summary = model(x, ei, ew); loss = model.loss(pos_z, neg_z, summary)
+                loss, dgi_loss_value, local_loss_value = _objective()
                 loss.backward();
                 if clip_grad is not None: nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_grad)
                 opt.step()
@@ -3178,6 +6805,8 @@ def run_module8_dgi(adata1: ad.AnnData, adata2: ad.AnnData, show_internal_progre
             # record history
             l = float(loss)
             losses_hist.append(l)
+            dgi_losses_hist.append(float(dgi_loss_value))
+            local_losses_hist.append(float(local_loss_value))
             ema = l if ema is None else (0.9 * ema + 0.1 * l)
             ema_hist.append(ema)
         # save training curves
@@ -3185,7 +6814,14 @@ def run_module8_dgi(adata1: ad.AnnData, adata2: ad.AnnData, show_internal_progre
             import matplotlib.pyplot as plt
             import numpy as _np
             fig = plt.figure(figsize=(7,4))
-            plt.plot(_np.array(losses_hist), label=f"{tag}-loss", linewidth=1.0)
+            plt.plot(_np.array(losses_hist), label=f"{tag}-total", linewidth=1.2)
+            plt.plot(_np.array(dgi_losses_hist), label=f"{tag}-DGI", linewidth=1.0)
+            if dgi_local_loss_weight > 0.0 and local_source.numel() > 0:
+                plt.plot(
+                    dgi_local_loss_weight * _np.array(local_losses_hist),
+                    label=f"{tag}-weighted-local",
+                    linewidth=1.0,
+                )
             plt.plot(_np.array(ema_hist), label=f"{tag}-ema", linewidth=1.5, linestyle="--")
             plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.title("DGI Training Curves"); plt.legend(frameon=False); plt.tight_layout()
             _save_fig(fig, out_dir or os.getcwd(), f"module8_dgi_{tag}_curves")
@@ -3197,7 +6833,13 @@ def run_module8_dgi(adata1: ad.AnnData, adata2: ad.AnnData, show_internal_progre
                 _m8_prog.stop()
         except Exception:
             pass
-        return model
+        history = {
+            "loss": np.asarray(losses_hist, dtype=np.float32),
+            "dgi_loss": np.asarray(dgi_losses_hist, dtype=np.float32),
+            "local_loss": np.asarray(local_losses_hist, dtype=np.float32),
+            "loss_ema": np.asarray(ema_hist, dtype=np.float32),
+        }
+        return model, history
 
     @torch.no_grad()
     def get_embeddings(encoder):
@@ -3223,7 +6865,11 @@ def run_module8_dgi(adata1: ad.AnnData, adata2: ad.AnnData, show_internal_progre
     # Train GCN
     t0 = _step_start("Build + train DGI (GCN)")
     dgi_gcn, enc_gcn = build_dgi(conv_type="gcn", hidden=dgi_hidden, out_channels=dgi_out)
-    dgi_gcn = train_dgi(dgi_gcn, epochs=dgi_epochs, tag="GCN")
+    dgi_gcn, gcn_history = train_dgi(
+        dgi_gcn,
+        epochs=dgi_epochs,
+        tag="GCN",
+    )
     Z_gcn = get_embeddings(enc_gcn)
     _step_done("Build + train DGI (GCN)", t0)
     del dgi_gcn, enc_gcn
@@ -3234,7 +6880,11 @@ def run_module8_dgi(adata1: ad.AnnData, adata2: ad.AnnData, show_internal_progre
         try:
             t0 = _step_start("Build + train DGI (SAGE)")
             dgi_sage, enc_sage = build_dgi(conv_type="sage", hidden=dgi_hidden, out_channels=dgi_out)
-            dgi_sage = train_dgi(dgi_sage, epochs=dgi_epochs, tag="SAGE")
+            dgi_sage, _sage_history = train_dgi(
+                dgi_sage,
+                epochs=dgi_epochs,
+                tag="SAGE",
+            )
             Z_sage = get_embeddings(enc_sage)
             _step_done("Build + train DGI (SAGE)", t0)
             del dgi_sage, enc_sage
@@ -3242,24 +6892,156 @@ def run_module8_dgi(adata1: ad.AnnData, adata2: ad.AnnData, show_internal_progre
         except Exception:
             Z_sage = None
 
-    # Fill to adata2
-    t0 = _step_start("Attach embeddings to adata2 + broadcast to adata1")
-    adata2.obsm["X_dgi_gcn"] = Z_gcn
+    # Attach to the graph's native observation unit.
+    attach_label = (
+        "Attach native-unit embeddings"
+        if not broadcast_to_adata1
+        else "Attach embeddings to adata2 + broadcast to adata1"
+    )
+    t0 = _step_start(attach_label)
+    adata2.obsm[output_key] = Z_gcn
     if Z_sage is not None:
-        adata2.obsm["X_dgi_sage"] = Z_sage
-    # Map back to adata1 by cluster
-    clu_to_row = {clu: i for i, clu in enumerate(adata2.obs_names.astype(str))}
-    row_idx_adata1 = adata1.obs["meta-domain"].astype(str).map(clu_to_row).to_numpy()
-    def _broadcast(Z, row_index):
-        out = np.zeros((len(row_index), Z.shape[1]), dtype=np.float32)
-        mask = (row_index >= 0) & (row_index < Z.shape[0])
-        out[mask] = Z[row_index[mask]]
-        return out
-    adata1.obsm["X_dgi_gcn"] = _broadcast(Z_gcn, row_idx_adata1)
-    if Z_sage is not None:
-        adata1.obsm["X_dgi_sage"] = _broadcast(Z_sage, row_idx_adata1)
-    _step_done("Attach embeddings to adata2 + broadcast to adata1", t0)
+        adata2.obsm[sage_output_key] = Z_sage
+    if compatibility_alias and output_key != "X_dgi_gcn":
+        adata2.obsm["X_dgi_gcn"] = Z_gcn.copy()
+    if (
+        compatibility_alias
+        and Z_sage is not None
+        and sage_output_key != "X_dgi_sage"
+    ):
+        adata2.obsm["X_dgi_sage"] = Z_sage.copy()
+
+    local_positive_cosine = float("nan")
+    local_negative_cosine = float("nan")
+    local_cosine_margin = float("nan")
+    if local_pair_arrays[0].size > 0:
+        embedding_norm = np.linalg.norm(Z_gcn, axis=1, keepdims=True)
+        normalized_embedding = Z_gcn / np.maximum(embedding_norm, 1e-12)
+        local_source_np, local_positive_np, local_negative_np = (
+            local_pair_arrays
+        )
+        positive_cosines = np.sum(
+            normalized_embedding[local_source_np]
+            * normalized_embedding[local_positive_np],
+            axis=1,
+        )
+        negative_cosines = np.sum(
+            normalized_embedding[local_source_np]
+            * normalized_embedding[local_negative_np],
+            axis=1,
+        )
+        local_positive_cosine = float(np.mean(positive_cosines))
+        local_negative_cosine = float(np.mean(negative_cosines))
+        local_cosine_margin = float(
+            local_positive_cosine - local_negative_cosine
+        )
+
+    node_unit = "metaspot" if not broadcast_to_adata1 else "metadomain"
+    provenance = dict(adata2.uns.get("dgi_embeddings", {}))
+    provenance[output_key] = {
+        "schema_version": int(
+            METASPOT_DGI_SCHEMA_VERSION
+            if node_unit == "metaspot"
+            else 1
+        ),
+        "node_unit": node_unit,
+        "framework": "standard_dgi",
+        "objective": "global_dgi_plus_pairwise_local_ranking",
+        "node_id_checksum": _obs_names_checksum(adata2.obs_names),
+        "graph_key": graph_key,
+        "feature_keys": [str(key) for key in feature_keys],
+        "n_nodes": int(adata2.n_obs),
+        "n_features": int(X_all.shape[1]),
+        "embedding_dim": int(Z_gcn.shape[1]),
+        "encoder": str(dgi_encoder),
+        "message_passing_layers": int(dgi_layers),
+        "hidden_dim": int(dgi_hidden),
+        "dropout": float(dgi_dropout),
+        "residual_alpha": float(dgi_residual_alpha),
+        "layer_norm": bool(dgi_layer_norm),
+        "corruption_mode_requested": str(dgi_corruption_mode),
+        "corruption_mode_effective": str(effective_corruption_mode),
+        "corruption_group_key": (
+            cell_group_key
+            if effective_corruption_mode == "same_cell"
+            else ""
+        ),
+        "corruption_group_count": int(
+            len(corruption_plan["sizes"])
+            if corruption_plan is not None
+            else 0
+        ),
+        "corruption_singleton_group_count": int(
+            np.sum(corruption_plan["sizes"] == 1)
+            if corruption_plan is not None
+            else 0
+        ),
+        "local_graph_key": str(effective_local_graph_key),
+        "gcn_backend_requested": str(dgi_cpu_backend),
+        "gcn_backend_effective": str(effective_gcn_backend),
+        "local_loss_weight": float(dgi_local_loss_weight),
+        "local_temperature": float(dgi_local_temperature),
+        "local_samples_requested": int(dgi_local_samples),
+        "local_pairs_sampled": int(local_pair_arrays[0].size),
+        "final_local_positive_cosine": local_positive_cosine,
+        "final_local_negative_cosine": local_negative_cosine,
+        "final_local_cosine_margin": local_cosine_margin,
+        "epochs": int(dgi_epochs),
+        "learning_rate": float(dgi_lr),
+        "weight_decay": float(dgi_wd),
+        "gradient_clip": float(dgi_clip),
+        "amp": bool(dgi_amp),
+        "random_seed": int(dgi_seed),
+        "training_loss": gcn_history["loss"],
+        "training_dgi_loss": gcn_history["dgi_loss"],
+        "training_local_loss": gcn_history["local_loss"],
+        "training_loss_ema": gcn_history["loss_ema"],
+        "final_training_loss": float(gcn_history["loss"][-1]),
+        "final_dgi_loss": float(gcn_history["dgi_loss"][-1]),
+        "final_local_loss": float(gcn_history["local_loss"][-1]),
+        "compatibility_alias": (
+            "X_dgi_gcn"
+            if compatibility_alias and output_key != "X_dgi_gcn"
+            else ""
+        ),
+    }
+    adata2.uns["dgi_embeddings"] = provenance
+
+    if broadcast_to_adata1:
+        if "meta-domain" not in adata1.obs.columns:
+            raise KeyError(
+                "Legacy MetaDomain DGI broadcast requires "
+                "adata1.obs['meta-domain']"
+            )
+        clu_to_row = {
+            clu: i for i, clu in enumerate(adata2.obs_names.astype(str))
+        }
+        row_idx_adata1 = (
+            adata1.obs["meta-domain"].astype(str).map(clu_to_row).to_numpy()
+        )
+
+        def _broadcast(Z, row_index):
+            out = np.zeros((len(row_index), Z.shape[1]), dtype=np.float32)
+            mask = (row_index >= 0) & (row_index < Z.shape[0])
+            out[mask] = Z[row_index[mask]]
+            return out
+
+        adata1.obsm["X_dgi_gcn"] = _broadcast(Z_gcn, row_idx_adata1)
+        if Z_sage is not None:
+            adata1.obsm["X_dgi_sage"] = _broadcast(Z_sage, row_idx_adata1)
+    _step_done(attach_label, t0)
     return adata1, adata2
+
+
+def _graph_unit_from_config(config: Dict[str, Any]) -> str:
+    return dgi_unit_from_config(config)
+
+
+def _build_module_execution_order(config: Dict[str, Any]) -> List[str]:
+    """Return the dependency order for the selected graph observation unit."""
+    if _graph_unit_from_config(config) == "metaspot":
+        return ["m1", "m2", "m3", "m4", "m7", "m8", "m5", "m6"]
+    return ["m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8"]
 
 
 def build_anndata(spatial_df: pd.DataFrame,
@@ -3270,7 +7052,9 @@ def build_anndata(spatial_df: pd.DataFrame,
                   out_dir: Optional[str] = None,
                   scvi_epochs: int = 100,
                   dgi_epochs: int = 100,
-                  enable_dgi_sage: bool = False) -> Tuple[ad.AnnData, Optional[ad.AnnData], pd.DataFrame]:
+                  enable_dgi_sage: bool = False,
+                  fingerprint_context: Optional[Mapping[str, Any]] = None,
+                  ) -> Tuple[ad.AnnData, Optional[ad.AnnData], pd.DataFrame]:
     # Fine-grained resume within build_anndata
     if out_dir is None:
         out_dir = os.getcwd()
@@ -3279,14 +7063,34 @@ def build_anndata(spatial_df: pd.DataFrame,
         cfg = load_params_yaml()
     except Exception:
         cfg = {}
-    cur_mod_fps = fingerprint_modules_set(cfg)
+    cur_mod_fps = fingerprint_modules_set(
+        cfg,
+        context=fingerprint_context,
+    )
+    # Compact M3 membership is a semantic data artifact. Its reuse depends on
+    # the inputs and M1-M3 parameters/schema, not on unrelated source edits in
+    # later modules (the normal module fingerprints intentionally include the
+    # whole source-tree provenance).
+    membership_fingerprint_context = {
+        "inputs": (
+            fingerprint_context.get("inputs")
+            if isinstance(fingerprint_context, Mapping)
+            else None
+        )
+    }
+    membership_mod_fps = fingerprint_modules_set(
+        cfg,
+        context=membership_fingerprint_context,
+    )
     prev_mod_fps = state_prev.get("module_fingerprints") or {}
     # First full module run: state has no 'modules_completed' flag yet
     _first_run = not bool(state_prev.get("modules_completed"))
-    module_order = ['m1','m2','m3','m4','m5','m6','m7','m8']
-    # Determine earliest changed module among those with params (m1,m2,m3,m5,m6,m7,m8)
-    start_mod = 'm1'
-    for m in ['m1','m2','m3','m5','m6','m7','m8']:
+    graph_unit = _graph_unit_from_config(cfg)
+    module_order = _build_module_execution_order(cfg)
+    fingerprint_order = [m for m in module_order if m != "m4"]
+    # Determine the earliest changed module in the actual dependency order.
+    start_mod = fingerprint_order[0]
+    for m in fingerprint_order:
         if prev_mod_fps.get(m) != cur_mod_fps.get(m):
             start_mod = m
             break
@@ -3306,16 +7110,34 @@ def build_anndata(spatial_df: pd.DataFrame,
     # renumber MetaSpots, so loading any later cache would silently cross-wire
     # expression and geometry.
     _cache_chain_valid = True
+    _late_point_df_cache: Optional[pd.DataFrame] = None
+    if graph_unit == "metaspot" and _mod_lt("m4", start_mod):
+        _late_point_df_cache = _load_late_point_resume_checkpoint(
+            out_dir,
+            spatial_df,
+        )
+        if _late_point_df_cache is not None:
+            _logging.getLogger("cellscope").info(
+                "Resume: using aligned late point-table checkpoint "
+                "(module5_final_data) for Modules 1-3"
+            )
 
     # Use unique cell ids to avoid row-level list blow-up (can be hundreds of millions).
     sampled_cell_ids = pd.unique(spatial_df['cell_id'])
     # Read Module 1 geometry options
     _m1_include_dir = True
+    _m1_use_input_nucleus_flags = True
     _m1_winsor = (1, 99)
     try:
         _cfg = load_params_yaml()
         _m1 = _cfg.get('module1', {}) if _cfg else {}
         _m1_include_dir = bool(_m1.get('include_directional', _m1_include_dir))
+        _m1_use_input_nucleus_flags = bool(
+            _m1.get(
+                'use_input_nucleus_flags',
+                _m1_use_input_nucleus_flags,
+            )
+        )
         wl = _m1.get('winsor_perc_low', _m1_winsor[0]); wh = _m1.get('winsor_perc_high', _m1_winsor[1])
         _m1_winsor = (int(wl), int(wh))
     except Exception:
@@ -3334,6 +7156,8 @@ def build_anndata(spatial_df: pd.DataFrame,
             except Exception:
                 pass
             point_df = pd_cache
+        elif _late_point_df_cache is not None:
+            point_df = _late_point_df_cache
         else:
             if progress_callback: progress_callback("Module 1 · Geometry Features")
             point_df = build_point_geometry_v2(
@@ -3342,6 +7166,7 @@ def build_anndata(spatial_df: pd.DataFrame,
                 cell_boundaries_df=cell_df,
                 sampled_cells=sampled_cell_ids,
                 include_directional=_m1_include_dir,
+                use_input_nucleus_flags=_m1_use_input_nucleus_flags,
                 winsor_perc=_m1_winsor,
                 show_internal_progress=show_internal_progress,
             )
@@ -3355,6 +7180,7 @@ def build_anndata(spatial_df: pd.DataFrame,
             cell_boundaries_df=cell_df,
             sampled_cells=sampled_cell_ids,
             include_directional=_m1_include_dir,
+            use_input_nucleus_flags=_m1_use_input_nucleus_flags,
             winsor_perc=_m1_winsor,
             show_internal_progress=show_internal_progress,
         )
@@ -3395,6 +7221,8 @@ def build_anndata(spatial_df: pd.DataFrame,
     _m2_recomputed = False
     if _mod_lt('m2', start_mod) and _cache_chain_valid:
         pd_cache = _load_dataframe_checkpoint(_intermediate_dir(out_dir), "module2_point_df")
+        if pd_cache is None and _late_point_df_cache is not None:
+            pd_cache = _late_point_df_cache
         if pd_cache is not None:
             if progress_callback: progress_callback("Resume: load Module 2 cache")
             try:
@@ -3420,7 +7248,7 @@ def build_anndata(spatial_df: pd.DataFrame,
                     gmm_cols = _geom + composition_model.feature_names + ['local_density']
             except Exception:
                 composition_model = None
-            if composition_model is None:
+            if composition_model is None and _late_point_df_cache is None:
                 _, gmm_cols, rebuilt_model = build_composition_embeddings(
                     point_df,
                     _m2_source_df,
@@ -3500,6 +7328,7 @@ def build_anndata(spatial_df: pd.DataFrame,
     _m3_small_backend_cells = 12000
     _m3_sequential_cells = 256
     _m3_enforce_spatial_connectivity = False
+    _m3_partition_by_nucleus = False
     _m3_spatial_connectivity_k = 8
     _m3_spatial_radius_quantile = 0.9
     _m3_spatial_radius_factor = 1.5
@@ -3510,6 +7339,8 @@ def build_anndata(spatial_df: pd.DataFrame,
     _m3_target_sites_per_metaspot = None
     _m3_min_metaspots_per_cell = 1
     _m3_max_metaspots_per_cell = None
+    _m3_parallel_chunk_cells = None
+    _m3_parallel_n_jobs = None
     try:
         _cfg = load_params_yaml()
         _m3 = _cfg.get('module3', {}) if _cfg else {}
@@ -3545,6 +7376,10 @@ def build_anndata(spatial_df: pd.DataFrame,
             _m3_sequential_cells = int(_m3.get('sequential_cells'))
         if 'enforce_spatial_connectivity' in _m3:
             _m3_enforce_spatial_connectivity = bool(_m3.get('enforce_spatial_connectivity'))
+        if 'partition_by_nucleus' in _m3:
+            _m3_partition_by_nucleus = bool(
+                _m3.get('partition_by_nucleus')
+            )
         if isinstance(_m3.get('spatial_connectivity_k'), (int, float)):
             _m3_spatial_connectivity_k = int(_m3.get('spatial_connectivity_k'))
         if isinstance(_m3.get('spatial_radius_quantile'), (int, float)):
@@ -3566,56 +7401,36 @@ def build_anndata(spatial_df: pd.DataFrame,
             _m3_min_metaspots_per_cell = int(_m3.get('min_metaspots_per_cell'))
         if isinstance(_m3.get('max_metaspots_per_cell'), (int, float)):
             _m3_max_metaspots_per_cell = int(_m3.get('max_metaspots_per_cell'))
+        if isinstance(_m3.get('parallel_chunk_cells'), (int, float)):
+            _m3_parallel_chunk_cells = int(_m3.get('parallel_chunk_cells'))
+        if isinstance(_m3.get('parallel_n_jobs'), (int, float)):
+            _m3_parallel_n_jobs = int(_m3.get('parallel_n_jobs'))
     except Exception:
         pass
     import time as _time
     _t_m3 = _time.perf_counter()
     _m3_recomputed = False
+    _m3_compact_reused = False
+    pd_cache = None
     if _mod_lt('m3', start_mod) and _cache_chain_valid:
         pd_cache = _load_dataframe_checkpoint(_intermediate_dir(out_dir), "module3_point_df")
-        if pd_cache is not None:
-            if progress_callback: progress_callback("Resume: load Module 3 cache")
-            try:
-                import logging as _logging
-                _logging.getLogger("cellscope").info("Resume: using Module 3 cache (module3_point_df)")
-            except Exception:
-                pass
-            point_df = pd_cache
-        else:
-            if progress_callback: progress_callback("Module 3 · MetaSpot Segmentation")
-            point_df = per_cell_clustering(
-                point_df,
-                gmm_cols,
-                composition_model=composition_model,
-                show_internal_progress=show_internal_progress,
-                hdbscan_min_cluster_size=_m3_hdb_min,
-                hdbscan_allow_single_cluster=_m3_allow_single,
-                hdbscan_min_samples_frac=_m3_min_samples_frac,
-                target_sub_size=_m3_target_sub_size,
-                n_feat_hdb=_m3_n_feat_hdb,
-                kmeans_min_k=_m3_kmeans_min_k,
-                kmeans_max_k=_m3_kmeans_max_k,
-                use_k_cap=_m3_use_k_cap,
-                merge_min_size=_m3_merge_min,
-                hdbscan_max_points=_m3_hdbscan_max_points,
-                kmeans_train_size=_m3_kmeans_train_size,
-                kmeans_batch_size=_m3_kmeans_batch_size,
-                small_backend_cells=_m3_small_backend_cells,
-                sequential_cells=_m3_sequential_cells,
-                enforce_spatial_connectivity=_m3_enforce_spatial_connectivity,
-                spatial_connectivity_k=_m3_spatial_connectivity_k,
-                spatial_radius_quantile=_m3_spatial_radius_quantile,
-                spatial_radius_factor=_m3_spatial_radius_factor,
-                spatial_smoothing_iterations=_m3_spatial_smoothing_iterations,
-                spatial_smoothing_min_fraction=_m3_spatial_smoothing_min_fraction,
-                spatial_min_component_size=_m3_spatial_min_component_size,
-                spatial_compactness=_m3_spatial_compactness,
-                target_sites_per_metaspot=_m3_target_sites_per_metaspot,
-                min_metaspots_per_cell=_m3_min_metaspots_per_cell,
-                max_metaspots_per_cell=_m3_max_metaspots_per_cell,
-            )
-            _save_dataframe(point_df, out_dir, "module3_point_df")
-            _m3_recomputed = True
+        if pd_cache is None and _late_point_df_cache is not None:
+            pd_cache = _late_point_df_cache
+    if pd_cache is None:
+        pd_cache = _load_module3_membership_checkpoint(
+            point_df,
+            out_dir,
+            module_fingerprints=membership_mod_fps,
+        )
+        _m3_compact_reused = pd_cache is not None
+    if pd_cache is not None:
+        if progress_callback:
+            progress_callback("Resume: load Module 3 membership")
+        point_df = pd_cache
+        _logging.getLogger("cellscope").info(
+            "Resume: using %s Module 3 checkpoint",
+            "compact membership" if _m3_compact_reused else "full point-table",
+        )
     else:
         if progress_callback: progress_callback("Module 3 · MetaSpot Segmentation")
         point_df = per_cell_clustering(
@@ -3638,6 +7453,7 @@ def build_anndata(spatial_df: pd.DataFrame,
             small_backend_cells=_m3_small_backend_cells,
             sequential_cells=_m3_sequential_cells,
             enforce_spatial_connectivity=_m3_enforce_spatial_connectivity,
+            partition_by_nucleus=_m3_partition_by_nucleus,
             spatial_connectivity_k=_m3_spatial_connectivity_k,
             spatial_radius_quantile=_m3_spatial_radius_quantile,
             spatial_radius_factor=_m3_spatial_radius_factor,
@@ -3648,6 +7464,8 @@ def build_anndata(spatial_df: pd.DataFrame,
             target_sites_per_metaspot=_m3_target_sites_per_metaspot,
             min_metaspots_per_cell=_m3_min_metaspots_per_cell,
             max_metaspots_per_cell=_m3_max_metaspots_per_cell,
+            parallel_chunk_cells=_m3_parallel_chunk_cells,
+            parallel_n_jobs=_m3_parallel_n_jobs,
         )
         _save_dataframe(point_df, out_dir, "module3_point_df")
         _m3_recomputed = True
@@ -3664,31 +7482,128 @@ def build_anndata(spatial_df: pd.DataFrame,
     try:
         import logging as _logging
         _logging.getLogger("cellscope").info(
-            "Module 3 done in %.2fs%s",
+            "Module 3 segmentation done in %.2fs%s",
             _dt_m3,
             (f" (cells={_cells})" if _cells is not None else ""),
         )
     except Exception:
         pass
+    _audit_t0 = _time.perf_counter()
+    if progress_callback:
+        try:
+            progress_callback("Module 3 · Audit segmentation quality")
+        except Exception:
+            pass
+    _logging.getLogger("cellscope").info(
+        "Module 3 segmentation audit started | rows=%d | cells=%s",
+        len(point_df),
+        _cells,
+    )
+    try:
+        segmentation_audit = (
+            _load_dataframe_checkpoint(
+                _intermediate_dir(out_dir),
+                "module3_metaspot_segmentation_audit",
+            )
+            if _m3_compact_reused
+            else None
+        )
+        if segmentation_audit is None:
+            segmentation_audit = _metaspot_segmentation_audit(
+                point_df,
+                target_sites_per_metaspot=_m3_target_sites_per_metaspot,
+                min_metaspots_per_cell=_m3_min_metaspots_per_cell,
+                max_metaspots_per_cell=_m3_max_metaspots_per_cell,
+                partition_by_nucleus=_m3_partition_by_nucleus,
+            )
+            _save_dataframe(
+                segmentation_audit,
+                out_dir,
+                "module3_metaspot_segmentation_audit",
+                diagnostic=True,
+            )
+        _logging.getLogger("cellscope").info(
+            "Module 3 audit: MetaSpots/cell median=%.1f, "
+            "actual/requested median=%.3f, "
+            "nucleus-mixed transcript fraction=%.6f",
+            float(segmentation_audit["actual_metaspots"].median()),
+            float(
+                segmentation_audit[
+                    "actual_to_requested_ratio"
+                ].median()
+            ),
+            float(
+                segmentation_audit["mixed_transcripts"].sum()
+                / max(
+                    1,
+                    segmentation_audit["n_transcripts"].sum(),
+                )
+            ),
+        )
+        _logging.getLogger("cellscope").info(
+            "Module 3 segmentation audit done in %.2fs",
+            _time.perf_counter() - _audit_t0,
+        )
+    except Exception as exc:
+        _logging.getLogger("cellscope").warning(
+            "Module 3 segmentation audit failed after %.2fs: %s",
+            _time.perf_counter() - _audit_t0,
+            exc,
+        )
+    # This compact membership contract is mandatory even when bulky
+    # intermediate tables are disabled.  It is sufficient to resume or audit
+    # segmentation without serializing every Module 1/2 feature column.
+    if _m3_recomputed:
+        try:
+            _save_module3_membership_checkpoint(
+                point_df,
+                out_dir,
+                module_fingerprints=membership_mod_fps,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not persist the mandatory Module 3 MetaSpot "
+                "membership checkpoint"
+            ) from exc
+    # Save histogram of metaspots per cell
+    if not _m3_compact_reused:
+        try:
+            import matplotlib.pyplot as plt
+            vc = point_df.groupby('cell_id')[METASPOT_LOCAL_COL].nunique()
+            fig = plt.figure(figsize=(6,4))
+            ax = vc.plot.hist(bins=50)
+            ax.set_xlabel("n_metaspots per cell"); ax.set_ylabel("count"); plt.tight_layout()
+            _save_fig(fig, out_dir or os.getcwd(), "module3_metaspots_per_cell_hist")
+            plt.close(fig)
+        except Exception:
+            pass
     if progress_callback:
         try:
             progress_callback("Module 3 · Done")
         except Exception:
             pass
-    # Save histogram of metaspots per cell
-    try:
-        import matplotlib.pyplot as plt
-        vc = point_df.groupby('cell_id')[METASPOT_LOCAL_COL].nunique()
-        fig = plt.figure(figsize=(6,4))
-        ax = vc.plot.hist(bins=50)
-        ax.set_xlabel("n_metaspots per cell"); ax.set_ylabel("count"); plt.tight_layout()
-        _save_fig(fig, out_dir or os.getcwd(), "module3_metaspots_per_cell_hist")
-        plt.close(fig)
-    except Exception:
-        pass
+    execution_plan: Optional[Dict[str, Any]] = None
+    if graph_unit == "metaspot":
+        from .scalable_execution import resolve_execution_plan
+
+        resolved_plan = resolve_execution_plan(
+            cfg,
+            n_metaspots=int(point_df[METASPOT_COL].nunique()),
+            n_transcripts=int(len(point_df)),
+        )
+        execution_plan = resolved_plan.to_dict()
+        if not bool(execution_plan.get("full_diagnostics", True)):
+            _logging.getLogger("cellscope").info(
+                "Streaming profile: disabling full diagnostic tables; "
+                "downstream figures follow io.write_intermediate_figures=%s",
+                _io_should_write_figures(),
+            )
     # Module 4: adata1 from point_df (derived; rerun if m1–m3 changed)
     _m4_recomputed = False
-    if _mod_lt('m4', start_mod) and _cache_chain_valid:
+    if (
+        (_mod_lt('m4', start_mod) and _cache_chain_valid)
+        or _m3_compact_reused
+    ):
         a1_cache = _load_adata_checkpoint(os.path.join(_intermediate_dir(out_dir), "module4_adata1.h5ad"))
         if a1_cache is not None:
             aligned, alignment_reason = _validate_adata1_point_df_alignment(
@@ -3747,6 +7662,322 @@ def build_anndata(spatial_df: pd.DataFrame,
             progress_callback("Module 4 · Done" + (f" ({_suf})" if _suf else ""))
         except Exception:
             pass
+
+    if graph_unit == "metaspot":
+        if execution_plan is None:
+            raise RuntimeError("MetaSpot execution plan was not resolved")
+        if int(execution_plan["n_metaspots"]) != int(adata1.n_obs):
+            raise RuntimeError(
+                "Execution-plan MetaSpot count differs from Module 4 AnnData"
+            )
+        adata1.uns["execution_plan"] = dict(execution_plan)
+        try:
+            atomic_write_json(
+                os.path.join(
+                    _intermediate_dir(out_dir or os.getcwd()),
+                    "execution_plan.json",
+                ),
+                execution_plan,
+            )
+        except Exception as exc:
+            _logging.getLogger("cellscope").warning(
+                "Execution-plan manifest could not be written: %s",
+                exc,
+            )
+        _logging.getLogger("cellscope").info(
+            "Scale-aware execution plan | profile=%s | MetaSpots=%d | "
+            "kNN=%s | DGI=%s | MetaDomain=%s",
+            execution_plan["effective_profile"],
+            int(adata1.n_obs),
+            execution_plan["knn_backend"],
+            execution_plan["dgi_training_mode"],
+            execution_plan["metadomain_method"],
+        )
+
+    # In MetaSpot graph mode, Modules 7 and 8 are true upstream dependencies
+    # of MetaDomain construction.  Keep separate checkpoints so an old
+    # MetaDomain-broadcast embedding can never masquerade as a MetaSpot model.
+    if graph_unit == "metaspot":
+        module7_config = (cfg.get("module7", {}) or {})
+        neighbor_config = module7_config.get("neighbors", {}) or {}
+        if not isinstance(neighbor_config, dict):
+            neighbor_config = {}
+
+        _m7_metaspot_recomputed = False
+        if _mod_lt("m7", start_mod) and _cache_chain_valid:
+            graph_cache = _load_adata_checkpoint(
+                os.path.join(
+                    _intermediate_dir(out_dir),
+                    "module7_metaspot_adata1.h5ad",
+                )
+            )
+            if graph_cache is not None:
+                valid, reason = _metaspot_cache_matches(
+                    graph_cache,
+                    adata1,
+                    required_obsm=("X_expr_metaspot_scaled",),
+                    required_obsp=(METASPOT_GRAPH_KEY,),
+                )
+                graph_meta = graph_cache.uns.get("metaspot_graph", {})
+                valid = bool(
+                    valid
+                    and graph_meta.get("node_unit") == "metaspot"
+                    and int(graph_meta.get("schema_version", -1))
+                    == METASPOT_GRAPH_SCHEMA_VERSION
+                    and graph_meta.get("execution_profile")
+                    == execution_plan["effective_profile"]
+                    and graph_meta.get("knn_backend")
+                    == execution_plan["knn_backend"]
+                )
+                if not valid:
+                    _logging.getLogger("cellscope").warning(
+                        "Rejecting MetaSpot graph cache: %s",
+                        reason,
+                    )
+                    graph_cache = None
+            if graph_cache is not None:
+                if progress_callback:
+                    progress_callback("Resume: load Module 7 MetaSpot graph")
+                adata1 = graph_cache
+            else:
+                if progress_callback:
+                    progress_callback("Module 7 · MetaSpot Graph Construction")
+                adata1 = build_metaspot_graph(
+                    adata1,
+                    point_df,
+                    k_expr=int(neighbor_config.get("k_expr", 15)),
+                    k_spatial=int(neighbor_config.get("k_spatial", 6)),
+                    expr_n_components=int(
+                        module7_config.get(
+                            "metaspot_expr_n_components",
+                            module7_config.get("scvi_n_latent", 32),
+                        )
+                    ),
+                    alpha_expr=float(
+                        module7_config.get("metaspot_alpha_expr", 0.8)
+                    ),
+                    alpha_spatial=float(
+                        module7_config.get("metaspot_alpha_spatial", 0.2)
+                    ),
+                    edge_norm=str(
+                        module7_config.get("metaspot_edge_norm", "gcn")
+                    ),
+                    use_geometry_features=bool(
+                        module7_config.get(
+                            "metaspot_use_geometry_features",
+                            False,
+                        )
+                    ),
+                    expression_cross_cell_only=bool(
+                        module7_config.get(
+                            "metaspot_expr_cross_cell_only",
+                            False,
+                        )
+                    ),
+                    max_full_batch_nodes=int(
+                        module7_config.get(
+                            "max_full_batch_nodes",
+                            200_000,
+                        )
+                    ),
+                    execution_profile=str(
+                        execution_plan["effective_profile"]
+                    ),
+                    knn_backend=str(execution_plan["knn_backend"]),
+                    ann_candidate_multiplier=int(
+                        module7_config.get("ann_candidate_multiplier", 4)
+                    ),
+                    ann_query_chunk_nodes=int(
+                        module7_config.get("ann_query_chunk_nodes", 100_000)
+                    ),
+                    ann_train_sample=int(
+                        module7_config.get("ann_train_sample", 1_000_000)
+                    ),
+                    faiss_hnsw_m=int(
+                        module7_config.get("faiss_hnsw_m", 32)
+                    ),
+                    faiss_nprobe=int(
+                        module7_config.get("faiss_nprobe", 32)
+                    ),
+                    faiss_pq_subvectors=int(
+                        module7_config.get("faiss_pq_subvectors", 8)
+                    ),
+                    faiss_pq_bits=int(
+                        module7_config.get("faiss_pq_bits", 8)
+                    ),
+                    faiss_use_gpu=module7_config.get(
+                        "faiss_use_gpu", "auto"
+                    ),
+                    faiss_gpu_device=int(
+                        module7_config.get("faiss_gpu_device", 0)
+                    ),
+                )
+                _save_adata(adata1, out_dir, "module7_metaspot_adata1")
+                _m7_metaspot_recomputed = True
+        else:
+            if progress_callback:
+                progress_callback("Module 7 · MetaSpot Graph Construction")
+            adata1 = build_metaspot_graph(
+                adata1,
+                point_df,
+                k_expr=int(neighbor_config.get("k_expr", 15)),
+                k_spatial=int(neighbor_config.get("k_spatial", 6)),
+                expr_n_components=int(
+                    module7_config.get(
+                        "metaspot_expr_n_components",
+                        module7_config.get("scvi_n_latent", 32),
+                    )
+                ),
+                alpha_expr=float(
+                    module7_config.get("metaspot_alpha_expr", 0.8)
+                ),
+                alpha_spatial=float(
+                    module7_config.get("metaspot_alpha_spatial", 0.2)
+                ),
+                edge_norm=str(
+                    module7_config.get("metaspot_edge_norm", "gcn")
+                ),
+                use_geometry_features=bool(
+                    module7_config.get(
+                        "metaspot_use_geometry_features",
+                        False,
+                    )
+                ),
+                expression_cross_cell_only=bool(
+                    module7_config.get(
+                        "metaspot_expr_cross_cell_only",
+                        False,
+                    )
+                ),
+                max_full_batch_nodes=int(
+                    module7_config.get("max_full_batch_nodes", 200_000)
+                ),
+                execution_profile=str(execution_plan["effective_profile"]),
+                knn_backend=str(execution_plan["knn_backend"]),
+                ann_candidate_multiplier=int(
+                    module7_config.get("ann_candidate_multiplier", 4)
+                ),
+                ann_query_chunk_nodes=int(
+                    module7_config.get("ann_query_chunk_nodes", 100_000)
+                ),
+                ann_train_sample=int(
+                    module7_config.get("ann_train_sample", 1_000_000)
+                ),
+                faiss_hnsw_m=int(module7_config.get("faiss_hnsw_m", 32)),
+                faiss_nprobe=int(module7_config.get("faiss_nprobe", 32)),
+                faiss_pq_subvectors=int(
+                    module7_config.get("faiss_pq_subvectors", 8)
+                ),
+                faiss_pq_bits=int(module7_config.get("faiss_pq_bits", 8)),
+                faiss_use_gpu=module7_config.get("faiss_use_gpu", "auto"),
+                faiss_gpu_device=int(
+                    module7_config.get("faiss_gpu_device", 0)
+                ),
+            )
+            _save_adata(adata1, out_dir, "module7_metaspot_adata1")
+            _m7_metaspot_recomputed = True
+        if _m7_metaspot_recomputed:
+            _cache_chain_valid = False
+        _logging.getLogger("cellscope").info(
+            "Module 7 MetaSpot graph ready: nodes=%d edges=%d",
+            adata1.n_obs,
+            int(adata1.obsp[METASPOT_GRAPH_KEY].nnz),
+        )
+
+        _m8_metaspot_recomputed = False
+        if _mod_lt("m8", start_mod) and _cache_chain_valid:
+            dgi_cache = _load_adata_checkpoint(
+                os.path.join(
+                    _intermediate_dir(out_dir),
+                    "module8_metaspot_adata1.h5ad",
+                )
+            )
+            if dgi_cache is not None:
+                valid, reason = _metaspot_cache_matches(
+                    dgi_cache,
+                    adata1,
+                    required_obsm=(METASPOT_DGI_KEY,),
+                    required_obsp=(METASPOT_GRAPH_KEY,),
+                )
+                dgi_meta = (
+                    dgi_cache.uns.get("dgi_embeddings", {}).get(
+                        METASPOT_DGI_KEY,
+                        {},
+                    )
+                )
+                valid = bool(
+                    valid
+                    and dgi_meta.get("node_unit") == "metaspot"
+                    and int(dgi_meta.get("schema_version", -1))
+                    == METASPOT_DGI_SCHEMA_VERSION
+                    and dgi_meta.get("node_id_checksum")
+                    == _obs_names_checksum(adata1.obs_names)
+                    and dgi_meta.get("training_mode")
+                    == execution_plan["dgi_training_mode"]
+                )
+                if not valid:
+                    _logging.getLogger("cellscope").warning(
+                        "Rejecting MetaSpot DGI cache: %s",
+                        reason,
+                    )
+                    dgi_cache = None
+            if dgi_cache is not None:
+                if progress_callback:
+                    progress_callback("Resume: load Module 8 MetaSpot DGI")
+                adata1 = dgi_cache
+            else:
+                if progress_callback:
+                    progress_callback("Module 8 · MetaSpot DGI Embedding")
+                feature_keys = tuple(
+                    adata1.uns["metaspot_graph"]["feature_keys"]
+                )
+                _, embedded = run_module8_dgi(
+                    adata1,
+                    adata1,
+                    show_internal_progress=show_internal_progress,
+                    dgi_epochs=dgi_epochs,
+                    enable_dgi_sage=enable_dgi_sage,
+                    out_dir=out_dir,
+                    progress_callback=progress_callback,
+                    graph_key=METASPOT_GRAPH_KEY,
+                    feature_keys=feature_keys,
+                    output_key=METASPOT_DGI_KEY,
+                    sage_output_key=METASPOT_DGI_SAGE_KEY,
+                    broadcast_to_adata1=False,
+                    compatibility_alias=True,
+                )
+                adata1 = embedded
+                _save_adata(adata1, out_dir, "module8_metaspot_adata1")
+                _m8_metaspot_recomputed = True
+        else:
+            if progress_callback:
+                progress_callback("Module 8 · MetaSpot DGI Embedding")
+            feature_keys = tuple(adata1.uns["metaspot_graph"]["feature_keys"])
+            _, embedded = run_module8_dgi(
+                adata1,
+                adata1,
+                show_internal_progress=show_internal_progress,
+                dgi_epochs=dgi_epochs,
+                enable_dgi_sage=enable_dgi_sage,
+                out_dir=out_dir,
+                progress_callback=progress_callback,
+                graph_key=METASPOT_GRAPH_KEY,
+                feature_keys=feature_keys,
+                output_key=METASPOT_DGI_KEY,
+                sage_output_key=METASPOT_DGI_SAGE_KEY,
+                broadcast_to_adata1=False,
+                compatibility_alias=True,
+            )
+            adata1 = embedded
+            _save_adata(adata1, out_dir, "module8_metaspot_adata1")
+            _m8_metaspot_recomputed = True
+        if _m8_metaspot_recomputed:
+            _cache_chain_valid = False
+        _logging.getLogger("cellscope").info(
+            "Module 8 MetaSpot DGI ready: shape=%s",
+            tuple(adata1.obsm[METASPOT_DGI_KEY].shape),
+        )
+
     # Module 5: meta-domain clustering (allow resume)
     _m5_recomputed = False
     if _mod_lt('m5', start_mod) and _cache_chain_valid:
@@ -3774,6 +8005,13 @@ def build_anndata(spatial_df: pd.DataFrame,
                 enable_cap=True,
                 show_internal_progress=show_internal_progress,
                 progress_callback=progress_callback,
+                module5_config_override={
+                    "large_scale_method": (
+                        execution_plan["metadomain_method"]
+                        if execution_plan is not None
+                        else "auto"
+                    )
+                },
             )
             _m5_recomputed = True
     else:
@@ -3788,6 +8026,13 @@ def build_anndata(spatial_df: pd.DataFrame,
             enable_cap=True,
             show_internal_progress=show_internal_progress,
             progress_callback=progress_callback,
+            module5_config_override={
+                "large_scale_method": (
+                    execution_plan["metadomain_method"]
+                    if execution_plan is not None
+                    else "auto"
+                )
+            },
         )
         _m5_recomputed = True
     if _m5_recomputed:
@@ -3827,6 +8072,17 @@ def build_anndata(spatial_df: pd.DataFrame,
             progress_callback("Module 5 · Done" + (f" ({_suf})" if _suf else ""))
         except Exception:
             pass
+    if _io_should_write_figures():
+        try:
+            _plot_metadomain_k_selection_diagnostics(
+                adata1,
+                out_dir or os.getcwd(),
+            )
+        except Exception as exc:
+            _logging.getLogger("cellscope").warning(
+                "MetaDomain clustering-diagnostic plotting failed: %s",
+                exc,
+            )
 
     # Module 6: Build adata2 from adata1 + meta-domains
     # Module 6: adata2 (allow resume)
@@ -3883,6 +8139,13 @@ def build_anndata(spatial_df: pd.DataFrame,
         except Exception:
             pass
 
+    if graph_unit == "metaspot":
+        # Modules 7/8 already ran on adata1 before MetaDomain construction.
+        # adata2 now carries pooled MetaSpot representations for annotation
+        # Leiden; do not train a second DGI in the first implementation.
+        final_csv = point_df.copy()
+        return adata1, adata2, final_csv
+
     # Module 7: Graph construction on adata2 (weighted edges, optional same-cell downweight)
     # Module 7: Graph Construction (allow resume)
     _m7_recomputed = False
@@ -3898,26 +8161,6 @@ def build_anndata(spatial_df: pd.DataFrame,
             adata2 = a2_cache
         else:
             if progress_callback: progress_callback("Module 7 · Graph Construction")
-            try:
-                adata2 = build_module7_graph(
-                    adata2,
-                    show_internal_progress=show_internal_progress,
-                    scvi_epochs=scvi_epochs,
-                    out_dir=out_dir,
-                    progress_callback=progress_callback,
-                )
-                try:
-                    _save_adata(adata2, out_dir, "module7_adata2")
-                except Exception:
-                    pass
-                _m7_recomputed = True
-            except Exception as e:
-                print(f"[WARN] Module 7 failed: {e}")
-            else:
-                pass
-    else:
-        if progress_callback: progress_callback("Module 7 · Graph Construction")
-        try:
             adata2 = build_module7_graph(
                 adata2,
                 show_internal_progress=show_internal_progress,
@@ -3930,10 +8173,20 @@ def build_anndata(spatial_df: pd.DataFrame,
             except Exception:
                 pass
             _m7_recomputed = True
-        except Exception as e:
-            print(f"[WARN] Module 7 failed: {e}")
-        else:
+    else:
+        if progress_callback: progress_callback("Module 7 · Graph Construction")
+        adata2 = build_module7_graph(
+            adata2,
+            show_internal_progress=show_internal_progress,
+            scvi_epochs=scvi_epochs,
+            out_dir=out_dir,
+            progress_callback=progress_callback,
+        )
+        try:
+            _save_adata(adata2, out_dir, "module7_adata2")
+        except Exception:
             pass
+        _m7_recomputed = True
     if _m7_recomputed:
         _cache_chain_valid = False
     try:
@@ -3966,29 +8219,6 @@ def build_anndata(spatial_df: pd.DataFrame,
             adata1, adata2 = a1_cache, a2_cache
         else:
             if progress_callback: progress_callback("Module 8 · Graph Embeddings (DGI)")
-            try:
-                adata1, adata2 = run_module8_dgi(
-                    adata1,
-                    adata2,
-                    show_internal_progress=show_internal_progress,
-                    dgi_epochs=dgi_epochs,
-                    enable_dgi_sage=enable_dgi_sage,
-                    out_dir=out_dir,
-                    progress_callback=progress_callback,
-                )
-                try:
-                    _save_adata(adata1, out_dir, "module8_adata1")
-                    _save_adata(adata2, out_dir, "module8_adata2")
-                except Exception:
-                    pass
-                _m8_recomputed = True
-            except Exception as e:
-                print(f"[WARN] Module 8 failed: {e}")
-            else:
-                pass
-    else:
-        if progress_callback: progress_callback("Module 8 · Graph Embeddings (DGI)")
-        try:
             adata1, adata2 = run_module8_dgi(
                 adata1,
                 adata2,
@@ -4004,10 +8234,23 @@ def build_anndata(spatial_df: pd.DataFrame,
             except Exception:
                 pass
             _m8_recomputed = True
-        except Exception as e:
-            print(f"[WARN] Module 8 failed: {e}")
-        else:
+    else:
+        if progress_callback: progress_callback("Module 8 · Graph Embeddings (DGI)")
+        adata1, adata2 = run_module8_dgi(
+            adata1,
+            adata2,
+            show_internal_progress=show_internal_progress,
+            dgi_epochs=dgi_epochs,
+            enable_dgi_sage=enable_dgi_sage,
+            out_dir=out_dir,
+            progress_callback=progress_callback,
+        )
+        try:
+            _save_adata(adata1, out_dir, "module8_adata1")
+            _save_adata(adata2, out_dir, "module8_adata2")
+        except Exception:
             pass
+        _m8_recomputed = True
     if _m8_recomputed:
         _cache_chain_valid = False
     try:
@@ -4085,25 +8328,444 @@ def _io_should_write_figures() -> bool:
         pass
     return allow
 
-def _intermediate_dir(out_dir: str) -> str:
-    """Return the path to the intermediate directory, configurable via params.yaml.
 
-    io.intermediate_dirname: optional folder name (default 'intermediate').
-    """
+def _io_should_write_diagnostic_tables() -> bool:
+    """Return whether diagnostic tables are requested by the active config."""
+    try:
+        cfg = load_params_yaml()
+        io_cfg = cfg.get("io", {}) if cfg else {}
+        return bool(io_cfg.get("write_diagnostic_tables", True)) and bool(
+            io_cfg.get("write_diagnostic_csv", True)
+            or io_cfg.get("write_diagnostic_parquet", False)
+        )
+    except Exception:
+        return True
+
+
+def _full_metaspot_diagnostics_enabled(adata1: ad.AnnData) -> bool:
+    """Honor both scale-aware planning and explicit diagnostic I/O policy."""
+    execution_plan = adata1.uns.get("execution_plan", {})
+    scale_allows = bool(execution_plan.get("full_diagnostics", True))
+    return scale_allows and _io_should_write_diagnostic_tables()
+
+
+def _broadcast_metaspot_diagnostics_enabled(adata1: ad.AnnData) -> bool:
+    """Avoid duplicating wide MetaSpot audits onto every streaming transcript."""
+    execution_plan = adata1.uns.get("execution_plan", {})
+    default = bool(execution_plan.get("full_diagnostics", True))
+    try:
+        cfg = load_params_yaml()
+        io_cfg = cfg.get("io", {}) if cfg else {}
+        if "broadcast_metaspot_diagnostics_to_transcripts" in io_cfg:
+            return bool(
+                io_cfg.get("broadcast_metaspot_diagnostics_to_transcripts")
+            )
+    except Exception:
+        pass
+    return default
+
+def _intermediate_dirname() -> str:
+    """Return the configured intermediate folder name without creating it."""
     try:
         _cfg = load_params_yaml()
         dname = (_cfg.get('io', {}) if _cfg else {}).get('intermediate_dirname', 'intermediate')
         dname = str(dname).strip() or 'intermediate'
     except Exception:
         dname = 'intermediate'
-    p = os.path.join(out_dir, dname)
+    return dname
+
+
+def _intermediate_dir(out_dir: str) -> str:
+    """Return and create the configured intermediate output directory."""
+    p = os.path.join(out_dir, _intermediate_dirname())
     os.makedirs(p, exist_ok=True)
     return p
 
-def _save_dataframe(df: pd.DataFrame, out_dir: str, name: str):
-    """Save a dataframe as CSV/Parquet according to io flags in params.yaml."""
-    # Respect global/io switch: do nothing if disabled
-    if not _io_should_write_intermediate():
+def _atomic_dataframe_write(
+    df: pd.DataFrame,
+    path: str,
+    *,
+    file_format: str,
+) -> None:
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.",
+        suffix=f".tmp.{file_format}",
+        dir=directory,
+    )
+    os.close(fd)
+    try:
+        if file_format == "csv":
+            df.to_csv(temporary, index=False)
+        elif file_format == "parquet":
+            df.to_parquet(temporary, index=False)
+        else:
+            raise ValueError(f"Unsupported dataframe format: {file_format}")
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _quarantine_stale_file(path: str) -> Optional[str]:
+    """Move an older output aside so it cannot masquerade as this run."""
+    if not os.path.isfile(path):
+        return None
+    candidate = f"{path}.stale"
+    suffix = 1
+    while os.path.exists(candidate):
+        candidate = f"{path}.stale.{suffix}"
+        suffix += 1
+    os.replace(path, candidate)
+    return candidate
+
+
+def _atomic_partitioned_parquet_write(
+    df: pd.DataFrame,
+    directory: str,
+    *,
+    target_rows_per_part: int = 1_000_000,
+) -> Dict[str, Any]:
+    """Write a cell-stable Parquet dataset with an atomic directory swap."""
+    import json
+    import shutil
+
+    parent = os.path.dirname(os.path.abspath(directory))
+    os.makedirs(parent, exist_ok=True)
+    temporary = tempfile.mkdtemp(
+        prefix=f".{os.path.basename(directory)}.",
+        suffix=".tmp",
+        dir=parent,
+    )
+    target_rows = max(1, int(target_rows_per_part))
+    n_parts = max(1, int(math.ceil(len(df) / target_rows)))
+    if "cell_id" in df.columns:
+        cell_codes, _ = pd.factorize(df["cell_id"], sort=False)
+        partition_ids = np.mod(cell_codes, n_parts).astype(np.int32)
+    else:
+        partition_ids = np.minimum(
+            np.arange(len(df), dtype=np.int64) // target_rows,
+            n_parts - 1,
+        ).astype(np.int32)
+    order = np.argsort(partition_ids, kind="stable")
+    sorted_parts = partition_ids[order]
+    starts = np.r_[0, np.flatnonzero(np.diff(sorted_parts)) + 1]
+    ends = np.r_[starts[1:], len(order)]
+    parts = []
+    try:
+        for start, end in zip(starts, ends):
+            part_id = int(sorted_parts[start]) if end > start else 0
+            name = f"part-{part_id:05d}.parquet"
+            path = os.path.join(temporary, name)
+            frame = df.iloc[order[start:end]]
+            frame.to_parquet(path, index=False)
+            parts.append(
+                {
+                    "file": name,
+                    "rows": int(len(frame)),
+                    "cells": (
+                        int(frame["cell_id"].nunique())
+                        if "cell_id" in frame.columns
+                        else None
+                    ),
+                }
+            )
+        manifest = {
+            "schema_version": 1,
+            "format": "partitioned_parquet",
+            "partition_strategy": (
+                "stable_cell_hash" if "cell_id" in df.columns else "row_range"
+            ),
+            "rows": int(len(df)),
+            "columns": [str(column) for column in df.columns],
+            "n_parts": int(len(parts)),
+            "target_rows_per_part": target_rows,
+            "parts": parts,
+        }
+        with open(os.path.join(temporary, "manifest.json"), "w") as handle:
+            json.dump(manifest, handle, indent=2, sort_keys=True)
+        open(os.path.join(temporary, "_SUCCESS"), "w").close()
+        previous = f"{directory}.previous"
+        if os.path.exists(previous):
+            if os.path.isdir(previous):
+                shutil.rmtree(previous)
+            else:
+                os.unlink(previous)
+        if os.path.exists(directory):
+            os.replace(directory, previous)
+        os.replace(temporary, directory)
+        if os.path.exists(previous):
+            if os.path.isdir(previous):
+                shutil.rmtree(previous)
+            else:
+                os.unlink(previous)
+        return manifest
+    finally:
+        if os.path.isdir(temporary):
+            shutil.rmtree(temporary)
+
+
+_DEPRECATED_OUTPUT_ARTIFACTS = (
+    "rapx_umap_cluster_annotation.png",
+    "annotation_umap_leiden.png",
+    "fine_annotation_proportions.png",
+    "fine_annotation_proportions.csv",
+    "fine_annotation_proportions.parquet",
+)
+
+
+def _remove_deprecated_output_artifacts(out_dir: str) -> List[str]:
+    """Remove superseded files that would misrepresent a resumed run.
+
+    These paths are deliberately exact and confined to the configured
+    intermediate directory.  This prevents stale figures from surviving when
+    a newer code version no longer emits them.
+    """
+    intermediate = os.path.join(out_dir, _intermediate_dirname())
+    if not os.path.isdir(intermediate):
+        return []
+    removed: List[str] = []
+    for name in _DEPRECATED_OUTPUT_ARTIFACTS:
+        path = os.path.join(intermediate, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            os.unlink(path)
+            removed.append(path)
+            _logging.getLogger("cellscope").info(
+                "Removed deprecated output artifact: %s",
+                path,
+            )
+        except OSError as exc:
+            _logging.getLogger("cellscope").warning(
+                "Could not remove deprecated output artifact %s: %s",
+                path,
+                exc,
+            )
+    return removed
+
+
+def _remove_inactive_method_artifacts(
+    out_dir: str,
+    config: Mapping[str, Any],
+) -> List[str]:
+    """Remove exact QC files emitted only by the inactive model path.
+
+    Resumed runs intentionally share one output directory. Without this
+    cleanup, a CA-DMGI/consensus-Leiden run can appear beside stale
+    standard-DGI/KMeans figures and incorrectly imply that both generated the
+    final result.
+    """
+    module5 = config.get("module5", {}) if isinstance(config, Mapping) else {}
+    module8 = config.get("module8", {}) if isinstance(config, Mapping) else {}
+    clustering_method = str(
+        module5.get("clustering_method", "minibatch_kmeans")
+        if isinstance(module5, Mapping)
+        else "minibatch_kmeans"
+    ).strip().lower().replace("-", "_")
+    framework = str(
+        module8.get("dgi_framework", "standard_dgi")
+        if isinstance(module8, Mapping)
+        else "standard_dgi"
+    ).strip().lower().replace("-", "_")
+    inactive_names: List[str] = []
+    if clustering_method in {"consensus_leiden", "stability_leiden", "leiden"}:
+        inactive_names.extend(
+            [
+                "metadomain_k_selection_diagnostics.png",
+                "module5_k_selection_diagnostics.csv",
+                "module5_k_selection_diagnostics.parquet",
+            ]
+        )
+    else:
+        inactive_names.extend(
+            [
+                "metadomain_consensus_leiden_diagnostics.png",
+                "module5_consensus_leiden_diagnostics.csv",
+                "module5_consensus_leiden_diagnostics.parquet",
+            ]
+        )
+    legacy_framework = "ch_dmgi"  # legacy compatibility only
+    if framework in {"cell_aware_dmgi", "ca_dmgi", legacy_framework, "dmgi"}:
+        inactive_names.append("module8_dgi_GCN_curves.png")
+    else:
+        inactive_names.extend(
+            [
+                "module8_ca_dmgi_training.png",
+                "module8_ca_dmgi_training_history.csv",
+                "module8_ca_dmgi_training_history.parquet",
+                "module8_ca_dmgi_summary.csv",
+                "module8_ca_dmgi_summary.parquet",
+            ]
+        )
+    inactive_names.extend(
+        [
+            "module8_ch_dmgi_training.png",  # legacy compatibility only
+            "module8_ch_dmgi_training_history.csv",  # legacy compatibility only
+            "module8_ch_dmgi_training_history.parquet",  # legacy compatibility only
+            "module8_ch_dmgi_summary.csv",  # legacy compatibility only
+            "module8_ch_dmgi_summary.parquet",  # legacy compatibility only
+        ]
+    )
+
+    intermediate = os.path.join(out_dir, _intermediate_dirname())
+    removed: List[str] = []
+    for name in inactive_names:
+        path = os.path.join(intermediate, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            os.unlink(path)
+            removed.append(path)
+            _logging.getLogger("cellscope").info(
+                "Removed inactive method artifact: %s",
+                path,
+            )
+        except OSError as exc:
+            _logging.getLogger("cellscope").warning(
+                "Could not remove inactive method artifact %s: %s",
+                path,
+                exc,
+            )
+    return removed
+
+
+def _write_output_guide(
+    out_dir: str,
+    *,
+    counts: Mapping[str, Any],
+    annotation_enabled: bool,
+    primary_data_product: str = "final_data.parquet",
+) -> str:
+    """Write a concise human-readable index of production and audit outputs."""
+    intermediate_name = _intermediate_dirname()
+    guide_path = os.path.join(out_dir, "OUTPUT_GUIDE.md")
+    count_text = (
+        f"{int(counts.get('n_transcripts') or 0):,} transcripts, "
+        f"{int(counts.get('n_cells') or 0):,} cells, "
+        f"{int(counts.get('n_metaspots') or 0):,} MetaSpots, and "
+        f"{int(counts.get('n_metadomains') or 0):,} MetaDomains"
+    )
+    annotation_section = ""
+    if annotation_enabled:
+        annotation_section = f"""
+## Recommended result figures (when figure output is enabled)
+
+- `{intermediate_name}/metaspot_annotation_result.png`: canonical annotation
+  result at MetaSpot resolution, including final labels and evidence tiers.
+- `{intermediate_name}/final_annotation_proportions.png`: per-cell distribution
+  of the canonical seven-class transcript annotation.
+
+## Cell × Structure atlas (after Phase 1 audit)
+
+- `{intermediate_name}/cell_structure_atlas.csv`: one row per cell and fine
+  structure with four-state detection status, multi-source evidence, loci, and
+  total-cell/compartment burden.
+- `{intermediate_name}/cell_structure_summary.csv`: per-cell fine-structure
+  counts and detection coverage normalized by assay detectability.
+- `{intermediate_name}/cell_structure_depth_summary.csv`: marker evidence,
+  detectability, detected structures, and coverage by transcript depth.
+
+## Clustering and method diagnostics (when available)
+
+- `{intermediate_name}/metadomain_leiden_clusters.png`: MetaDomain UMAP colored
+  by the final `Subcellular Annotation` label. The legacy filename is retained
+  for output compatibility; Leiden cluster IDs remain available in the AnnData
+  audit fields rather than defining the figure colors.
+- `{intermediate_name}/metadomain_annotation_quality.png`: MetaDomain aggregation
+  and transfer into final MetaSpot labels.
+- `{intermediate_name}/metadomain_consensus_leiden_diagnostics.png`: default
+  multi-resolution, multi-seed clustering stability/occupancy audit. The
+  companion `module5_consensus_leiden_diagnostics.*` contains exact values.
+- `{intermediate_name}/module8_ca_dmgi_training.png`: default Cell-Aware Deep
+  Multiplex Graph Infomax (CA-DMGI) relation-specific expression/spatial losses
+  and learned consensus-gate trajectory. The companion
+  `module8_ca_dmgi_training_history.*` and `module8_ca_dmgi_summary.*` contain
+  exact values and graph semantics.
+- `metadomain_k_selection_diagnostics.png` and `module8_dgi_GCN_curves.png`
+  are produced only by the legacy MiniBatchKMeans/standard-DGI fallback paths.
+
+## Audit-only annotation tables
+
+- `{intermediate_name}/rapx_annotation_scores.csv`: full RAP-X evidence matrix.
+- `{intermediate_name}/rapx_metadomain_evidence.csv`,
+  `{intermediate_name}/rapx_candidate_to_strict.csv`, and
+  `{intermediate_name}/rapx_candidate_evidence_tier.csv`: confirmatory evidence
+  audit. `Unknown` in the strict track means "not confirmatory-FDR supported";
+  it is not the final public annotation.
+- `{intermediate_name}/metaspot_local_annotation_scores.csv` and
+  `{intermediate_name}/metaspot_fine_decision_provenance.csv`: local marker,
+  DGI-neighborhood, rescue, and fallback evidence.
+- `adata1.obs["subcellular_metaspot_diminishing_return_*"]`: original label,
+  locus rank, evidence threshold, burden, and pruning decision for repeated
+  fine-structure loci. Pruned loci fall back to their broad parent label.
+- `adata1.obs["subcellular_metaspot_multistructure_first_locus_*"]`: unified
+  five-structure first-locus selection, evidence scores, and projected-burden
+  safety decision. These fields alter labels only when the corresponding
+  option in `effective_params.yaml` is enabled.
+- `{intermediate_name}/omm_cell_detection_tiers.csv`: supported OMM calls and
+  the separate audit-only exploratory sensitivity layer. Exploratory rows do
+  not overwrite the canonical public label.
+"""
+    primary_name = os.path.basename(primary_data_product)
+    optional_name = (
+        "final_data.csv"
+        if primary_name == "final_data.parquet"
+        else "final_data.parquet"
+    )
+    text = f"""# CellScoper output guide
+
+This successful run contains {count_text}.
+
+## Primary data products
+
+- `{primary_name}`: transcript-level production result written successfully by
+  this run. `{optional_name}` is optional and must not be treated as current
+  unless it is also recorded in `run_manifest.json`.
+- `adata1.h5ad`: MetaSpot-level production object. The canonical public label is
+  `obs[\"subcellular_annotation\"]`. Multi-structure Phase 2 evidence is stored in
+  `obsm[\"X_subcellular_structure_presence\"]`,
+  `obsm[\"X_subcellular_structure_localization\"]`, and
+  `obsm[\"X_subcellular_structure_evidence\"]`; structure order and score
+  semantics are recorded in `uns[\"metaspot_local_annotation\"]`.
+- `adata2.h5ad`: internal MetaDomain evidence and clustering object; it is not
+  the final annotation grain.
+- `effective_params.yaml`, `params_used.yaml`, and `run_manifest.json`:
+  configuration and provenance required to reproduce the run.
+{annotation_section}
+## Checkpoints and compact QC
+
+Other files under `{intermediate_name}/` are restart checkpoints or compact
+diagnostic tables. They should not be presented as final biological results
+unless their observation unit and decision stage are stated explicitly.
+"""
+    fd, temporary = tempfile.mkstemp(
+        prefix=".OUTPUT_GUIDE.",
+        suffix=".tmp.md",
+        dir=out_dir,
+    )
+    os.close(fd)
+    try:
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write(text.strip() + "\n")
+        os.replace(temporary, guide_path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return guide_path
+
+
+def _save_dataframe(
+    df: pd.DataFrame,
+    out_dir: str,
+    name: str,
+    *,
+    diagnostic: bool = False,
+    force_parquet: bool = False,
+):
+    """Atomically save an intermediate or compact diagnostic table."""
+    if not diagnostic and not _io_should_write_intermediate():
         return
     base = _intermediate_dir(out_dir)
     write_csv = True
@@ -4111,10 +8773,22 @@ def _save_dataframe(df: pd.DataFrame, out_dir: str, name: str):
     try:
         _cfg = load_params_yaml()
         io_cfg = _cfg.get('io', {}) if _cfg else {}
-        write_csv = bool(io_cfg.get('write_intermediate_csv', True))
-        write_pq = bool(io_cfg.get('write_intermediate_parquet', True))
-    except Exception:
-        pass
+        if diagnostic:
+            if not bool(io_cfg.get("write_diagnostic_tables", True)):
+                return
+            write_csv = bool(io_cfg.get("write_diagnostic_csv", True))
+            write_pq = bool(io_cfg.get("write_diagnostic_parquet", False))
+        else:
+            write_csv = bool(io_cfg.get('write_intermediate_csv', True))
+            write_pq = bool(io_cfg.get('write_intermediate_parquet', True))
+    except Exception as exc:
+        _logging.getLogger("cellscope").warning(
+            "Could not read I/O settings for table %s: %s; using defaults",
+            name,
+            exc,
+        )
+    if force_parquet:
+        write_pq = True
     if not write_csv and not write_pq:
         _logging.getLogger("cellscope").debug(
             "Intermediate table disabled by I/O config: %s",
@@ -4129,7 +8803,11 @@ def _save_dataframe(df: pd.DataFrame, out_dir: str, name: str):
     if write_csv:
         csv_path = os.path.join(base, f"{name}.csv")
         try:
-            df.to_csv(csv_path, index=False)
+            _atomic_dataframe_write(
+                df,
+                csv_path,
+                file_format="csv",
+            )
             written.append(csv_path)
         except Exception as exc:
             _logging.getLogger("cellscope").warning(
@@ -4140,7 +8818,11 @@ def _save_dataframe(df: pd.DataFrame, out_dir: str, name: str):
     if write_pq:
         try:
             pq_path = os.path.join(base, f"{name}.parquet")
-            df.to_parquet(pq_path, index=False)
+            _atomic_dataframe_write(
+                df,
+                pq_path,
+                file_format="parquet",
+            )
             written.append(pq_path)
         except Exception as exc:
             _logging.getLogger("cellscope").warning(
@@ -4150,7 +8832,11 @@ def _save_dataframe(df: pd.DataFrame, out_dir: str, name: str):
             )
     if written:
         _logging.getLogger("cellscope").info(
-            "Saved intermediate table: %s",
+            "Saved %s table | name=%s | rows=%d | columns=%d | files=%s",
+            "diagnostic" if diagnostic else "intermediate",
+            name,
+            len(df),
+            int(df.shape[1]),
             ", ".join(written),
         )
 
@@ -4209,11 +8895,12 @@ def _joblib_backend() -> str:
         pass
     return "loky"
 
-def _cluster_chunk_size() -> int:
+def _cluster_chunk_size(configured: Optional[int] = None) -> int:
     """Chunk size for per-cell parallel loops.
 
     Env: CELLSCOPE_CLUSTER_CHUNK (int)
-    Config: module2.parallel_chunk_cells
+    Config: module3.parallel_chunk_cells (with module2's legacy setting as a
+    fallback when called outside the pipeline).
     Smaller chunks reduce peak memory (fewer simultaneous process payloads)
     at the cost of higher scheduler overhead.
     """
@@ -4224,19 +8911,28 @@ def _cluster_chunk_size() -> int:
     except Exception:
         pass
     try:
+        if configured is not None:
+            return max(16, min(4096, int(configured)))
+    except Exception:
+        pass
+    try:
         from .config import load_params_yaml
         cfg = load_params_yaml() or {}
+        m3 = cfg.get("module3", {}) or {}
+        cfg_v = m3.get("parallel_chunk_cells")
+        if cfg_v is not None:
+            return max(16, min(4096, int(cfg_v)))
         m2 = cfg.get("module2", {}) or {}
         cfg_v = m2.get("parallel_chunk_cells")
         if cfg_v is not None:
-            return max(16, min(1024, int(cfg_v)))
+            return max(16, min(4096, int(cfg_v)))
     except Exception:
         pass
     try:
         v = int(os.environ.get("CELLSCOPE_CLUSTER_CHUNK", "512"))
-        return max(128, min(1024, v))
+        return max(128, min(4096, v))
     except Exception:
-        return 128
+        return 256
 
 
 def _state_path(out_dir: str) -> str:
@@ -4249,39 +8945,136 @@ def _load_state(out_dir: str) -> Optional[dict]:
         if os.path.exists(p):
             with open(p, "r", encoding="utf-8") as f:
                 return json.load(f)
-    except Exception:
-        pass
+    except Exception as exc:
+        _logging.getLogger("cellscope").warning(
+            "Could not read pipeline state from %s: %s",
+            _state_path(out_dir),
+            exc,
+        )
     return None
 
 def _save_state(out_dir: str, last_completed: str, extra: Optional[dict] = None) -> None:
     try:
-        import json, time
+        import time
         state = {"last_completed": last_completed, "ts": time.time()}
         if extra:
             state.update(extra)
-        with open(_state_path(out_dir), "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+        atomic_write_json(_state_path(out_dir), state)
+    except Exception as exc:
+        _logging.getLogger("cellscope").warning(
+            "Could not persist pipeline state after stage %s: %s",
+            last_completed,
+            exc,
+            exc_info=True,
+        )
 
 def _sanitize_obs_for_h5ad(adata: ad.AnnData) -> ad.AnnData:
     """Normalize obs values unsupported by older AnnData/HDF5 writers."""
     for col in adata.obs.columns:
         series = adata.obs[col]
-        if (
-            pd.api.types.is_string_dtype(series.dtype)
-            or isinstance(series.dtype, pd.CategoricalDtype)
-            or series.dtype == object
-        ):
-            series = series.astype(object)
-            series = series.where(pd.notnull(series), "")
-            series = series.apply(
+        # AnnData/HDF5 natively supports categorical and nullable string
+        # columns. Expanding them to Python objects used to perform one Python
+        # call per value and destroyed compact category codes on large runs.
+        if isinstance(series.dtype, pd.CategoricalDtype):
+            continue
+        if pd.api.types.is_string_dtype(series.dtype) and series.dtype != object:
+            continue
+        if series.dtype != object:
+            continue
+
+        non_missing = series[series.notna()]
+        sample = non_missing.iloc[:1024].to_numpy(dtype=object, copy=False)
+        contains_sequence = any(
+            isinstance(value, (list, tuple)) for value in sample
+        )
+        all_strings = all(isinstance(value, str) for value in sample)
+        if contains_sequence:
+            normalized = series.map(
                 lambda value: ",".join(map(str, value))
                 if isinstance(value, (list, tuple))
-                else str(value)
+                else ("" if pd.isna(value) else str(value))
             )
-            adata.obs[col] = series.astype(object)
+            adata.obs[col] = normalized.astype(object)
+        elif all_strings:
+            if series.isna().any():
+                adata.obs[col] = series.where(series.notna(), "")
+        else:
+            adata.obs[col] = series.where(series.notna(), "").astype(str)
     return adata
+
+
+def _atomic_write_adata(
+    adata: ad.AnnData,
+    path: str,
+    *,
+    compression: str,
+) -> None:
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.",
+        suffix=".tmp.h5ad",
+        dir=directory,
+    )
+    os.close(fd)
+    try:
+        adata.write_h5ad(temporary, compression=compression)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+@contextmanager
+def _compact_final_adata1_for_write(
+    adata1: ad.AnnData,
+    *,
+    enabled: bool,
+):
+    """Temporarily retain only the canonical MetaSpot DGI representation.
+
+    Final output compaction must not mutate the in-memory object or any resume
+    checkpoint: the pipeline may still need all relations while writing later
+    artifacts.  Holding references while the mappings are cleared avoids a
+    second multi-GiB AnnData copy.
+    """
+    if not enabled:
+        yield adata1
+        return
+
+    original_obsm = list(adata1.obsm.items())
+    original_obsp = list(adata1.obsp.items())
+    kept_obsm = [
+        (key, value)
+        for key, value in original_obsm
+        if key == METASPOT_DGI_KEY
+    ]
+    marker_key = "cellscope_final_output_compaction"
+    sentinel = object()
+    original_marker = adata1.uns.get(marker_key, sentinel)
+    adata1.obsm.clear()
+    adata1.obsm.update(kept_obsm)
+    adata1.obsp.clear()
+    adata1.uns[marker_key] = {
+        "enabled": True,
+        "kept_obsm": [key for key, _ in kept_obsm],
+        "omitted_obsm": [
+            key for key, _ in original_obsm if key != METASPOT_DGI_KEY
+        ],
+        "omitted_obsp": [key for key, _ in original_obsp],
+        "reason": "io.drop_embeddings",
+    }
+    try:
+        yield adata1
+    finally:
+        adata1.obsm.clear()
+        adata1.obsm.update(original_obsm)
+        adata1.obsp.clear()
+        adata1.obsp.update(original_obsp)
+        if original_marker is sentinel:
+            adata1.uns.pop(marker_key, None)
+        else:
+            adata1.uns[marker_key] = original_marker
 
 
 def _save_adata(adata: ad.AnnData, out_dir: str, name: str, compression: str = "lzf"):
@@ -4297,7 +9090,7 @@ def _save_adata(adata: ad.AnnData, out_dir: str, name: str, compression: str = "
             p,
         )
         # Avoid mutating the in-memory schema merely for writer compatibility.
-        adata.obs = original_obs.copy()
+        adata.obs = original_obs.copy(deep=False)
         _sanitize_obs_for_h5ad(adata)
         try:
             import anndata as _ad
@@ -4326,27 +9119,2495 @@ def _save_adata(adata: ad.AnnData, out_dir: str, name: str, compression: str = "
             except OSError:
                 pass
 
-def _save_fig(fig, out_dir: str, name: str):
+def _save_fig(fig, out_dir: str, name: str, *, dpi: int = 150):
     if not _io_should_write_figures():
         return
+    temporary = None
     try:
         p = os.path.join(_intermediate_dir(out_dir), f"{name}.png")
-        fig.savefig(p, bbox_inches='tight', dpi=150)
-    except Exception:
-        pass
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{name}.",
+            suffix=".tmp.png",
+            dir=os.path.dirname(p),
+        )
+        os.close(fd)
+        fig.savefig(temporary, bbox_inches='tight', dpi=int(dpi))
+        os.replace(temporary, p)
+        temporary = None
+        _logging.getLogger("cellscope").info(
+            "Saved diagnostic figure | name=%s | path=%s",
+            name,
+            p,
+        )
+    except Exception as exc:
+        _logging.getLogger("cellscope").warning(
+            "Failed to save diagnostic figure %s: %s",
+            name,
+            exc,
+            exc_info=True,
+        )
+    finally:
+        if temporary and os.path.exists(temporary):
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
 
 
-def run_pipeline(
+def _plot_metadomain_k_selection_diagnostics(
+    adata1: ad.AnnData,
+    out_dir: str,
+) -> Optional[pd.DataFrame]:
+    """Save the sampled automatic-K evidence alongside Module 5 outputs."""
+    metadata = adata1.uns.get("module5_metadomain_clustering", {})
+    if metadata.get("clustering_method") == "consensus_leiden":
+        rows: List[Dict[str, Any]] = []
+        selected_by_block: Dict[str, float] = {}
+        for block, block_meta in dict(
+            metadata.get("consensus_by_block", {})
+        ).items():
+            resolutions = np.asarray(
+                block_meta.get("candidate_resolution", []), dtype=float
+            )
+            stability = np.asarray(
+                block_meta.get("candidate_stability_ari", []), dtype=float
+            )
+            n_clusters = np.asarray(
+                block_meta.get("candidate_n_clusters", []), dtype=int
+            )
+            average_size = np.asarray(
+                block_meta.get("candidate_average_size", []), dtype=float
+            )
+            small_fraction = np.asarray(
+                block_meta.get("candidate_small_cluster_fraction", []),
+                dtype=float,
+            )
+            nonrecurrent_fraction = np.asarray(
+                block_meta.get("candidate_nonrecurrent_fraction", []),
+                dtype=float,
+            )
+            feasible = np.asarray(
+                block_meta.get("candidate_feasible", []), dtype=bool
+            )
+            if not (
+                resolutions.size
+                and all(
+                    values.size == resolutions.size
+                    for values in (
+                        stability,
+                        n_clusters,
+                        average_size,
+                        small_fraction,
+                        nonrecurrent_fraction,
+                        feasible,
+                    )
+                )
+            ):
+                continue
+            selected_resolution = float(
+                block_meta.get("selected_resolution", resolutions[0])
+            )
+            selected_by_block[str(block)] = selected_resolution
+            for index, resolution in enumerate(resolutions):
+                rows.append(
+                    {
+                        "block": str(block),
+                        "resolution": float(resolution),
+                        "stability_ari": float(stability[index]),
+                        "n_clusters": int(n_clusters[index]),
+                        "average_metaspots_per_cluster": float(
+                            average_size[index]
+                        ),
+                        "small_cluster_fraction": float(
+                            small_fraction[index]
+                        ),
+                        "nonrecurrent_fraction": float(
+                            nonrecurrent_fraction[index]
+                        ),
+                        "feasible": bool(feasible[index]),
+                        "selected": bool(
+                            np.isclose(resolution, selected_resolution)
+                        ),
+                    }
+                )
+        diagnostics = pd.DataFrame(rows)
+        if diagnostics.empty:
+            return None
+        fig, axes = plt.subplots(
+            1, 3, figsize=(16, 4.6), constrained_layout=True
+        )
+        palette = {
+            "N": _SUBCELLULAR_LABEL_PALETTE["Nucleus"],
+            "C": _SUBCELLULAR_LABEL_PALETTE["Cytosol"],
+            "A": _SUBCELLULAR_LABEL_PALETTE["Unknown"],
+        }
+        for block, group in diagnostics.groupby("block", sort=False):
+            color = palette.get(str(block), "#777777")
+            axes[0].plot(
+                group["resolution"],
+                group["stability_ari"],
+                marker="o",
+                color=color,
+                label=str(block),
+            )
+            axes[1].plot(
+                group["resolution"],
+                group["n_clusters"],
+                marker="o",
+                color=color,
+                label=str(block),
+            )
+            axes[2].plot(
+                group["resolution"],
+                100.0 * group["nonrecurrent_fraction"],
+                marker="o",
+                color=color,
+                label=f"{block}: nonrecurrent",
+            )
+            axes[2].plot(
+                group["resolution"],
+                100.0 * group["small_cluster_fraction"],
+                marker="s",
+                linestyle="--",
+                color=color,
+                label=f"{block}: small",
+            )
+            selected = selected_by_block[str(block)]
+            for axis in axes:
+                axis.axvline(selected, color=color, linestyle=":", alpha=0.7)
+        axes[0].set_ylim(-0.02, 1.02)
+        axes[0].set_ylabel("Cross-seed adjusted Rand index")
+        axes[0].set_title("Assignment stability")
+        axes[1].set_ylabel("Candidate MetaDomains")
+        axes[1].set_title("Resolution and granularity")
+        axes[2].set_ylabel("MetaSpots (%)")
+        axes[2].set_title("Occupancy and cross-cell recurrence")
+        for axis in axes:
+            axis.set_xlabel("Leiden resolution")
+            axis.legend(frameon=False, fontsize="small")
+        fig.suptitle(
+            "Stability-selected consensus Leiden",
+            fontsize=16,
+            fontweight="bold",
+        )
+        _save_fig(fig, out_dir, "metadomain_consensus_leiden_diagnostics")
+        plt.close(fig)
+        _save_dataframe(
+            diagnostics,
+            out_dir,
+            "module5_consensus_leiden_diagnostics",
+            diagnostic=True,
+        )
+        return diagnostics
+
+    selection = metadata.get("k_selection", {})
+    candidate_k = np.asarray(selection.get("candidate_k", []))
+    distortion = np.asarray(selection.get("distortion", []), dtype=float)
+    if candidate_k.size < 2 or distortion.size != candidate_k.size:
+        return None
+
+    def _aligned(name: str, default: float = np.nan) -> np.ndarray:
+        values = np.asarray(selection.get(name, []), dtype=float)
+        if values.size == candidate_k.size:
+            return values
+        return np.full(candidate_k.size, default, dtype=float)
+
+    diagnostics = pd.DataFrame(
+        {
+            "K": candidate_k.astype(int),
+            "heldout_distortion": distortion,
+            "stability_ari": _aligned("stability_ari"),
+            "small_cluster_fraction": _aligned(
+                "small_cluster_fraction"
+            ),
+            "empty_cluster_fraction": _aligned(
+                "empty_cluster_fraction"
+            ),
+        }
+    ).sort_values("K")
+    selected_k = int(selection.get("selected_k", candidate_k[0]))
+    knee_k = int(selection.get("knee_k", selected_k))
+    feasible = np.asarray(selection.get("feasible", []), dtype=bool)
+    if feasible.size == candidate_k.size:
+        diagnostics["feasible"] = feasible
+    else:
+        diagnostics["feasible"] = True
+    diagnostics["selected"] = diagnostics["K"].eq(selected_k)
+    diagnostics["distortion_knee"] = diagnostics["K"].eq(knee_k)
+
+    blue = "#4C78A8"
+    orange = "#F28E2B"
+    grey = "#9D9D9D"
+    fig, axes = plt.subplots(
+        1,
+        3,
+        figsize=(16, 4.6),
+        constrained_layout=True,
+    )
+
+    axes[0].plot(
+        diagnostics["K"],
+        diagnostics["heldout_distortion"],
+        marker="o",
+        color=blue,
+        linewidth=2,
+    )
+    axes[0].scatter(
+        [selected_k],
+        diagnostics.loc[
+            diagnostics["selected"],
+            "heldout_distortion",
+        ],
+        s=90,
+        color=orange,
+        edgecolor="black",
+        zorder=4,
+        label=f"Selected K={selected_k}",
+    )
+    axes[0].axvline(knee_k, color=grey, linestyle="--")
+    axes[0].set_xscale("log")
+    axes[0].set_title("Held-out clustering distortion")
+    axes[0].set_xlabel("Candidate K (log scale)")
+    axes[0].set_ylabel(
+        "Mean 1 − cosine similarity"
+        if bool(selection.get("use_cosine", True))
+        else "Mean squared distance"
+    )
+    axes[0].legend(frameon=False)
+
+    axes[1].plot(
+        diagnostics["K"],
+        diagnostics["stability_ari"],
+        marker="o",
+        color=blue,
+        linewidth=2,
+    )
+    stability_min = float(selection.get("stability_min", 0.4))
+    axes[1].axhline(
+        stability_min,
+        color=grey,
+        linestyle="--",
+        label=f"Minimum={stability_min:.2f}",
+    )
+    axes[1].axvline(selected_k, color=orange, linestyle=":")
+    axes[1].set_xscale("log")
+    axes[1].set_ylim(-0.02, 1.02)
+    axes[1].set_title("Cross-seed assignment stability")
+    axes[1].set_xlabel("Candidate K (log scale)")
+    axes[1].set_ylabel("Adjusted Rand index")
+    axes[1].legend(frameon=False)
+
+    axes[2].plot(
+        diagnostics["K"],
+        100.0 * diagnostics["small_cluster_fraction"],
+        marker="o",
+        color=blue,
+        linewidth=2,
+        label="Small-cluster MetaSpots",
+    )
+    axes[2].plot(
+        diagnostics["K"],
+        100.0 * diagnostics["empty_cluster_fraction"],
+        marker="s",
+        color=grey,
+        linewidth=1.5,
+        label="Empty clusters",
+    )
+    max_small = float(
+        selection.get("max_small_cluster_fraction", 0.01)
+    )
+    axes[2].axhline(
+        100.0 * max_small,
+        color=grey,
+        linestyle="--",
+        label=f"Maximum={100.0 * max_small:.1f}%",
+    )
+    axes[2].axvline(selected_k, color=orange, linestyle=":")
+    axes[2].set_xscale("log")
+    axes[2].set_title("Candidate occupancy diagnostics")
+    axes[2].set_xlabel("Candidate K (log scale)")
+    axes[2].set_ylabel("Fraction (%)")
+    axes[2].legend(frameon=False, fontsize="small")
+
+    reason = str(selection.get("selection_reason", ""))
+    fig.suptitle(
+        "MetaDomain automatic K selection"
+        f" · {reason.replace('_', ' ')}",
+        fontsize=16,
+        fontweight="bold",
+    )
+    _save_fig(fig, out_dir, "metadomain_k_selection_diagnostics")
+    plt.close(fig)
+    _save_dataframe(
+        diagnostics,
+        out_dir,
+        "module5_k_selection_diagnostics",
+        diagnostic=True,
+    )
+    return diagnostics
+
+
+def _metadomain_broad_compartment(values: Sequence[object]) -> np.ndarray:
+    values = np.asarray(values, dtype=object)
+    broad = np.full(values.size, "Other", dtype=object)
+    broad[
+        np.isin(
+            values,
+            [
+                "Nucleus",
+                "Nucleolus",
+                "Lamina",
+                "Nuclear Pore",
+            ],
+        )
+    ] = "Nuclear"
+    broad[
+        np.isin(
+            values,
+            ["Cytosol", "ER", "OMM"],
+        )
+    ] = "Cytoplasmic"
+    return broad
+
+
+def _attach_annotation_provenance_columns(
+    frame: pd.DataFrame,
+) -> pd.DataFrame:
+    """Describe how production labels relate to MetaDomain evidence."""
+    required = {
+        "subcellular_annotation_domain",
+        "subcellular_annotation",
+    }
+    if not required.issubset(frame.columns):
+        return frame
+    comparison_column = (
+        "subcellular_annotation_compatibility"
+        if "subcellular_annotation_compatibility" in frame.columns
+        else "subcellular_annotation"
+    )
+    categories = list(_SUBCELLULAR_LABEL_ORDER)
+    unknown_code = categories.index("Unknown")
+
+    def _annotation_codes(values: pd.Series) -> np.ndarray:
+        codes = pd.Categorical(values, categories=categories).codes.astype(
+            np.int8,
+            copy=False,
+        )
+        if np.any(codes < 0):
+            codes = codes.copy()
+            codes[codes < 0] = unknown_code
+        return codes
+
+    domain_codes = _annotation_codes(
+        frame["subcellular_annotation_domain"]
+    )
+    final_codes = _annotation_codes(frame[comparison_column])
+    changed = domain_codes != final_codes
+    broad_lookup = np.zeros(len(categories), dtype=np.int8)
+    broad_lookup[
+        [
+            categories.index(label)
+            for label in _SUBCELLULAR_LABEL_GROUPS["Nuclear side"]
+        ]
+    ] = 1
+    broad_lookup[
+        [
+            categories.index(label)
+            for label in _SUBCELLULAR_LABEL_GROUPS["Cytoplasmic side"]
+        ]
+    ] = 2
+    domain_broad = broad_lookup[domain_codes]
+    final_broad = broad_lookup[final_codes]
+    broad_changed = domain_broad != final_broad
+    provenance_codes = np.zeros(
+        len(frame),
+        dtype=np.int8,
+    )
+    provenance_codes[changed & ~broad_changed] = 1
+    provenance_codes[changed & broad_changed] = 2
+    supported = ~changed
+    for column in (
+        "subcellular_annotation_domain_strict",
+        "subcellular_annotation_domain_exploratory",
+    ):
+        if column in frame.columns:
+            evidence_codes = _annotation_codes(frame[column])
+            supported |= (
+                (evidence_codes == final_codes)
+                & (evidence_codes != unknown_code)
+            )
+    return _replace_frame_columns(
+        frame,
+        {
+            "subcellular_annotation_provenance": (
+                pd.Categorical.from_codes(
+                    provenance_codes,
+                    categories=[
+                        "MetaDomain RAP-X",
+                        "MetaSpot subtype/local refinement",
+                        "MetaSpot broad-compartment correction",
+                    ],
+                )
+            ),
+            "final_label_matches_domain_annotation": ~changed,
+            "final_label_supported_by_domain_evidence": supported,
+        },
+    )
+
+
+def _build_metadomain_annotation_quality_tables(
+    adata1: ad.AnnData,
+) -> Dict[str, Any]:
+    """Build scalable MetaDomain aggregation and label-transfer diagnostics."""
+    required = {
+        "meta-domain",
+        "subcellular_annotation_domain",
+        "subcellular_annotation",
+    }
+    missing = sorted(required.difference(adata1.obs.columns))
+    if missing:
+        raise KeyError(
+            "MetaDomain quality diagnostics require adata1.obs columns: "
+            + ", ".join(missing)
+        )
+
+    domains = adata1.obs["meta-domain"].astype(str)
+    domain_codes, domain_names_raw = pd.factorize(domains, sort=True)
+    domain_names = pd.Index(
+        domain_names_raw.astype(str),
+        name="meta-domain",
+    )
+    n_domains = len(domain_names)
+    n_spots = adata1.n_obs
+    sizes = np.bincount(domain_codes, minlength=n_domains)
+
+    domain_labels = (
+        adata1.obs["subcellular_annotation_domain"]
+        .astype("string")
+        .fillna("Unknown")
+        .astype(str)
+        .to_numpy()
+    )
+    compatibility_column = (
+        "subcellular_annotation_compatibility"
+        if "subcellular_annotation_compatibility" in adata1.obs.columns
+        else "subcellular_annotation"
+    )
+    final_labels = (
+        adata1.obs[compatibility_column]
+        .astype("string")
+        .fillna("Unknown")
+        .astype(str)
+        .to_numpy()
+    )
+    exact_agreement = domain_labels == final_labels
+    broad_domain = _metadomain_broad_compartment(domain_labels)
+    broad_final = _metadomain_broad_compartment(final_labels)
+    broad_agreement = broad_domain == broad_final
+
+    geometry = np.full(n_spots, "Unavailable", dtype=object)
+    if "r_mean" in adata1.obs.columns:
+        r_mean = pd.to_numeric(
+            adata1.obs["r_mean"],
+            errors="coerce",
+        ).to_numpy(float)
+        finite = np.isfinite(r_mean)
+        geometry[finite & (r_mean < 0)] = "Nuclear"
+        geometry[finite & (r_mean >= 0)] = "Cytoplasmic"
+
+    loo_cosine = np.full(n_spots, np.nan, dtype=np.float32)
+    clustering_meta = adata1.uns.get(
+        "module5_metadomain_clustering",
+        {},
+    )
+    representation_key = str(
+        clustering_meta.get("cluster_rep", "")
+    )
+    if (
+        representation_key == METASPOT_DGI_KEY
+        and representation_key not in adata1.obsm
+        and "X_dgi_gcn" in adata1.obsm
+    ):
+        representation_key = "X_dgi_gcn"
+    representation_available = representation_key in adata1.obsm
+    if representation_available:
+        from sklearn.preprocessing import normalize
+
+        representation = np.asarray(
+            adata1.obsm[representation_key],
+            dtype=np.float32,
+        )
+        representation = StandardScaler().fit_transform(
+            representation
+        ).astype(np.float32)
+        representation = normalize(
+            representation,
+            norm="l2",
+        ).astype(np.float32)
+        sums = np.zeros(
+            (n_domains, representation.shape[1]),
+            dtype=np.float32,
+        )
+        np.add.at(sums, domain_codes, representation)
+        valid_loo = sizes[domain_codes] > 1
+        own_loo = normalize(
+            sums[domain_codes[valid_loo]]
+            - representation[valid_loo],
+            norm="l2",
+        )
+        loo_cosine[valid_loo] = np.einsum(
+            "ij,ij->i",
+            representation[valid_loo],
+            own_loo,
+        ).astype(np.float32)
+
+    spot_table = pd.DataFrame(
+        {
+            "meta-domain": domains.to_numpy(),
+            "cell_id": (
+                adata1.obs["cell_id"].astype(str).to_numpy()
+                if "cell_id" in adata1.obs.columns
+                else "Unavailable"
+            ),
+            "geometry_compartment": geometry,
+            "domain_annotation": domain_labels,
+            "final_annotation": final_labels,
+            "domain_final_exact_agreement": exact_agreement,
+            "domain_final_broad_agreement": broad_agreement,
+            "embedding_loo_cosine": loo_cosine,
+        },
+        index=adata1.obs_names,
+    )
+    grouped = spot_table.groupby("meta-domain", sort=False)
+
+    def _purity(series: pd.Series) -> float:
+        counts = series.value_counts(dropna=False)
+        return float(counts.iloc[0] / counts.sum())
+
+    def _mode(series: pd.Series) -> str:
+        return str(series.value_counts(dropna=False).index[0])
+
+    domain_table = pd.DataFrame(index=domain_names)
+    domain_table["n_metaspots"] = grouped.size().reindex(domain_names)
+    domain_table["domain_label"] = (
+        grouped["domain_annotation"].apply(_mode).reindex(domain_names)
+    )
+    domain_table["dominant_final_label"] = (
+        grouped["final_annotation"].apply(_mode).reindex(domain_names)
+    )
+    domain_table["geometry_purity"] = (
+        grouped["geometry_compartment"]
+        .apply(_purity)
+        .reindex(domain_names)
+    )
+    domain_table["final_label_purity"] = (
+        grouped["final_annotation"]
+        .apply(_purity)
+        .reindex(domain_names)
+    )
+    domain_table["domain_final_exact_agreement"] = (
+        grouped["domain_final_exact_agreement"]
+        .mean()
+        .reindex(domain_names)
+    )
+    domain_table["domain_final_broad_agreement"] = (
+        grouped["domain_final_broad_agreement"]
+        .mean()
+        .reindex(domain_names)
+    )
+    domain_table["embedding_loo_cosine_median"] = (
+        grouped["embedding_loo_cosine"]
+        .median()
+        .reindex(domain_names)
+    )
+    domain_table["representation_key"] = representation_key
+    domain_table["representation_available"] = representation_available
+
+    if "cell_id" in adata1.obs.columns:
+        cell_counts = (
+            spot_table.groupby(["meta-domain", "cell_id"]).size()
+        )
+        domain_table["n_cells"] = (
+            cell_counts.groupby(level=0)
+            .size()
+            .reindex(domain_names)
+        )
+        domain_table["dominant_cell_fraction"] = (
+            cell_counts.groupby(level=0).max()
+            / cell_counts.groupby(level=0).sum()
+        ).reindex(domain_names)
+
+    transfer_counts = pd.crosstab(
+        spot_table["domain_annotation"],
+        spot_table["final_annotation"],
+    )
+    transfer_fraction = transfer_counts.div(
+        transfer_counts.sum(axis=1).replace(0, np.nan),
+        axis=0,
+    ).fillna(0.0)
+    transfer_long = (
+        transfer_counts.rename_axis(
+            index="domain_annotation",
+            columns="final_annotation",
+        )
+        .stack()
+        .rename("n_metaspots")
+        .reset_index()
+    )
+    fraction_lookup = (
+        transfer_fraction.rename_axis(
+            index="domain_annotation",
+            columns="final_annotation",
+        )
+        .stack()
+        .rename("row_fraction")
+        .reset_index()
+    )
+    transfer_long = transfer_long.merge(
+        fraction_lookup,
+        on=["domain_annotation", "final_annotation"],
+        how="left",
+    )
+
+    domain_composition = pd.Series(
+        domain_labels,
+        dtype="object",
+    ).value_counts(normalize=True)
+    final_composition = pd.Series(
+        final_labels,
+        dtype="object",
+    ).value_counts(normalize=True)
+    composition_labels = list(
+        dict.fromkeys(
+            [
+                "Nucleus",
+                "Nucleolus",
+                "Lamina",
+                "Nuclear Pore",
+                "Cytosol",
+                "ER",
+                "OMM",
+                "Unknown",
+            ]
+            + domain_composition.index.tolist()
+            + final_composition.index.tolist()
+        )
+    )
+    composition = pd.DataFrame(
+        {
+            "label": composition_labels,
+            "domain_evidence_fraction": domain_composition.reindex(
+                composition_labels,
+                fill_value=0.0,
+            ).to_numpy(),
+            "final_metaspot_fraction": final_composition.reindex(
+                composition_labels,
+                fill_value=0.0,
+            ).to_numpy(),
+        }
+    )
+    composition = composition[
+        (
+            composition["domain_evidence_fraction"]
+            + composition["final_metaspot_fraction"]
+        )
+        > 0
+    ].reset_index(drop=True)
+
+    summary = {
+        "n_metaspots": int(n_spots),
+        "n_metadomains": int(n_domains),
+        "weighted_geometry_purity": float(
+            np.average(
+                domain_table["geometry_purity"],
+                weights=domain_table["n_metaspots"],
+            )
+        ),
+        "domain_final_exact_agreement": float(
+            np.mean(exact_agreement)
+        ),
+        "domain_final_broad_agreement": float(
+            np.mean(broad_agreement)
+        ),
+        "representation_key": representation_key,
+        "representation_available": representation_available,
+    }
+    return {
+        "domains": domain_table,
+        "spots": spot_table,
+        "transfer_counts": transfer_counts,
+        "transfer_fraction": transfer_fraction,
+        "transfer_long": transfer_long,
+        "composition": composition,
+        "summary": summary,
+    }
+
+
+def _plot_metadomain_annotation_quality(
+    adata1: ad.AnnData,
+    out_dir: str,
+) -> Optional[Dict[str, Any]]:
+    """Save MetaDomain aggregation and annotation-transfer diagnostics."""
+    try:
+        tables = _build_metadomain_annotation_quality_tables(adata1)
+    except Exception as exc:
+        _logging.getLogger("cellscope").warning(
+            "MetaDomain quality plotting skipped: %s",
+            exc,
+        )
+        return None
+
+    domains = tables["domains"]
+    transfer_fraction = tables["transfer_fraction"]
+    composition = tables["composition"]
+    summary = tables["summary"]
+    blue = "#4C78A8"
+    orange = "#F28E2B"
+    grey = "#9D9D9D"
+
+    fig, axes = plt.subplots(
+        2,
+        3,
+        figsize=(18, 10),
+        constrained_layout=True,
+    )
+
+    axes[0, 0].hist(
+        domains["n_metaspots"],
+        bins=min(25, max(8, int(np.sqrt(len(domains))))),
+        color=blue,
+        edgecolor="white",
+    )
+    median_size = float(domains["n_metaspots"].median())
+    axes[0, 0].axvline(
+        median_size,
+        color=orange,
+        linestyle="--",
+        label=f"Median={median_size:.0f}",
+    )
+    axes[0, 0].set_title("MetaSpots per MetaDomain")
+    axes[0, 0].set_xlabel("MetaSpots")
+    axes[0, 0].set_ylabel("MetaDomains")
+    axes[0, 0].legend(frameon=False)
+
+    agreement_labels = ["Exact label", "Broad compartment"]
+    agreement_values = 100.0 * np.asarray(
+        [
+            summary["domain_final_exact_agreement"],
+            summary["domain_final_broad_agreement"],
+        ],
+        dtype=float,
+    )
+    agreement_bars = axes[0, 1].bar(
+        agreement_labels,
+        agreement_values,
+        color=[blue, orange],
+        edgecolor="white",
+        width=0.62,
+    )
+    axes[0, 1].bar_label(
+        agreement_bars,
+        labels=[f"{value:.1f}%" for value in agreement_values],
+        padding=4,
+    )
+    axes[0, 1].set_ylim(0.0, 100.0)
+    axes[0, 1].set_title(
+        "Domain evidence retained after MetaSpot update"
+    )
+    axes[0, 1].set_ylabel("Agreement with final MetaSpot label (%)")
+    axes[0, 1].tick_params(axis="x", rotation=12)
+
+    axes[0, 2].hist(
+        domains["geometry_purity"],
+        bins=np.linspace(0.5, 1.0, 16),
+        color=blue,
+        edgecolor="white",
+    )
+    axes[0, 2].axvline(
+        summary["weighted_geometry_purity"],
+        color=orange,
+        linestyle="--",
+        label=(
+            "MetaSpot-weighted="
+            f"{summary['weighted_geometry_purity']:.3f}"
+        ),
+    )
+    axes[0, 2].set_xlim(0.48, 1.02)
+    axes[0, 2].set_title(
+        "Nuclear/cytoplasmic purity by MetaDomain"
+    )
+    axes[0, 2].set_xlabel("Within-domain geometry purity")
+    axes[0, 2].set_ylabel("MetaDomains")
+    axes[0, 2].legend(frameon=False)
+
+    sizes = domains["n_metaspots"].to_numpy(float)
+    point_sizes = 25.0 + 155.0 * sizes / max(1.0, sizes.max())
+    color_values = domains[
+        "embedding_loo_cosine_median"
+    ].to_numpy(float)
+    finite_color = np.isfinite(color_values)
+    color_range = (
+        float(np.nanmax(color_values) - np.nanmin(color_values))
+        if finite_color.any()
+        else np.nan
+    )
+    if finite_color.any() and color_range > 1e-4:
+        fill_value = float(np.nanmedian(color_values))
+        scatter = axes[1, 0].scatter(
+            domains["geometry_purity"],
+            domains["domain_final_broad_agreement"],
+            c=np.where(finite_color, color_values, fill_value),
+            s=point_sizes,
+            cmap="viridis",
+            alpha=0.78,
+            edgecolor="white",
+            linewidth=0.4,
+        )
+        fig.colorbar(
+            scatter,
+            ax=axes[1, 0],
+            label="Median embedding cosine",
+        )
+    else:
+        axes[1, 0].scatter(
+            domains["geometry_purity"],
+            domains["domain_final_broad_agreement"],
+            s=point_sizes,
+            color=blue,
+            alpha=0.78,
+            edgecolor="white",
+            linewidth=0.4,
+        )
+    axes[1, 0].axvline(0.8, color=grey, linestyle=":")
+    axes[1, 0].axhline(0.5, color=grey, linestyle=":")
+    axes[1, 0].set_xlim(0.48, 1.02)
+    axes[1, 0].set_ylim(-0.02, 1.02)
+    axes[1, 0].set_title("Geometry purity and label transfer")
+    axes[1, 0].set_xlabel("Within-domain geometry purity")
+    axes[1, 0].set_ylabel("Domain-to-final broad-label agreement")
+
+    sns.heatmap(
+        transfer_fraction,
+        cmap="Blues",
+        vmin=0.0,
+        vmax=1.0,
+        annot=(
+            transfer_fraction.shape[0] <= 9
+            and transfer_fraction.shape[1] <= 9
+        ),
+        fmt=".0%",
+        cbar_kws={"label": "Row fraction"},
+        ax=axes[1, 1],
+    )
+    axes[1, 1].set_title(
+        "Domain evidence to final MetaSpot labels"
+    )
+    axes[1, 1].set_xlabel("Final MetaSpot label")
+    axes[1, 1].set_ylabel("MetaDomain evidence label")
+    axes[1, 1].tick_params(axis="x", rotation=35)
+    axes[1, 1].tick_params(axis="y", rotation=0)
+
+    y = np.arange(len(composition))
+    height = 0.36
+    axes[1, 2].barh(
+        y - height / 2,
+        100.0 * composition["domain_evidence_fraction"],
+        height,
+        color=grey,
+        label="Domain evidence",
+    )
+    axes[1, 2].barh(
+        y + height / 2,
+        100.0 * composition["final_metaspot_fraction"],
+        height,
+        color=blue,
+        label="Final MetaSpot",
+    )
+    axes[1, 2].set_yticks(y)
+    axes[1, 2].set_yticklabels(composition["label"])
+    axes[1, 2].invert_yaxis()
+    axes[1, 2].set_title("MetaSpot-weighted label composition")
+    axes[1, 2].set_xlabel("MetaSpots (%)")
+    axes[1, 2].legend(frameon=False)
+
+    fig.suptitle(
+        "MetaDomain aggregation and annotation quality"
+        f" · {summary['n_metaspots']:,} MetaSpots"
+        f" · {summary['n_metadomains']:,} MetaDomains"
+        f" · broad-label agreement="
+        f"{summary['domain_final_broad_agreement']:.1%}"
+        f" · corrected="
+        f"{1.0 - summary['domain_final_broad_agreement']:.1%}",
+        fontsize=16,
+        fontweight="bold",
+    )
+    _save_fig(fig, out_dir, "metadomain_annotation_quality")
+    plt.close(fig)
+
+    _save_dataframe(
+        domains.reset_index(),
+        out_dir,
+        "metadomain_quality_by_domain",
+        diagnostic=True,
+    )
+    _save_dataframe(
+        tables["transfer_long"],
+        out_dir,
+        "metadomain_annotation_transfer",
+        diagnostic=True,
+    )
+    _save_dataframe(
+        composition,
+        out_dir,
+        "metadomain_label_composition",
+        diagnostic=True,
+    )
+    return tables
+
+
+def _plot_metadomain_subcellular_annotation(
+    adata2,
+    out_dir: str,
+    *,
+    label_col: str = "subcellular_annotation",
+) -> bool:
+    """Save the MetaDomain UMAP using final production annotation colors."""
+    if "X_umap" not in adata2.obsm:
+        _logging.getLogger("cellscope").warning(
+            "MetaDomain annotation UMAP skipped: X_umap is unavailable."
+        )
+        return False
+    if label_col not in adata2.obs.columns:
+        _logging.getLogger("cellscope").warning(
+            "MetaDomain annotation UMAP skipped: label column %s is unavailable.",
+            label_col,
+        )
+        return False
+
+    labels = (
+        adata2.obs[label_col]
+        .astype("string")
+        .fillna("Unknown")
+        .astype(str)
+    )
+    observed = set(labels.unique())
+    categories = [
+        label for label in _SUBCELLULAR_LABEL_ORDER if label in observed
+    ]
+    categories.extend(sorted(observed.difference(categories)))
+
+    coordinates = np.asarray(adata2.obsm["X_umap"])
+    if coordinates.ndim != 2 or coordinates.shape != (adata2.n_obs, 2):
+        raise ValueError(
+            "X_umap must have shape (n_metadomains, 2); "
+            f"received {coordinates.shape}."
+        )
+
+    import matplotlib as mpl
+    import matplotlib.pyplot as plt
+
+    with mpl.rc_context(_PUBLICATION_PLOT_STYLE):
+        fig, ax = plt.subplots(figsize=(7.4, 5.0))
+        draw_order = [
+            "Unknown",
+            "Cytosol",
+            "Nucleus",
+            "ER",
+            "OMM",
+            "Lamina",
+            "Nuclear Pore",
+            "Nucleolus",
+        ]
+        draw_order.extend(
+            sorted(set(categories).difference(draw_order))
+        )
+        handles = {}
+        for label in draw_order:
+            mask = labels.eq(label).to_numpy()
+            if not mask.any():
+                continue
+            collection = ax.scatter(
+                coordinates[mask, 0],
+                coordinates[mask, 1],
+                s=10,
+                linewidth=0,
+                alpha=0.8,
+                rasterized=True,
+                color=_SUBCELLULAR_LABEL_PALETTE.get(label, "#7F7F7F"),
+                label=label,
+            )
+            handles[label] = collection
+
+        ax.set_title("MetaDomain Subcellular Annotation")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        nuclear_handles = [
+            handles[label]
+            for label in _SUBCELLULAR_LABEL_GROUPS["Nuclear side"]
+            if label in handles
+        ]
+        cytoplasmic_handles = [
+            handles[label]
+            for label in _SUBCELLULAR_LABEL_GROUPS["Cytoplasmic side"]
+            if label in handles
+        ]
+        if nuclear_handles:
+            nuclear_legend = ax.legend(
+                handles=nuclear_handles,
+                title="Nuclear side",
+                loc="upper left",
+                bbox_to_anchor=(1.01, 0.98),
+                borderaxespad=0,
+                markerscale=1.7,
+            )
+            nuclear_legend.get_title().set_fontweight("bold")
+            ax.add_artist(nuclear_legend)
+        if cytoplasmic_handles:
+            cytoplasmic_legend = ax.legend(
+                handles=cytoplasmic_handles,
+                title="Cytoplasmic side",
+                loc="upper left",
+                bbox_to_anchor=(1.01, 0.48),
+                borderaxespad=0,
+                markerscale=1.7,
+            )
+            cytoplasmic_legend.get_title().set_fontweight("bold")
+        if "Unknown" in handles:
+            if cytoplasmic_handles:
+                ax.add_artist(cytoplasmic_legend)
+            unknown_legend = ax.legend(
+                handles=[handles["Unknown"]],
+                title="Other",
+                loc="upper left",
+                bbox_to_anchor=(1.01, 0.18),
+                borderaxespad=0,
+                markerscale=1.7,
+            )
+            unknown_legend.get_title().set_fontweight("bold")
+
+        fig.subplots_adjust(right=0.74)
+        _save_fig(
+            fig,
+            out_dir,
+            "metadomain_leiden_clusters",
+            dpi=800,
+        )
+    plt.close(fig)
+    return True
+
+
+def _normalize_overlaps_nucleus_labels(values: pd.Series) -> pd.Series:
+    """Map geometric nucleus membership to explicit nuclear/cytosolic labels."""
+    series = pd.Series(values, copy=False)
+    codes = np.full(len(series), -1, dtype=np.int8)
+
+    if pd.api.types.is_bool_dtype(series.dtype):
+        valid = series.notna().to_numpy()
+        truth = series.fillna(False).to_numpy(dtype=bool)
+        codes[valid & truth] = 0
+        codes[valid & ~truth] = 1
+    elif pd.api.types.is_numeric_dtype(series.dtype):
+        numeric = pd.to_numeric(series, errors="coerce")
+        valid = series.notna()
+        invalid = valid & ~numeric.isin([0, 1])
+        if invalid.any():
+            preview = series.loc[invalid].value_counts().head(10).to_dict()
+            raise ValueError(
+                "overlaps_nucleus must contain only boolean or 0/1 values; "
+                f"unrecognized values={preview}"
+            )
+        codes[numeric.eq(1).to_numpy()] = 0
+        codes[numeric.eq(0).to_numpy()] = 1
+    else:
+        normalized = series.astype("string").str.strip().str.lower()
+        nuclear_values = {"true", "1", "1.0", "t", "yes"}
+        cytosolic_values = {"false", "0", "0.0", "f", "no"}
+        nuclear = normalized.isin(nuclear_values)
+        cytosolic = normalized.isin(cytosolic_values)
+        invalid = series.notna() & ~(nuclear | cytosolic)
+        if invalid.any():
+            preview = series.loc[invalid].value_counts().head(10).to_dict()
+            raise ValueError(
+                "overlaps_nucleus must contain only boolean or 0/1 values; "
+                f"unrecognized values={preview}"
+            )
+        codes[nuclear.to_numpy()] = 0
+        codes[cytosolic.to_numpy()] = 1
+
+    categorical = pd.Categorical.from_codes(
+        codes,
+        categories=["Nucleus", "Cytosol"],
+    )
+    return pd.Series(categorical, index=series.index, name="label")
+
+
+def _build_per_cell_label_proportion_tables(
+    cell_ids: pd.Series,
+    labels: pd.Series,
+    *,
+    preferred_order: Sequence[str],
+) -> Dict[str, pd.DataFrame]:
+    """Build zero-complete per-cell percentages and their exact summary."""
+    cells = pd.Series(cell_ids, copy=False)
+    label_values = pd.Series(labels, copy=False)
+    valid = cells.notna() & label_values.notna()
+    if not valid.any():
+        raise ValueError("No transcripts have both a cell ID and a label")
+
+    valid_cells = cells.loc[valid]
+    valid_labels = label_values.loc[valid]
+    cell_codes, cell_index = pd.factorize(valid_cells, sort=False)
+    observed_codes, observed_index = pd.factorize(
+        valid_labels,
+        sort=False,
+    )
+    observed_labels = [str(value) for value in observed_index]
+    label_order = list(
+        dict.fromkeys(
+            [str(value) for value in preferred_order] + observed_labels
+        )
+    )
+    if not label_order:
+        raise ValueError("No label categories are available for plotting")
+
+    label_position = {label: idx for idx, label in enumerate(label_order)}
+    observed_to_order = np.asarray(
+        [label_position[label] for label in observed_labels],
+        dtype=np.int64,
+    )
+    ordered_codes = observed_to_order[observed_codes]
+    n_cells = len(cell_index)
+    n_labels = len(label_order)
+    flat_codes = cell_codes.astype(np.int64, copy=False) * n_labels
+    flat_codes += ordered_codes
+    counts_array = np.bincount(
+        flat_codes,
+        minlength=n_cells * n_labels,
+    ).reshape(n_cells, n_labels)
+    counts = pd.DataFrame(
+        counts_array,
+        index=pd.Index(cell_index, name="cell_id"),
+        columns=pd.Index(label_order, name="label"),
+    )
+    cell_totals = counts.sum(axis=1)
+    proportions = counts.div(cell_totals, axis=0).mul(100.0)
+
+    transcript_counts = counts.sum(axis=0)
+    total_transcripts = int(transcript_counts.sum())
+    cells_with_label = counts.gt(0).sum(axis=0)
+    quartiles = proportions.quantile([0.25, 0.75]).T
+    summary = pd.DataFrame(
+        {
+            "label": label_order,
+            "n_transcripts": transcript_counts.to_numpy(dtype=np.int64),
+            "global_transcript_percentage": (
+                transcript_counts.to_numpy(dtype=float)
+                / max(1, total_transcripts)
+                * 100.0
+            ),
+            "n_cells_total": n_cells,
+            "n_cells_with_label": cells_with_label.to_numpy(dtype=np.int64),
+            "cell_detection_percentage": (
+                cells_with_label.to_numpy(dtype=float)
+                / max(1, n_cells)
+                * 100.0
+            ),
+            "median_cell_percentage": proportions.median(axis=0).to_numpy(),
+            "q1_cell_percentage": quartiles[0.25].to_numpy(),
+            "q3_cell_percentage": quartiles[0.75].to_numpy(),
+            "mean_cell_percentage": proportions.mean(axis=0).to_numpy(),
+            "std_cell_percentage": proportions.std(axis=0).to_numpy(),
+            "min_cell_percentage": proportions.min(axis=0).to_numpy(),
+            "max_cell_percentage": proportions.max(axis=0).to_numpy(),
+        }
+    )
+    return {
+        "counts": counts,
+        "proportions": proportions,
+        "summary": summary,
+    }
+
+
+def _build_ground_truth_nuclear_cytoplasmic_proportions(
+    final_df: pd.DataFrame,
+) -> Dict[str, pd.DataFrame]:
+    """Summarize per-cell geometric nuclear/cytoplasmic transcript shares."""
+    required = {"cell_id", "overlaps_nucleus"}
+    missing = sorted(required.difference(final_df.columns))
+    if missing:
+        raise KeyError(
+            "Ground-truth proportion plot requires final-data columns: "
+            + ", ".join(missing)
+        )
+    labels = _normalize_overlaps_nucleus_labels(
+        final_df["overlaps_nucleus"]
+    )
+    return _build_per_cell_label_proportion_tables(
+        final_df["cell_id"],
+        labels,
+        preferred_order=["Nucleus", "Cytosol"],
+    )
+
+
+def _build_final_annotation_proportions(
+    final_df: pd.DataFrame,
+) -> Dict[str, pd.DataFrame]:
+    """Summarize per-cell transcript shares for the final production labels."""
+    required = {"cell_id", "subcellular_annotation"}
+    missing = sorted(required.difference(final_df.columns))
+    if missing:
+        raise KeyError(
+            "Final-annotation proportion plot requires final-data columns: "
+            + ", ".join(missing)
+        )
+    labels = final_df["subcellular_annotation"]
+    if isinstance(labels.dtype, pd.CategoricalDtype):
+        if "Unknown" not in labels.cat.categories:
+            labels = labels.cat.add_categories(["Unknown"])
+        labels = labels.fillna("Unknown")
+    else:
+        labels = labels.where(labels.notna(), "Unknown")
+    preferred = [
+        label for label in _SUBCELLULAR_LABEL_ORDER if label != "Unknown"
+    ]
+    return _build_per_cell_label_proportion_tables(
+        final_df["cell_id"],
+        labels,
+        preferred_order=preferred,
+    )
+
+
+def _build_fine_annotation_proportions(
+    final_df: pd.DataFrame,
+) -> Dict[str, pd.DataFrame]:
+    """Summarize seven-class labels; uncertainty lives in state columns."""
+    required = {"cell_id", "subcellular_fine_annotation"}
+    missing = sorted(required.difference(final_df.columns))
+    if missing:
+        raise KeyError(
+            "Fine-annotation proportion plot requires final-data columns: "
+            + ", ".join(missing)
+        )
+    labels = final_df["subcellular_fine_annotation"]
+    if isinstance(labels.dtype, pd.CategoricalDtype):
+        if "Unknown" not in labels.cat.categories:
+            labels = labels.cat.add_categories(["Unknown"])
+        labels = labels.fillna("Unknown")
+    else:
+        labels = labels.where(labels.notna(), "Unknown")
+    preferred = [
+        label for label in _SUBCELLULAR_LABEL_ORDER if label != "Unknown"
+    ]
+    return _build_per_cell_label_proportion_tables(
+        final_df["cell_id"],
+        labels,
+        preferred_order=preferred,
+    )
+
+
+def _plot_per_cell_label_proportions(
+    tables: Mapping[str, pd.DataFrame],
+    out_dir: str,
+    *,
+    name: str,
+    title: str,
+    color: Optional[str] = None,
+    palette: Optional[Mapping[str, str]] = None,
+) -> None:
+    """Save one full-scale per-cell boxplot plus its exact summary table."""
+    proportions = tables["proportions"]
+    summary = tables["summary"]
+    long = (
+        proportions.rename_axis(index="cell_id", columns="label")
+        .reset_index()
+        .melt(
+            id_vars="cell_id",
+            var_name="label",
+            value_name="percentage",
+        )
+    )
+    label_order = proportions.columns.astype(str).tolist()
+    summary_by_label = summary.set_index("label").reindex(label_order)
+    tick_labels = [
+        f"{label}\n{summary_by_label.loc[label, 'cell_detection_percentage']:.1f}% cells"
+        for label in label_order
+    ]
+
+    fig_width = max(7.0, 1.35 * len(label_order))
+    fig, ax = plt.subplots(figsize=(fig_width, 6.2))
+    try:
+        boxplot_kwargs: Dict[str, Any] = {}
+        if palette is not None:
+            boxplot_kwargs.update(
+                hue="label",
+                palette={
+                    label: palette.get(label, "#9AA0A6")
+                    for label in label_order
+                },
+                legend=False,
+            )
+        else:
+            boxplot_kwargs["color"] = color
+        sns.boxplot(
+            data=long,
+            x="label",
+            y="percentage",
+            order=label_order,
+            width=0.65,
+            showfliers=False,
+            ax=ax,
+            **boxplot_kwargs,
+        )
+        ax.scatter(
+            np.arange(len(label_order)),
+            summary_by_label["global_transcript_percentage"].to_numpy(),
+            marker="D",
+            s=38,
+            color="#30343B",
+            edgecolor="white",
+            linewidth=0.6,
+            zorder=4,
+            label="Global transcript percentage",
+        )
+        ax.set_xticks(np.arange(len(label_order)))
+        ax.set_xticklabels(tick_labels, rotation=30, ha="right")
+        ax.set_xlabel("Label (fraction of cells with >0 transcripts)")
+        ax.set_ylabel("Transcripts per cell (%)")
+        ax.set_title(title, fontweight="bold")
+        ax.set_ylim(0.0, 100.0)
+        ax.yaxis.set_major_formatter(PercentFormatter(xmax=100))
+        ax.legend(frameon=False, loc="upper right")
+        sns.despine(ax=ax)
+        fig.tight_layout()
+        _save_fig(fig, out_dir, name)
+    finally:
+        plt.close(fig)
+
+    _save_dataframe(
+        summary,
+        out_dir,
+        name,
+        diagnostic=True,
+    )
+
+
+def _save_transcript_annotation_proportion_diagnostics(
+    final_df: pd.DataFrame,
+    out_dir: str,
+) -> Dict[str, Dict[str, pd.DataFrame]]:
+    """Save geometric-truth and final-annotation per-cell proportion plots."""
+    results: Dict[str, Dict[str, pd.DataFrame]] = {}
+    specifications = [
+        (
+            "ground_truth_nuclear_cytoplasmic_proportions",
+            _build_ground_truth_nuclear_cytoplasmic_proportions,
+            "Geometric reference: per-cell nuclear/cytoplasmic proportions",
+            _SUBCELLULAR_LABEL_PALETTE,
+        ),
+        (
+            "final_annotation_proportions",
+            _build_final_annotation_proportions,
+            "Final annotation: per-cell subcellular-label proportions",
+            _SUBCELLULAR_LABEL_PALETTE,
+        ),
+    ]
+    # ``subcellular_fine_annotation`` is a compatibility alias of the public
+    # seven-class ``subcellular_annotation``. Emitting a second identical plot
+    # and table suggests two distinct results, so only the canonical final
+    # annotation summary is written.
+    for name, builder, title, palette in specifications:
+        try:
+            tables = builder(final_df)
+            _plot_per_cell_label_proportions(
+                tables,
+                out_dir,
+                name=name,
+                title=title,
+                palette=palette,
+            )
+            results[name] = tables
+        except Exception as exc:
+            _logging.getLogger("cellscope").warning(
+                "Transcript proportion diagnostic skipped | name=%s | "
+                "reason=%s",
+                name,
+                exc,
+                exc_info=True,
+            )
+    return results
+
+
+def _build_metaspot_annotation_result_tables(
+    adata1: ad.AnnData,
+) -> Dict[str, Any]:
+    """Summarize the final user-facing annotation at MetaSpot resolution."""
+    required = {
+        "subcellular_annotation_domain",
+        "subcellular_annotation",
+    }
+    missing = sorted(required.difference(adata1.obs.columns))
+    if missing:
+        raise KeyError(
+            "MetaSpot annotation results require adata1.obs columns: "
+            + ", ".join(missing)
+        )
+
+    domain_labels = (
+        adata1.obs["subcellular_annotation_domain"]
+        .astype("string")
+        .fillna("Unknown")
+        .astype(str)
+    )
+    compatibility_column = (
+        "subcellular_annotation_compatibility"
+        if "subcellular_annotation_compatibility" in adata1.obs.columns
+        else "subcellular_annotation"
+    )
+    final_labels = (
+        adata1.obs[compatibility_column]
+        .astype("string")
+        .fillna("Unknown")
+        .astype(str)
+    )
+    changed = domain_labels.to_numpy() != final_labels.to_numpy()
+    domain_broad = _metadomain_broad_compartment(domain_labels.to_numpy())
+    final_broad = _metadomain_broad_compartment(final_labels.to_numpy())
+    broad_changed = changed & (domain_broad != final_broad)
+
+    update = np.full(
+        adata1.n_obs,
+        "Unchanged",
+        dtype=object,
+    )
+    update[changed & ~broad_changed] = "Subtype/local refinement"
+    update[broad_changed] = "Broad-compartment correction"
+
+    spots = pd.DataFrame(
+        {
+            "domain_annotation": domain_labels.to_numpy(),
+            "final_annotation": final_labels.to_numpy(),
+            "annotation_update": update,
+        },
+        index=adata1.obs_names.copy(),
+    )
+    if "subcellular_fine_annotation" in adata1.obs.columns:
+        spots["fine_annotation"] = (
+            adata1.obs["subcellular_fine_annotation"]
+            .astype("string")
+            .fillna("Unknown")
+            .astype(str)
+            .to_numpy()
+        )
+    else:
+        spots["fine_annotation"] = (
+            adata1.obs["subcellular_annotation"]
+            .astype("string")
+            .fillna("Unknown")
+            .astype(str)
+            .to_numpy()
+        )
+    if "subcellular_fine_state" in adata1.obs.columns:
+        spots["fine_state"] = (
+            adata1.obs["subcellular_fine_state"]
+            .astype("string")
+            .fillna("Unavailable")
+            .astype(str)
+            .to_numpy()
+        )
+    else:
+        spots["fine_state"] = "Unavailable"
+    if "subcellular_metaspot_decision_provenance" in adata1.obs.columns:
+        spots["decision_provenance"] = (
+            adata1.obs["subcellular_metaspot_decision_provenance"]
+            .astype("string")
+            .fillna("unavailable")
+            .astype(str)
+            .to_numpy()
+        )
+    else:
+        spots["decision_provenance"] = update
+    tier_column = (
+        "subcellular_annotation_domain_tier"
+        if "subcellular_annotation_domain_tier" in adata1.obs.columns
+        else "subcellular_annotation_tier"
+    )
+    if tier_column in adata1.obs.columns:
+        spots["domain_evidence_tier"] = (
+            adata1.obs[tier_column]
+            .astype("string")
+            .fillna("Unavailable")
+            .astype(str)
+            .to_numpy()
+        )
+    else:
+        spots["domain_evidence_tier"] = "Unavailable"
+    if "subcellular_annotation_tier" in adata1.obs.columns:
+        spots["final_evidence_tier"] = (
+            adata1.obs["subcellular_annotation_tier"]
+            .astype("string")
+            .fillna("Unavailable")
+            .astype(str)
+            .to_numpy()
+        )
+    else:
+        spots["final_evidence_tier"] = "Unavailable"
+    if "cell_id" in adata1.obs.columns:
+        spots["cell_id"] = adata1.obs["cell_id"].astype(str).to_numpy()
+
+    label_order = list(
+        dict.fromkeys(
+            list(_SUBCELLULAR_LABEL_ORDER)
+            + domain_labels.value_counts().index.astype(str).tolist()
+            + final_labels.value_counts().index.astype(str).tolist()
+        )
+    )
+    domain_counts = domain_labels.value_counts()
+    final_counts = final_labels.value_counts()
+    rows = []
+    for label in label_order:
+        domain_n = int(domain_counts.get(label, 0))
+        final_n = int(final_counts.get(label, 0))
+        if domain_n + final_n == 0:
+            continue
+        final_mask = final_labels.to_numpy() == label
+        row: Dict[str, Any] = {
+            "label": label,
+            "domain_evidence_n_metaspots": domain_n,
+            "domain_evidence_fraction": domain_n / max(1, adata1.n_obs),
+            "final_n_metaspots": final_n,
+            "final_fraction": final_n / max(1, adata1.n_obs),
+            "changed_to_label_n_metaspots": int(
+                np.sum(final_mask & changed)
+            ),
+        }
+        if "cell_id" in spots.columns:
+            row["final_n_cells"] = int(
+                spots.loc[final_mask, "cell_id"].nunique()
+            )
+        rows.append(row)
+    label_summary = pd.DataFrame(rows)
+
+    fine_groups = spots.groupby(
+        ["fine_annotation", "fine_state"],
+        observed=True,
+        dropna=False,
+    )
+    fine_summary = fine_groups.size().rename("n_metaspots").reset_index()
+    if "cell_id" in spots.columns:
+        fine_summary["n_cells"] = (
+            fine_groups["cell_id"].nunique().to_numpy()
+        )
+    fine_summary["fraction"] = (
+        fine_summary["n_metaspots"] / max(1, adata1.n_obs)
+    )
+
+    update_summary = (
+        spots["annotation_update"]
+        .value_counts()
+        .rename_axis("annotation_update")
+        .rename("n_metaspots")
+        .reset_index()
+    )
+    update_summary["fraction"] = (
+        update_summary["n_metaspots"] / max(1, adata1.n_obs)
+    )
+
+    transfer_counts = pd.crosstab(
+        spots["domain_annotation"],
+        spots["final_annotation"],
+    ).reindex(
+        index=[
+            label
+            for label in label_order
+            if label in set(spots["domain_annotation"])
+        ],
+        columns=[
+            label
+            for label in label_order
+            if label in set(spots["final_annotation"])
+        ],
+        fill_value=0,
+    )
+    transfer_fraction = transfer_counts.div(
+        transfer_counts.sum(axis=1).replace(0, np.nan),
+        axis=0,
+    ).fillna(0.0)
+    transfer_long = (
+        transfer_counts.rename_axis(
+            index="domain_annotation",
+            columns="final_annotation",
+        )
+        .stack()
+        .rename("n_metaspots")
+        .reset_index()
+    )
+    transfer_long["row_fraction"] = (
+        transfer_fraction.rename_axis(
+            index="domain_annotation",
+            columns="final_annotation",
+        )
+        .stack()
+        .to_numpy()
+    )
+
+    provenance_order = [
+        "Unchanged",
+        "Subtype/local refinement",
+        "Broad-compartment correction",
+    ]
+    provenance_counts = pd.crosstab(
+        spots["final_annotation"],
+        spots["annotation_update"],
+    ).reindex(
+        index=[
+            label
+            for label in label_order
+            if label in set(spots["final_annotation"])
+        ],
+        columns=provenance_order,
+        fill_value=0,
+    )
+    provenance_fraction = provenance_counts.div(
+        provenance_counts.sum(axis=1).replace(0, np.nan),
+        axis=0,
+    ).fillna(0.0)
+    provenance_long = (
+        provenance_counts.rename_axis(
+            index="final_annotation",
+            columns="final_annotation_provenance",
+        )
+        .stack()
+        .rename("n_metaspots")
+        .reset_index()
+    )
+    provenance_long["within_final_label_fraction"] = (
+        provenance_fraction.rename_axis(
+            index="final_annotation",
+            columns="final_annotation_provenance",
+        )
+        .stack()
+        .to_numpy()
+    )
+
+    preferred_decision_provenance = [
+        "broad_prior_fallback",
+        "local_exploratory",
+        "local_marker_plus_dgi_exploratory",
+        "local_strict",
+        "local_plus_omm_confirmation_exploratory",
+        "local_marker_plus_dgi_plus_omm_confirmation_exploratory",
+        "local_plus_omm_confirmation_strict",
+        "local_only_strict_omm_confirmation_unidentifiable",
+        "local_only_strict_omm_confirmation_unavailable",
+    ]
+    observed_decision_provenance = (
+        spots["decision_provenance"].value_counts().index.astype(str).tolist()
+    )
+    decision_provenance_order = list(
+        dict.fromkeys(
+            preferred_decision_provenance + observed_decision_provenance
+        )
+    )
+    decision_counts = pd.crosstab(
+        spots["fine_annotation"],
+        spots["decision_provenance"],
+    ).reindex(
+        index=spots["fine_annotation"].value_counts().index.astype(str),
+        columns=decision_provenance_order,
+        fill_value=0,
+    )
+    decision_fraction = decision_counts.div(
+        decision_counts.sum(axis=1).replace(0, np.nan),
+        axis=0,
+    ).fillna(0.0)
+    decision_long = (
+        decision_counts.rename_axis(
+            index="fine_annotation",
+            columns="decision_provenance",
+        )
+        .stack()
+        .rename("n_metaspots")
+        .reset_index()
+    )
+    decision_long["within_fine_label_fraction"] = (
+        decision_fraction.rename_axis(
+            index="fine_annotation",
+            columns="decision_provenance",
+        )
+        .stack()
+        .to_numpy()
+    )
+
+    preferred_final_tiers = [
+        "Broad-prior fallback",
+        "DGI-supported exploratory evidence",
+        "Exploratory local evidence",
+        "Strict local evidence",
+        "Cell-coherent OMM evidence",
+        "Cell-coherent fine-structure evidence",
+        "Tier-B callable-cell multiscale evidence",
+        "Unavailable",
+    ]
+    observed_final_tiers = (
+        spots["final_evidence_tier"].value_counts().index.astype(str).tolist()
+    )
+    final_tier_order = list(
+        dict.fromkeys(preferred_final_tiers + observed_final_tiers)
+    )
+    final_tier_counts = pd.crosstab(
+        spots["fine_annotation"],
+        spots["final_evidence_tier"],
+    ).reindex(
+        index=spots["fine_annotation"].value_counts().index.astype(str),
+        columns=final_tier_order,
+        fill_value=0,
+    )
+    final_tier_fraction = final_tier_counts.div(
+        final_tier_counts.sum(axis=1).replace(0, np.nan),
+        axis=0,
+    ).fillna(0.0)
+
+    return {
+        "spots": spots,
+        "label_summary": label_summary,
+        "fine_summary": fine_summary,
+        "update_summary": update_summary,
+        "transfer_counts": transfer_counts,
+        "transfer_fraction": transfer_fraction,
+        "transfer_long": transfer_long,
+        "provenance_counts": provenance_counts,
+        "provenance_fraction": provenance_fraction,
+        "provenance_long": provenance_long,
+        "decision_counts": decision_counts,
+        "decision_fraction": decision_fraction,
+        "decision_long": decision_long,
+        "decision_provenance_order": decision_provenance_order,
+        "final_tier_counts": final_tier_counts,
+        "final_tier_fraction": final_tier_fraction,
+        "final_tier_order": final_tier_order,
+        "summary": {
+            "n_metaspots": int(adata1.n_obs),
+            "n_cells": (
+                int(adata1.obs["cell_id"].nunique())
+                if "cell_id" in adata1.obs.columns
+                else None
+            ),
+            "changed_fraction": float(np.mean(changed)),
+            "broad_compartment_corrected_fraction": float(
+                np.mean(broad_changed)
+            ),
+        },
+    }
+
+
+def _metaspot_plot_representation(
+    adata1: ad.AnnData,
+    indices: np.ndarray,
+) -> Tuple[np.ndarray, str]:
+    """Return a bounded MetaSpot representation for result visualization."""
+    from sklearn.preprocessing import normalize
+
+    clustering_meta = adata1.uns.get(
+        "module5_metadomain_clustering",
+        {},
+    )
+    configured = str(clustering_meta.get("cluster_rep", "")).strip()
+    candidates = [
+        configured,
+        METASPOT_DGI_KEY,
+        "X_dgi_gcn",
+        METASPOT_DGI_SAGE_KEY,
+        "X_dgi_sage",
+        "X_expr_metaspot_scaled",
+        "X_expr_metaspot",
+    ]
+    seen = set()
+    for key in candidates:
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        if key not in adata1.obsm:
+            continue
+        values = np.asarray(
+            adata1.obsm[key][indices],
+            dtype=np.float32,
+        )
+        if values.ndim != 2 or values.shape[1] < 2:
+            continue
+        # Historical adata1 files may contain a MetaDomain embedding broadcast
+        # back to every member MetaSpot under a generic key such as
+        # ``X_dgi_gcn``.  Reusing it would only redraw the MetaDomain UMAP with
+        # overlapping points, not show MetaSpot-level structure.
+        rounded = np.round(values, decimals=6)
+        n_unique = int(np.unique(rounded, axis=0).shape[0])
+        n_domains = (
+            int(adata1.obs["meta-domain"].astype(str).nunique())
+            if "meta-domain" in adata1.obs.columns
+            else 0
+        )
+        broadcast_like = (
+            n_unique < max(20, int(math.ceil(0.25 * len(indices))))
+            and (
+                n_domains == 0
+                or n_unique <= max(20, int(math.ceil(1.25 * n_domains)))
+            )
+        )
+        if broadcast_like:
+            _logging.getLogger("cellscope").info(
+                "Skipping %s for MetaSpot UMAP: only %d unique rows among "
+                "%d MetaSpots (MetaDomains=%d), consistent with a "
+                "domain-level embedding broadcast.",
+                key,
+                n_unique,
+                len(indices),
+                n_domains,
+            )
+            continue
+        values = StandardScaler().fit_transform(values).astype(
+            np.float32,
+            copy=False,
+        )
+        values = normalize(values, norm="l2").astype(
+            np.float32,
+            copy=False,
+        )
+        return values, key
+
+    expression = adata1.X[indices]
+    if sp.issparse(expression):
+        expression = expression.astype(np.float32, copy=True)
+        expression = normalize(expression, norm="l1")
+        expression.data = np.log1p(expression.data * 1.0e4)
+    else:
+        expression = np.asarray(expression, dtype=np.float32)
+        expression = normalize(expression, norm="l1")
+        expression = np.log1p(expression * 1.0e4)
+    max_components = min(
+        50,
+        expression.shape[0] - 1,
+        expression.shape[1] - 1,
+    )
+    if max_components < 2:
+        dense = (
+            expression.toarray()
+            if sp.issparse(expression)
+            else np.asarray(expression)
+        )
+        values = np.zeros((expression.shape[0], 2), dtype=np.float32)
+        values[:, : min(2, dense.shape[1])] = dense[:, :2]
+        return values, "normalized_expression"
+    values = TruncatedSVD(
+        n_components=max_components,
+        random_state=0,
+    ).fit_transform(expression)
+    values = normalize(values, norm="l2").astype(
+        np.float32,
+        copy=False,
+    )
+    return values, "normalized_expression_svd"
+
+
+def _compute_metaspot_result_umap(
+    adata1: ad.AnnData,
+    spots: pd.DataFrame,
+    *,
+    max_points: int = 25_000,
+) -> Tuple[np.ndarray, np.ndarray, str]:
+    """Compute a deterministic, cell/label-stratified MetaSpot UMAP."""
+    n_obs = int(adata1.n_obs)
+    if n_obs < 3:
+        raise ValueError("MetaSpot UMAP requires at least three MetaSpots")
+
+    if n_obs > int(max_points):
+        if "cell_id" in spots.columns:
+            strata = (
+                spots["cell_id"].astype(str)
+                + "\x1f"
+                + spots["final_annotation"].astype(str)
+            ).to_numpy()
+        else:
+            strata = spots["final_annotation"].astype(str).to_numpy()
+        indices = _stratified_metaspot_sample(
+            strata,
+            int(max_points),
+            seed=2026,
+        )
+    else:
+        indices = np.arange(n_obs, dtype=np.int64)
+
+    existing = adata1.obsm.get("X_umap_metaspot")
+    if (
+        existing is not None
+        and np.asarray(existing).shape == (n_obs, 2)
+        and np.isfinite(np.asarray(existing)).all()
+    ):
+        return (
+            indices,
+            np.asarray(existing, dtype=np.float32)[indices],
+            str(
+                adata1.uns.get(
+                    "metaspot_annotation_visualization",
+                    {},
+                ).get("representation_key", "stored_X_umap_metaspot")
+            ),
+        )
+
+    values, representation_key = _metaspot_plot_representation(
+        adata1,
+        indices,
+    )
+    import scanpy as sc
+
+    plot_adata = ad.AnnData(
+        X=np.zeros((len(indices), 1), dtype=np.float32),
+    )
+    plot_adata.obsm["X_metaspot_result"] = values
+    n_neighbors = min(30, max(2, len(indices) - 1))
+    sc.pp.neighbors(
+        plot_adata,
+        n_neighbors=n_neighbors,
+        use_rep="X_metaspot_result",
+        metric="cosine",
+        random_state=0,
+    )
+    sc.tl.umap(
+        plot_adata,
+        min_dist=0.30,
+        spread=1.0,
+        random_state=0,
+    )
+    coordinates = np.asarray(
+        plot_adata.obsm["X_umap"],
+        dtype=np.float32,
+    )
+    if len(indices) == n_obs:
+        adata1.obsm["X_umap_metaspot"] = coordinates
+    adata1.uns["metaspot_annotation_visualization"] = {
+        "representation_key": representation_key,
+        "n_metaspots_total": n_obs,
+        "n_metaspots_displayed": int(len(indices)),
+        "sampling": (
+            "all"
+            if len(indices) == n_obs
+            else "cell_and_final_label_stratified"
+        ),
+        "max_points": int(max_points),
+        "neighbors": int(n_neighbors),
+        "metric": "cosine",
+        "random_state": 0,
+    }
+    return indices, coordinates, representation_key
+
+
+def _save_rapx_metadomain_evidence_audit_tables(
+    adata2: ad.AnnData,
+    out_dir: str,
+) -> Optional[Dict[str, pd.DataFrame]]:
+    """Save RAP-X confirmatory evidence without a misleading label UMAP.
+
+    The strict track is intentionally audit-only: ``Unknown`` means that a
+    MetaDomain did not pass confirmatory FDR, not that its final public label
+    is unknown.  Exact tables preserve this information more honestly than a
+    sparse strict-label scatter plot.
+    """
+    required = {
+        "subcell_core_candidate_label",
+        "subcellular_annotation_strict",
+        "subcellular_annotation_tier",
+    }
+    missing = sorted(required.difference(adata2.obs.columns))
+    if missing:
+        return None
+
+    if "X_umap" in adata2.obsm:
+        coordinates = np.asarray(adata2.obsm["X_umap"], dtype=np.float32)
+        if coordinates.ndim != 2 or coordinates.shape[1] < 2:
+            coordinates = np.full((adata2.n_obs, 2), np.nan, dtype=np.float32)
+    else:
+        coordinates = np.full((adata2.n_obs, 2), np.nan, dtype=np.float32)
+
+    evidence = pd.DataFrame(
+        {
+            "core_candidate": (
+                adata2.obs["subcell_core_candidate_label"]
+                .astype("string")
+                .fillna("Unknown")
+                .astype(str)
+                .to_numpy()
+            ),
+            "strict_call": (
+                adata2.obs["subcellular_annotation_strict"]
+                .astype("string")
+                .fillna("Unknown")
+                .astype(str)
+                .to_numpy()
+            ),
+            "domain_evidence_tier": (
+                adata2.obs["subcellular_annotation_tier"]
+                .astype("string")
+                .fillna("Unavailable")
+                .astype(str)
+                .to_numpy()
+            ),
+            "UMAP1": coordinates[:, 0],
+            "UMAP2": coordinates[:, 1],
+        },
+        index=adata2.obs_names.copy(),
+    )
+    label_order = [
+        label
+        for label in _SUBCELLULAR_LABEL_ORDER
+        if (
+            label in set(evidence["core_candidate"])
+            or label in set(evidence["strict_call"])
+        )
+    ]
+    tier_order = ["Strict", "Exploratory", "Candidate", "Unavailable"]
+
+    transition_counts = pd.crosstab(
+        evidence["core_candidate"],
+        evidence["strict_call"],
+    ).reindex(
+        index=[
+            label
+            for label in label_order
+            if label in set(evidence["core_candidate"])
+        ],
+        columns=[
+            label
+            for label in label_order
+            if label in set(evidence["strict_call"])
+        ],
+        fill_value=0,
+    )
+    transition_fraction = transition_counts.div(
+        transition_counts.sum(axis=1).replace(0, np.nan),
+        axis=0,
+    ).fillna(0.0)
+    tier_counts = pd.crosstab(
+        evidence["core_candidate"],
+        evidence["domain_evidence_tier"],
+    ).reindex(
+        index=transition_counts.index,
+        columns=tier_order,
+        fill_value=0,
+    )
+    tier_fraction = tier_counts.div(
+        tier_counts.sum(axis=1).replace(0, np.nan),
+        axis=0,
+    ).fillna(0.0)
+
+    transition_long = (
+        transition_counts.rename_axis(
+            index="core_candidate",
+            columns="strict_call",
+        )
+        .stack()
+        .rename("n_metadomains")
+        .reset_index()
+    )
+    transition_long["within_candidate_fraction"] = (
+        transition_fraction.rename_axis(
+            index="core_candidate",
+            columns="strict_call",
+        )
+        .stack()
+        .to_numpy()
+    )
+    tier_long = (
+        tier_counts.rename_axis(
+            index="core_candidate",
+            columns="domain_evidence_tier",
+        )
+        .stack()
+        .rename("n_metadomains")
+        .reset_index()
+    )
+    tier_long["within_candidate_fraction"] = (
+        tier_fraction.rename_axis(
+            index="core_candidate",
+            columns="domain_evidence_tier",
+        )
+        .stack()
+        .to_numpy()
+    )
+    _save_dataframe(
+        evidence.reset_index(names="metadomain_id"),
+        out_dir,
+        "rapx_metadomain_evidence",
+        diagnostic=True,
+    )
+    _save_dataframe(
+        transition_long,
+        out_dir,
+        "rapx_candidate_to_strict",
+        diagnostic=True,
+    )
+    _save_dataframe(
+        tier_long,
+        out_dir,
+        "rapx_candidate_evidence_tier",
+        diagnostic=True,
+    )
+    return {
+        "evidence": evidence,
+        "transition": transition_long,
+        "tier": tier_long,
+    }
+
+
+def _plot_metaspot_annotation_result(
+    adata1: ad.AnnData,
+    out_dir: str,
+) -> Optional[Dict[str, Any]]:
+    """Save the final MetaSpot-level annotation result and exact summaries."""
+    try:
+        tables = _build_metaspot_annotation_result_tables(adata1)
+        spots = tables["spots"]
+        plot_cfg = load_params_yaml() or {}
+        annotation_plot_cfg = plot_cfg.get("annotation", {}) or {}
+        max_points = int(
+            annotation_plot_cfg.get(
+                "metaspot_result_umap_max_points",
+                25_000,
+            )
+        )
+        if max_points < 1_000:
+            raise ValueError(
+                "annotation.metaspot_result_umap_max_points must be >= 1000"
+            )
+        indices, coordinates, representation_key = (
+            _compute_metaspot_result_umap(
+                adata1,
+                spots,
+                max_points=max_points,
+            )
+        )
+    except Exception as exc:
+        _logging.getLogger("cellscope").warning(
+            "MetaSpot annotation result plotting skipped: %s",
+            exc,
+            exc_info=True,
+        )
+        return None
+
+    displayed = spots.iloc[indices].copy()
+    displayed["UMAP1"] = coordinates[:, 0]
+    displayed["UMAP2"] = coordinates[:, 1]
+    label_palette = _SUBCELLULAR_LABEL_PALETTE
+    def _ordered_categories(
+        values: pd.Series,
+        preferred: Sequence[str],
+    ) -> List[str]:
+        observed = values.astype(str).value_counts().index.tolist()
+        return list(
+            dict.fromkeys(
+                value
+                for value in list(preferred) + observed
+                if value in observed
+            )
+        )
+
+    def _scatter_panel(
+        ax,
+        column: str,
+        title: str,
+        palette: Mapping[str, str],
+        preferred: Sequence[str],
+    ) -> None:
+        values = displayed[column].astype(str)
+        categories = list(dict.fromkeys(_ordered_categories(
+            values,
+            preferred,
+        )))
+        extra_colors = sns.color_palette(
+            "husl",
+            n_colors=max(1, len(categories)),
+        )
+        point_size = float(
+            np.clip(24_000.0 / max(1, len(displayed)), 2.0, 24.0)
+        )
+        rng = np.random.default_rng(2026)
+        for position, category in enumerate(categories):
+            member = np.flatnonzero(values.to_numpy() == category)
+            rng.shuffle(member)
+            ax.scatter(
+                displayed["UMAP1"].to_numpy()[member],
+                displayed["UMAP2"].to_numpy()[member],
+                s=point_size,
+                c=[
+                    palette.get(
+                        category,
+                        extra_colors[position % len(extra_colors)],
+                    )
+                ],
+                alpha=0.78,
+                linewidths=0,
+                rasterized=len(displayed) > 10_000,
+                label=category,
+            )
+        ax.set_title(title, fontweight="bold")
+        ax.set_xlabel("UMAP1")
+        ax.set_ylabel("UMAP2")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.legend(
+            frameon=True,
+            framealpha=0.90,
+            facecolor="white",
+            edgecolor="none",
+            fontsize="small",
+            markerscale=1.8,
+            loc="upper right",
+        )
+
+    fig, axes = plt.subplots(
+        2,
+        2,
+        figsize=(17, 12),
+        constrained_layout=False,
+    )
+    _scatter_panel(
+        axes[0, 0],
+        "domain_annotation",
+        "MetaDomain evidence mapped to MetaSpots",
+        label_palette,
+        _SUBCELLULAR_LABEL_ORDER,
+    )
+    _scatter_panel(
+        axes[0, 1],
+        "fine_annotation",
+        "Evidence-qualified fine MetaSpot annotation",
+        label_palette,
+        _SUBCELLULAR_LABEL_ORDER,
+    )
+
+    transfer_counts = tables["transfer_counts"]
+    transfer_fraction = tables["transfer_fraction"]
+    transfer_annotations = transfer_fraction.copy().astype(object)
+    for row in transfer_fraction.index:
+        for column in transfer_fraction.columns:
+            fraction = float(transfer_fraction.loc[row, column])
+            count = int(transfer_counts.loc[row, column])
+            transfer_annotations.loc[row, column] = (
+                f"{fraction:.0%}\n(n={count})" if count else ""
+            )
+    sns.heatmap(
+        transfer_fraction,
+        cmap="Blues",
+        vmin=0.0,
+        vmax=1.0,
+        annot=transfer_annotations,
+        fmt="",
+        linewidths=0.6,
+        linecolor="white",
+        cbar_kws={"label": "Fraction within domain-evidence label"},
+        ax=axes[1, 0],
+    )
+    axes[1, 0].set_title(
+        "MetaDomain evidence → broad-compatible MetaSpot annotation",
+        fontweight="bold",
+    )
+    axes[1, 0].set_xlabel("Final MetaSpot annotation")
+    axes[1, 0].set_ylabel("MetaDomain evidence label")
+    axes[1, 0].tick_params(axis="x", rotation=30)
+    axes[1, 0].tick_params(axis="y", rotation=0)
+
+    provenance_fraction = tables["final_tier_fraction"]
+    provenance_counts = tables["final_tier_counts"]
+    final_labels = provenance_fraction.index.tolist()
+    y = np.arange(len(final_labels))
+    left = np.zeros(len(final_labels), dtype=float)
+    provenance_order = tables["final_tier_order"]
+    tier_palette = {
+        "Broad-prior fallback": "#BAB0AC",
+        "DGI-supported exploratory evidence": "#76B7B2",
+        "Exploratory local evidence": "#F28E2B",
+        "Strict local evidence": "#4C78A8",
+        "Cell-coherent OMM evidence": "#B07AA1",
+        "Cell-coherent fine-structure evidence": "#59A14F",
+        "Tier-B callable-cell multiscale evidence": "#EDC948",
+        "Unavailable": "#D9D9D9",
+    }
+    for provenance in provenance_order:
+        values = (
+            100.0
+            * provenance_fraction[provenance].to_numpy(dtype=float)
+        )
+        axes[1, 1].barh(
+            y,
+            values,
+            left=left,
+            color=tier_palette.get(provenance, "#BAB0AC"),
+            edgecolor="white",
+            linewidth=0.5,
+            label=provenance,
+        )
+        counts = provenance_counts[provenance].to_numpy(dtype=int)
+        for position, (start, value, count) in enumerate(
+            zip(left, values, counts)
+        ):
+            if value >= 8.0 and count > 0:
+                axes[1, 1].text(
+                    start + value / 2.0,
+                    position,
+                    f"{value:.0f}%\n(n={count})",
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    color=(
+                        "white"
+                        if provenance in {
+                            "local_strict",
+                            "local_plus_omm_confirmation_strict",
+                        }
+                        else "#222222"
+                    ),
+                )
+        left += values
+    axes[1, 1].set_yticks(y)
+    axes[1, 1].set_yticklabels(final_labels)
+    axes[1, 1].invert_yaxis()
+    axes[1, 1].set_xlim(0.0, 100.0)
+    axes[1, 1].set_title(
+        "Evidence tier within each fine MetaSpot label",
+        fontweight="bold",
+    )
+    axes[1, 1].set_xlabel("MetaSpots within fine label (%)")
+    axes[1, 1].set_ylabel("Fine MetaSpot annotation")
+    axes[1, 1].legend(
+        frameon=False,
+        fontsize="small",
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.16),
+        ncol=3,
+    )
+
+    total = int(tables["summary"]["n_metaspots"])
+    shown = int(len(displayed))
+    display_note = (
+        f"{shown:,}/{total:,} MetaSpots displayed"
+        if shown < total
+        else f"{total:,} MetaSpots"
+    )
+    correction_fraction = float(
+        tables["summary"]["broad_compartment_corrected_fraction"]
+    )
+    fig.suptitle(
+        "MetaDomain evidence and fine MetaSpot annotation",
+        fontsize=16,
+        fontweight="bold",
+        y=0.985,
+    )
+    fig.text(
+        0.5,
+        0.953,
+        (
+            f"{display_note} · one point per MetaSpot · "
+            f"UMAP of {representation_key} · "
+            f"broad-compartment corrections={correction_fraction:.1%}"
+        ),
+        ha="center",
+        va="top",
+        fontsize=10,
+        color="#444444",
+    )
+    fig.tight_layout(
+        rect=[0.0, 0.105, 1.0, 0.91],
+        h_pad=2.4,
+        w_pad=2.0,
+    )
+    _save_fig(fig, out_dir, "metaspot_annotation_result")
+    plt.close(fig)
+
+    coordinate_table = displayed[
+        [
+            "UMAP1",
+            "UMAP2",
+            "domain_annotation",
+            "final_annotation",
+            "fine_annotation",
+            "fine_state",
+            "decision_provenance",
+            "domain_evidence_tier",
+            "annotation_update",
+        ]
+    ].copy()
+    metaspot_ids = (
+        adata1.obs["metaspot"].astype(str).iloc[indices].to_numpy()
+        if "metaspot" in adata1.obs.columns
+        else coordinate_table.index.astype(str)
+    )
+    coordinate_table.insert(
+        0,
+        "metaspot_id",
+        metaspot_ids,
+    )
+    if "cell_id" in displayed.columns:
+        coordinate_table.insert(
+            1,
+            "cell_id",
+            displayed["cell_id"].astype(str).to_numpy(),
+        )
+    _save_dataframe(
+        tables["label_summary"],
+        out_dir,
+        "metaspot_annotation_summary",
+        diagnostic=True,
+    )
+    _save_dataframe(
+        tables["fine_summary"],
+        out_dir,
+        "metaspot_fine_annotation_summary",
+        diagnostic=True,
+    )
+    _save_dataframe(
+        tables["update_summary"],
+        out_dir,
+        "metaspot_annotation_updates",
+        diagnostic=True,
+    )
+    _save_dataframe(
+        tables["transfer_long"],
+        out_dir,
+        "metaspot_annotation_transfer",
+        diagnostic=True,
+    )
+    _save_dataframe(
+        tables["provenance_long"],
+        out_dir,
+        "metaspot_annotation_provenance_by_final",
+        diagnostic=True,
+    )
+    _save_dataframe(
+        tables["decision_long"],
+        out_dir,
+        "metaspot_fine_decision_provenance",
+        diagnostic=True,
+    )
+    _save_dataframe(
+        coordinate_table.reset_index(drop=True),
+        out_dir,
+        "metaspot_annotation_umap_coordinates",
+        diagnostic=True,
+    )
+    return tables
+
+
+def _run_pipeline_impl(
     spatial_path: str,
     cell_boundaries_path: str,
     nucleus_boundaries_path: str,
     out_dir: str,
     gold_data: Optional[Union[str, pd.DataFrame]] = None,
     resume: bool = True,
-    save_intermediate: bool = True,
-    lite_intermediate: bool = False,
-    final_format: Literal["parquet","csv"] = "csv",
-    compression: str = "lzf",
+    save_intermediate: Optional[bool] = None,
+    lite_intermediate: Optional[bool] = None,
+    final_format: Optional[Literal["parquet","csv"]] = None,
+    compression: Optional[str] = None,
     resume_from: Optional[Literal[
         "load_inputs",
         "prepare_adata",
@@ -4354,14 +11615,15 @@ def run_pipeline(
         "write_outputs",
     ]] = None,
     show_internal_progress: bool = False,
-    enable_annotation: bool = True,
-    annotation_method: str = "rapx",
-    scvi_epochs: int = 100,
-    dgi_epochs: int = 200,
-    enable_dgi_sage: bool = False,
-    resume_policy: Literal["auto","minimal","force"] = "minimal",
+    enable_annotation: Optional[bool] = None,
+    annotation_method: Optional[str] = None,
+    scvi_epochs: Optional[int] = None,
+    dgi_epochs: Optional[int] = None,
+    enable_dgi_sage: Optional[bool] = None,
+    resume_policy: Optional[Literal["auto","minimal","force"]] = None,
     dry_run_diff: bool = False,
     progress_callback: Optional[Callable[[str], None]] = None,
+    input_provenance: Optional[Mapping[str, Any]] = None,
     ) -> dict:
     """
     Execute the CellScoper pipeline.
@@ -4370,50 +11632,79 @@ def run_pipeline(
     """
     ensure_dir(out_dir)
     logger = setup_logger(out_dir)
-    logger.info("CellScoper pipeline start")
+    logger.info("CellScoper pipeline start | out_dir=%s", out_dir)
     # Load config early to allow overriding some runtime I/O defaults
     cfg = load_params_yaml()
     write_csv_copy = True
+    io_cfg: Dict[str, Any] = {}
     try:
         io_cfg = cfg.get('io', {}) if cfg else {}
-        # Allow YAML to override defaults (CLI flags still take precedence if supplied explicitly by caller)
-        if isinstance(io_cfg.get('final_format'), str):
+        # Explicit Python/CLI arguments win. YAML supplies values only when the
+        # caller left an argument unset.
+        if final_format is None and isinstance(io_cfg.get('final_format'), str):
             final_format = str(io_cfg.get('final_format')).lower()
-        if isinstance(io_cfg.get('h5ad_compression'), str):
+        if compression is None and isinstance(io_cfg.get('h5ad_compression'), str):
             compression = str(io_cfg.get('h5ad_compression'))
         if 'write_csv_copy' in io_cfg:
             write_csv_copy = bool(io_cfg.get('write_csv_copy'))
-        if 'lite_intermediate' in io_cfg:
+        if lite_intermediate is None and 'lite_intermediate' in io_cfg:
             lite_intermediate = bool(io_cfg.get('lite_intermediate'))
-        # New: allow disabling intermediate persistence via YAML
-        # Priority: write_intermediate (if present) > keep_intermediate (legacy)
-        if 'write_intermediate' in io_cfg:
+        if save_intermediate is None and 'write_intermediate' in io_cfg:
             save_intermediate = bool(io_cfg.get('write_intermediate'))
-        elif 'keep_intermediate' in io_cfg:
+        elif save_intermediate is None and 'keep_intermediate' in io_cfg:
             ki = bool(io_cfg.get('keep_intermediate'))
-            # when keep_intermediate is False, we disable saving intermediates
-            if not ki:
-                save_intermediate = False
-        # Allow YAML resume_from
-        if cfg and isinstance(io_cfg.get('resume_from'), (str, type(None))):
+            save_intermediate = bool(ki)
+        if resume_from is None and isinstance(
+            io_cfg.get('resume_from'),
+            (str, type(None)),
+        ):
             rf = (io_cfg.get('resume_from') or '').strip()
             resume_from = rf if rf else resume_from
-        # Optional resume policy from YAML (io.resume_policy)
-        if isinstance(io_cfg.get('resume_policy'), str):
+        if resume_policy is None and isinstance(io_cfg.get('resume_policy'), str):
             resume_policy = str(io_cfg.get('resume_policy')).lower()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning(
+            "Could not resolve runtime I/O configuration: %s",
+            exc,
+            exc_info=True,
+        )
+    final_format = str(final_format or "csv").lower()
+    if final_format not in {"csv", "parquet"}:
+        raise ValueError("final_format must be 'csv' or 'parquet'")
+    compression = str(compression or "lzf")
+    lite_intermediate = bool(
+        False if lite_intermediate is None else lite_intermediate
+    )
+    save_intermediate = bool(
+        True if save_intermediate is None else save_intermediate
+    )
+    resume_policy = str(resume_policy or "minimal").lower()
+    if resume_policy not in {"auto", "minimal", "force"}:
+        raise ValueError(
+            "resume_policy must be one of: auto, minimal, force"
+        )
     try:
         m7_cfg = cfg.get('module7', {}) if cfg else {}
         m8_cfg = cfg.get('module8', {}) if cfg else {}
-        if isinstance(m7_cfg.get('scvi_epochs'), (int, float)):
+        if scvi_epochs is None and isinstance(
+            m7_cfg.get('scvi_epochs'),
+            (int, float),
+        ):
             scvi_epochs = int(m7_cfg.get('scvi_epochs'))
-        if isinstance(m8_cfg.get('dgi_epochs'), (int, float)):
+        if dgi_epochs is None and isinstance(
+            m8_cfg.get('dgi_epochs'),
+            (int, float),
+        ):
             dgi_epochs = int(m8_cfg.get('dgi_epochs'))
-        if 'enable_dgi_sage' in m8_cfg:
+        if enable_dgi_sage is None and 'enable_dgi_sage' in m8_cfg:
             enable_dgi_sage = bool(m8_cfg.get('enable_dgi_sage'))
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Could not resolve module runtime settings: %s", exc)
+    scvi_epochs = int(100 if scvi_epochs is None else scvi_epochs)
+    dgi_epochs = int(200 if dgi_epochs is None else dgi_epochs)
+    enable_dgi_sage = bool(
+        False if enable_dgi_sage is None else enable_dgi_sage
+    )
     try:
         runtime_cfg = cfg.get('runtime', {}) if cfg else {}
     except Exception:
@@ -4421,14 +11712,36 @@ def run_pipeline(
     # Annotation toggles/method from YAML (default on, method=rapx)
     try:
         ann_cfg = cfg.get('annotation', {}) if cfg else {}
-        if 'enable' in ann_cfg:
+        if enable_annotation is None and 'enable' in ann_cfg:
             enable_annotation = bool(ann_cfg.get('enable'))
-        if 'method' in ann_cfg:
+        if annotation_method is None and 'method' in ann_cfg:
             _m = str(ann_cfg.get('method') or "").strip().lower()
             if _m:
                 annotation_method = _m
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning(
+            "Could not resolve annotation runtime settings: %s",
+            exc,
+        )
+    enable_annotation = bool(
+        True if enable_annotation is None else enable_annotation
+    )
+    annotation_method = str(annotation_method or "rapx").lower()
+    logger.info(
+        "Effective runtime | config=%s | config_sha256=%s | resume=%s | "
+        "resume_policy=%s | save_intermediate=%s | lite_intermediate=%s | "
+        "final_format=%s | compression=%s | annotation=%s:%s",
+        os.environ.get("CELLSCOPE_CONFIG", "(package default)"),
+        sha256_mapping(cfg),
+        bool(resume),
+        resume_policy,
+        save_intermediate,
+        lite_intermediate,
+        final_format,
+        compression,
+        enable_annotation,
+        annotation_method,
+    )
     # Set global I/O switches for helpers
     try:
         global _WRITE_INTERMEDIATE, _LITE_INTERMEDIATE, _WRITE_FIGURES
@@ -4448,9 +11761,43 @@ def run_pipeline(
             pass
     except Exception:
         pass
-    # Cap BLAS/OMP threads; allow runtime.blas_threads in params.yaml to take effect
+    # Cap BLAS/OMP threads; allow runtime.blas_threads in params.yaml to take effect.
+    # OpenBLAS cannot safely exceed the package's compiled thread-table limit.
     try:
-        _rt_blas_threads = _coerce_pos_int(runtime_cfg.get('blas_threads')) if runtime_cfg else None
+        _requested_blas_threads = (
+            _coerce_pos_int(runtime_cfg.get('blas_threads'))
+            if runtime_cfg
+            else None
+        )
+        _threaded_outer_parallelism = (
+            _joblib_backend().strip().lower() == "threading"
+            and _preferred_n_jobs() > 1
+        )
+        _rt_blas_threads = (
+            1
+            if _threaded_outer_parallelism
+            else (
+                min(_requested_blas_threads, _MAX_SAFE_BLAS_THREADS)
+                if _requested_blas_threads
+                else None
+            )
+        )
+        if _threaded_outer_parallelism and (
+            _requested_blas_threads is None or _requested_blas_threads > 1
+        ):
+            logger.warning(
+                "Threaded outer parallelism requires single-threaded BLAS; "
+                "using 1 instead of runtime.blas_threads=%s.",
+                _requested_blas_threads,
+            )
+        elif _requested_blas_threads and _requested_blas_threads > _MAX_SAFE_BLAS_THREADS:
+            logger.warning(
+                "runtime.blas_threads=%d exceeds the OpenBLAS safe limit %d; "
+                "using %d.",
+                _requested_blas_threads,
+                _MAX_SAFE_BLAS_THREADS,
+                _rt_blas_threads,
+            )
         if _rt_blas_threads:
             for _env_k in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "OMP_NUM_THREADS", "NUMEXPR_MAX_THREADS", "NUMEXPR_NUM_THREADS"):
                 os.environ[_env_k] = str(_rt_blas_threads)
@@ -4469,26 +11816,25 @@ def run_pipeline(
         # Silence JAX GPU reminder by forcing CPU backend
         os.environ.setdefault("JAX_PLATFORM_NAME",    "cpu")
         os.environ.setdefault("JAX_PLATFORMS",        "cpu")
-        os.environ.setdefault(
-                                "PYTHONWARNINGS",
-                                "ignore:.*'force_all_finite'.*'ensure_all_finite'.*:FutureWarning:sklearn.utils.deprecation"
-                            )
     except Exception:
         pass
-    # Suppress warnings globally to avoid noisy output; only errors should surface
+    logger.info(
+        "Numerical threading | backend=%s | outer_jobs=%d | blas=%s | "
+        "numba=%s(requested=%s) | scanpy=%s(requested=%s)",
+        _joblib_backend(),
+        _preferred_n_jobs(),
+        os.environ.get("OPENBLAS_NUM_THREADS"),
+        os.environ.get("NUMBA_NUM_THREADS"),
+        runtime_cfg.get("numba_threads"),
+        os.environ.get("SCANPY_N_JOBS"),
+        runtime_cfg.get("scanpy_n_jobs"),
+    )
+    # Suppress only stable third-party compatibility notices. Runtime warnings
+    # and numerical problems must remain observable.
     try:
         import warnings as _warnings
-        _warnings.simplefilter("ignore")
-        _warnings.filterwarnings("ignore", category=FutureWarning)
-        _warnings.filterwarnings("ignore", category=UserWarning)
-        _warnings.filterwarnings("ignore", category=RuntimeWarning)
-        _warnings.filterwarnings("ignore", category=DeprecationWarning)
-        # Keep specific modules quiet as well
         _warnings.filterwarnings("ignore", category=FutureWarning, module=r"anndata.*")
         _warnings.filterwarnings("ignore", category=FutureWarning, module=r"sklearn.utils.deprecation")
-        # Filter common 3rd-party noisy warnings
-        _warnings.filterwarnings("ignore", message=".*does not have many workers.*", category=UserWarning)
-        _warnings.filterwarnings("ignore", message=".*Tensor Cores.*set `torch.set_float32_matmul_precision`.*", category=UserWarning)
     except Exception:
         pass
     # Downgrade Lightning/PL logs to ERROR to avoid hardware banners
@@ -4502,13 +11848,100 @@ def run_pipeline(
     except Exception:
         pass
 
-    # Determine minimal rerun start using config fingerprints
+    # Freeze current inputs, references, and source identity into resume
+    # fingerprints so an in-place file or code change cannot reuse stale
+    # checkpoints merely because params.yaml is unchanged.
+    hash_inputs = bool(io_cfg.get("provenance_hash_inputs", True))
+    if input_provenance is None:
+        input_provenance = build_input_provenance(
+            spatial_path=spatial_path,
+            cell_boundaries_path=cell_boundaries_path,
+            nucleus_boundaries_path=nucleus_boundaries_path,
+            gold_data=gold_data,
+            hash_inputs=hash_inputs,
+        )
+    else:
+        input_provenance = dict(input_provenance)
+    package_dir = os.path.dirname(__file__)
+    reference_provenance = bundled_reference_provenance(
+        package_dir,
+        hash_content=hash_inputs,
+    )
+    code_provenance = source_tree_provenance(package_dir)
+    raw_input_provenance = {
+        key: input_provenance.get(key)
+        for key in (
+            "spatial",
+            "cell_boundaries",
+            "nucleus_boundaries",
+        )
+    }
+    build_fingerprint_context = {
+        "inputs": raw_input_provenance,
+        "code": code_provenance,
+    }
+    annotation_fingerprint_context = {
+        "gold_data": input_provenance.get("gold_data"),
+        "references": reference_provenance,
+        "code": code_provenance,
+    }
+    stage_fingerprint_contexts = {
+        "load_inputs": build_fingerprint_context,
+        "preprocess": build_fingerprint_context,
+        "build_anndata": build_fingerprint_context,
+        "annotate": annotation_fingerprint_context,
+        "write_outputs": {"code": code_provenance},
+    }
+    for input_name, record in input_provenance.items():
+        if not isinstance(record, Mapping):
+            logger.info("Input provenance | name=%s | value=%s", input_name, record)
+            continue
+        digest = str(record.get("sha256", "not-computed"))
+        logger.info(
+            "Input provenance | name=%s | path=%s | size_bytes=%s | "
+            "sha256=%s",
+            input_name,
+            record.get("path", record.get("kind", "in-memory")),
+            record.get("size_bytes", record.get("n_rows")),
+            digest,
+        )
+    logger.info(
+        "Source provenance | python_source_sha256=%s | python_files=%s",
+        code_provenance.get("python_source_sha256"),
+        code_provenance.get("n_python_files"),
+    )
+    for reference_name, record in reference_provenance.items():
+        if isinstance(record, Mapping):
+            logger.info(
+                "Reference provenance | name=%s | size_bytes=%s | "
+                "sha256=%s",
+                reference_name,
+                record.get("size_bytes"),
+                record.get("sha256", "not-computed"),
+            )
+
+    # Determine minimal rerun start using config and provenance fingerprints.
     stage_order = ["load_inputs", "preprocess", "build_anndata", "annotate", "write_outputs"]
     start_from = None
-    cur_fps = {s: fingerprint_stage(cfg, s) for s in stage_order}
+    cur_fps = {
+        stage: fingerprint_stage(
+            cfg,
+            stage,
+            context=stage_fingerprint_contexts.get(stage),
+        )
+        for stage in stage_order
+    }
     try:
-        cur_mod_fps = fingerprint_modules_set(cfg)
-    except Exception:
+        cur_mod_fps = fingerprint_modules_set(
+            cfg,
+            context=build_fingerprint_context,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not build module fingerprints: %s",
+            exc,
+            exc_info=True,
+        )
         cur_mod_fps = {}
     st = _load_state(out_dir) or {}
     prev_fps = st.get("fingerprints") or {}
@@ -4543,7 +11976,14 @@ def run_pipeline(
                     start_from = s
                     break
             if start_from:
-                logger.info("Resume policy=minimal; config change → start from %s", start_from)
+                logger.info(
+                    "Resume policy=minimal; configuration/provenance "
+                    "fingerprint changed | start_from=%s | previous=%s | "
+                    "current=%s",
+                    start_from,
+                    str(prev_fps.get(start_from, "missing"))[:12],
+                    str(cur_fps.get(start_from, "missing"))[:12],
+                )
             else:
                 # fall back to last_completed if exists
                 if st.get("last_completed") in stage_order:
@@ -4563,12 +12003,27 @@ def run_pipeline(
         except Exception:
             changes = []
         logger.info("Dry-run diff: changed stages=%s; start_from=%s", ",".join(changes) if changes else "(none)", start_from or stage_order[0])
+        for stage in stage_order:
+            logger.info(
+                "Dry-run fingerprint | stage=%s | changed=%s | "
+                "previous=%s | current=%s",
+                stage,
+                prev_fps.get(stage) != cur_fps.get(stage),
+                str(prev_fps.get(stage, "missing"))[:12],
+                str(cur_fps.get(stage, "missing"))[:12],
+            )
         return {
             "dry_run": True,
             "changed_stages": changes,
             "start_from": start_from or stage_order[0],
             "state_file": os.path.join(out_dir, "pipeline_state.json"),
         }
+
+    # Resumed runs reuse the same output directory. Remove only exact files
+    # retired by the current output contract so stale visuals cannot be
+    # mistaken for results from this invocation.
+    _remove_deprecated_output_artifacts(out_dir)
+    _remove_inactive_method_artifacts(out_dir, cfg)
 
     stage_to_idx = {name: idx for idx, name in enumerate(stage_order)}
     resume_enabled = bool(resume)
@@ -4614,7 +12069,15 @@ def run_pipeline(
         if progress_callback: progress_callback("Loading inputs")
         try:
             spatial_df, cell_df, nucleus_df = load_inputs(
-                spatial_path, cell_boundaries_path, nucleus_boundaries_path, out_dir, resume, save_intermediate
+                spatial_path,
+                cell_boundaries_path,
+                nucleus_boundaries_path,
+                out_dir,
+                resume,
+                save_intermediate,
+                # Reaching this branch means the stage must run. Existing raw
+                # checkpoints may have a different input fingerprint.
+                reuse_cached_inputs=False,
             )
             raw_inputs_cache = (spatial_df, cell_df, nucleus_df)
             _save_state(out_dir, "load_inputs", extra={"fingerprints": cur_fps, "module_fingerprints": cur_mod_fps})
@@ -4641,7 +12104,16 @@ def run_pipeline(
             logger.info("Resume requested skip for preprocess but checkpoint missing → re-running")
         if progress_callback: progress_callback("Preprocess inputs")
         try:
-            spatial_df, cell_df, nucleus_df = preprocess(spatial_df, cell_df, nucleus_df, show_internal_progress=show_internal_progress)
+            module1_cfg = cfg.get("module1", {}) if cfg else {}
+            spatial_df, cell_df, nucleus_df = preprocess(
+                spatial_df,
+                cell_df,
+                nucleus_df,
+                show_internal_progress=show_internal_progress,
+                use_input_nucleus_flags=bool(
+                    module1_cfg.get("use_input_nucleus_flags", True)
+                ),
+            )
             if save_intermediate and not lite_intermediate:
                 _save_dataframe(spatial_df, out_dir, "preprocess_spatial")
                 _save_dataframe(cell_df, out_dir, "preprocess_cell_boundaries")
@@ -4681,6 +12153,7 @@ def run_pipeline(
                 scvi_epochs=scvi_epochs,
                 dgi_epochs=dgi_epochs,
                 enable_dgi_sage=enable_dgi_sage,
+                fingerprint_context=build_fingerprint_context,
             )
             # Optional: prune final_data columns to reduce redundancy per config
             try:
@@ -4721,7 +12194,15 @@ def run_pipeline(
                         compression=comp if m6_override else "lzf",
                     )
             if resume_enabled or (save_intermediate and not lite_intermediate):
-                _save_dataframe(final_data, out_dir, "module5_final_data")
+                # Resume needs the transcript-to-MetaSpot/MetaDomain ownership
+                # table even in lite mode. Force one compressed Parquet rather
+                # than silently making an annotate-only resume impossible.
+                _save_dataframe(
+                    final_data,
+                    out_dir,
+                    "module5_final_data",
+                    force_parquet=True,
+                )
             _save_state(out_dir, "build_anndata", extra={"fingerprints": cur_fps, "module_fingerprints": cur_mod_fps, "modules_completed": True})
             logger.info("Stage build_anndata done: adata1_obs=%d adata2_obs=%s final_rows=%d", adata1.n_obs, (adata2.n_obs if adata2 is not None else None), len(final_data))
         except Exception:
@@ -4738,12 +12219,25 @@ def run_pipeline(
 
     # ==== Stage 4: Annotation (optional/configurable) ====
     ann_method = (annotation_method or "rapx").lower()
+    if bool(enable_annotation) and ann_method not in {"rapx", "rap-x", "none"}:
+        raise ValueError(
+            f"Unsupported annotation method {ann_method!r}; expected 'rapx' "
+            "or explicitly disable annotation with method='none'."
+        )
+    if bool(enable_annotation) and ann_method != "none" and adata2 is None:
+        raise RuntimeError(
+            "Annotation is enabled but MetaDomain AnnData (adata2) is missing."
+        )
     run_annotation = bool(enable_annotation) and (ann_method != "none") and adata2 is not None
     annotation_cache = None
     annotation_cache_ready = False
     if run_annotation and resume_enabled and stage_to_idx["annotate"] < start_idx:
         annotation_cache = _resume_annotation_outputs(out_dir)
-        annotation_cache_ready = bool(annotation_cache and annotation_cache[1] is not None)
+        annotation_cache_ready = bool(
+            annotation_cache
+            and annotation_cache[0] is not None
+            and annotation_cache[2] is not None
+        )
     if run_annotation and _should_run("annotate", annotation_cache_ready):
         if resume_enabled and stage_to_idx["annotate"] < start_idx and not annotation_cache_ready:
             logger.info("Resume requested skip for annotate but checkpoint missing → re-running")
@@ -4765,21 +12259,81 @@ def run_pipeline(
                 rapx_spatial_channel=rapx_spatial_channel,
                 gold_data=gold_data,
             )
-            persist_annotation = (save_intermediate and not lite_intermediate) or resume_enabled
+            required_annotation_columns = {
+                "subcellular_annotation",
+                "subcellular_annotation_domain",
+            }
+            missing_final_columns = sorted(
+                required_annotation_columns.difference(final_data.columns)
+            )
+            missing_metaspot_columns = sorted(
+                required_annotation_columns.difference(adata1.obs.columns)
+            )
+            if missing_final_columns or missing_metaspot_columns:
+                raise RuntimeError(
+                    "Annotation completed without required production columns; "
+                    f"final_data_missing={missing_final_columns}, "
+                    f"adata1_missing={missing_metaspot_columns}"
+                )
+            # A lite run suppresses the annotated transcript checkpoint. Saving
+            # only annotated H5AD files cannot satisfy
+            # ``_resume_annotation_outputs`` and merely duplicates the final
+            # H5AD write, so keep this checkpoint atomic as a complete set.
+            persist_annotation = save_intermediate and not lite_intermediate
             if persist_annotation:
+                _save_adata(adata1, out_dir, "annotated_adata1")
                 if adata2 is not None:
                     _save_adata(adata2, out_dir, "annotated_adata2")
                 _save_dataframe(final_data, out_dir, "annotated_final_csv")
+            elif save_intermediate:
+                logger.info(
+                    "Lite intermediate mode: skipping incomplete annotation "
+                    "checkpoint; canonical outputs will be written once"
+                )
             _save_state(out_dir, "annotate", extra={"fingerprints": cur_fps, "module_fingerprints": cur_mod_fps})
             logger.info("Stage annotate done: final_rows=%d", len(final_data))
-        except Exception as e:
-            logger.warning("Annotation skipped: %s", e, exc_info=True)
+        except Exception as exc:
+            logger.exception(
+                "Stage annotate failed; refusing to write a successful "
+                "production output"
+            )
+            raise RuntimeError(
+                f"Annotation stage failed: {exc}"
+            ) from exc
     elif run_annotation and annotation_cache_ready and annotation_cache is not None:
         logger.info("Resume: skipping annotate (checkpoint available)")
-        ann_adata2, ann_final = annotation_cache
+        ann_adata1, ann_adata2, ann_final = annotation_cache
+        if ann_adata1 is not None:
+            adata1 = ann_adata1
         if ann_adata2 is not None:
             adata2 = ann_adata2
         final_data = ann_final
+        required_annotation_columns = {
+            "subcellular_annotation",
+            "subcellular_annotation_domain",
+        }
+        missing_cached_columns = sorted(
+            required_annotation_columns.difference(final_data.columns)
+        )
+        if missing_cached_columns:
+            raise RuntimeError(
+                "Cached annotation output is incomplete; missing "
+                f"{missing_cached_columns}. Rerun annotation."
+            )
+        missing_cached_metaspot_columns = sorted(
+            required_annotation_columns.difference(adata1.obs.columns)
+        )
+        if missing_cached_metaspot_columns:
+            raise RuntimeError(
+                "Cached MetaSpot annotation output is incomplete; missing "
+                f"{missing_cached_metaspot_columns}. Rerun annotation."
+            )
+    else:
+        logger.info(
+            "Annotation disabled explicitly | enable=%s | method=%s",
+            bool(enable_annotation),
+            ann_method,
+        )
 
     if adata1 is None or final_data is None:
         raise RuntimeError("Cannot write outputs: missing 'adata1' or 'final_data'. Please check prior stages or checkpoints.")
@@ -4791,6 +12345,7 @@ def run_pipeline(
     adata2_path = os.path.join(out_dir, "adata2.h5ad")
     final_parquet_path = os.path.join(out_dir, "final_data.parquet")
     final_csv_path = os.path.join(out_dir, "final_data.csv")
+    final_dataset_path = os.path.join(out_dir, "final_data_dataset")
 
     # Optionally resume directly to writing outputs
     if resume_from == "write_outputs":
@@ -4799,81 +12354,260 @@ def run_pipeline(
     # Write files
 
     if progress_callback: progress_callback("Writing outputs")
+    written_outputs: Dict[str, Optional[str]] = {
+        "adata1": None,
+        "adata2": None,
+        "final_parquet": None,
+        "final_csv": None,
+        "final_dataset": None,
+        "stale_final_parquet": None,
+    }
     try:
         # Compatibility for anndata<0.11 + pandas StringArray/categorical writes.
         # First sanitize obs columns, then opt-in to nullable-string writing when available.
         adata1 = _sanitize_obs_for_h5ad(adata1)
         try:
+            _write_cfg = load_params_yaml() or {}
+            _drop_final_h5ad_embeddings = bool(
+                (_write_cfg.get("io", {}) or {}).get(
+                    "drop_embeddings",
+                    False,
+                )
+            )
+        except Exception:
+            _drop_final_h5ad_embeddings = False
+        try:
             import anndata as _ad
             _ad.settings.allow_write_nullable_strings = True
         except Exception:
             pass
-        adata1.write(adata1_path, compression=compression)
+        with _compact_final_adata1_for_write(
+            adata1,
+            enabled=_drop_final_h5ad_embeddings,
+        ):
+            _atomic_write_adata(
+                adata1,
+                adata1_path,
+                compression=compression,
+            )
+        written_outputs["adata1"] = adata1_path
         if adata2 is not None:
             adata2 = _sanitize_obs_for_h5ad(adata2)
-            adata2.write(adata2_path, compression=compression)
+            _atomic_write_adata(
+                adata2,
+                adata2_path,
+                compression=compression,
+            )
+            written_outputs["adata2"] = adata2_path
         if final_format == "csv":
-            final_data.to_csv(final_csv_path, index=False)
-            # also write parquet copy silently
+            _atomic_dataframe_write(
+                final_data,
+                final_csv_path,
+                file_format="csv",
+            )
+            written_outputs["final_csv"] = final_csv_path
             try:
-                final_data.to_parquet(final_parquet_path, index=False)
-            except Exception:
-                pass
+                _atomic_dataframe_write(
+                    final_data,
+                    final_parquet_path,
+                    file_format="parquet",
+                )
+                written_outputs["final_parquet"] = final_parquet_path
+            except Exception as exc:
+                stale_path = _quarantine_stale_file(final_parquet_path)
+                written_outputs["stale_final_parquet"] = stale_path
+                logger.warning(
+                    "Optional Parquet copy was not written; CSV production "
+                    "output remains valid | stale_parquet=%s | error=%s",
+                    stale_path,
+                    exc,
+                )
         else:  # parquet chosen
             try:
-                final_data.to_parquet(final_parquet_path, index=False)
+                _atomic_dataframe_write(
+                    final_data,
+                    final_parquet_path,
+                    file_format="parquet",
+                )
+                written_outputs["final_parquet"] = final_parquet_path
                 if write_csv_copy:
-                    final_data.to_csv(final_csv_path, index=False)
-            except Exception:
-                final_data.to_csv(final_csv_path, index=False)
+                    try:
+                        _atomic_dataframe_write(
+                            final_data,
+                            final_csv_path,
+                            file_format="csv",
+                        )
+                        written_outputs["final_csv"] = final_csv_path
+                    except Exception as exc:
+                        logger.warning(
+                            "Optional CSV copy was not written; Parquet "
+                            "production output remains valid | error=%s",
+                            exc,
+                        )
+                elif os.path.isfile(final_csv_path):
+                    # Do not leave a stale CSV from an older run beside the
+                    # newly written canonical Parquet output.
+                    os.unlink(final_csv_path)
+                    logger.info(
+                        "Removed stale optional CSV output: %s",
+                        final_csv_path,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Parquet production write failed; falling back to CSV | "
+                    "error=%s",
+                    exc,
+                    exc_info=True,
+                )
+                _atomic_dataframe_write(
+                    final_data,
+                    final_csv_path,
+                    file_format="csv",
+                )
+                written_outputs["final_csv"] = final_csv_path
+                stale_path = _quarantine_stale_file(final_parquet_path)
+                written_outputs["stale_final_parquet"] = stale_path
+                if stale_path:
+                    logger.warning(
+                        "Quarantined stale Parquet output: %s",
+                        stale_path,
+                    )
+        execution_plan = adata1.uns.get("execution_plan", {})
+        write_partitioned_dataset = bool(
+            io_cfg.get("write_partitioned_dataset", False)
+        )
+        if (
+            bool(execution_plan.get("partitioned_annotation", False))
+            and write_partitioned_dataset
+        ):
+            partition_manifest = _atomic_partitioned_parquet_write(
+                final_data,
+                final_dataset_path,
+                target_rows_per_part=int(
+                    execution_plan.get("partition_rows", 1_000_000)
+                ),
+            )
+            written_outputs["final_dataset"] = final_dataset_path
+            logger.info(
+                "Streaming final dataset written | path=%s | parts=%d",
+                final_dataset_path,
+                int(partition_manifest["n_parts"]),
+            )
         _save_state(out_dir, "write_outputs", extra={"fingerprints": cur_fps, "module_fingerprints": cur_mod_fps})
-        logger.info("Stage write_outputs done")
+        logger.info(
+            "Stage write_outputs done | adata1=%s | adata2=%s | "
+            "final_parquet=%s | final_csv=%s | final_dataset=%s",
+            written_outputs["adata1"],
+            written_outputs["adata2"],
+            written_outputs["final_parquet"],
+            written_outputs["final_csv"],
+            written_outputs["final_dataset"],
+        )
     except Exception:
         logger.exception("Stage write_outputs failed")
         raise
 
-    logger.info("Pipeline finished successfully")
-    return {
-        "adata1": adata1_path,
-        "adata2": adata2_path if adata2 is not None else None,
-        "final_parquet": final_parquet_path if final_format == "parquet" else None,
-        "final_csv": final_csv_path if final_format == "csv" or write_csv_copy else None,
+    counts = {
+        "n_transcripts": int(len(final_data)),
+        "n_cells": (
+            int(final_data["cell_id"].nunique())
+            if "cell_id" in final_data.columns
+            else None
+        ),
+        "n_metaspots": int(adata1.n_obs),
+        "n_metadomains": (
+            int(adata2.n_obs) if adata2 is not None else None
+        ),
     }
+    output_guide_path = _write_output_guide(
+        out_dir,
+        counts=counts,
+        annotation_enabled=bool(run_annotation),
+        primary_data_product=str(
+            (
+                written_outputs["final_csv"]
+                if final_format == "csv"
+                else written_outputs["final_parquet"]
+            )
+            or written_outputs["final_csv"]
+        ),
+    )
+    written_outputs["output_guide"] = output_guide_path
+    logger.info(
+        "Pipeline finished successfully | transcripts=%s | cells=%s | "
+        "metaspots=%s | metadomains=%s",
+        counts["n_transcripts"],
+        counts["n_cells"],
+        counts["n_metaspots"],
+        counts["n_metadomains"],
+    )
+    return {**written_outputs, "counts": counts}
+
+
+@functools.wraps(_run_pipeline_impl)
+def run_pipeline(*args, **kwargs) -> dict:
+    """Run one isolated pipeline invocation.
+
+    Module helpers use temporary process-global I/O switches while a run is
+    active. Always restore them so failed runs and notebook dry-runs cannot
+    change the behavior of a later invocation in the same Python process.
+    """
+    global _WRITE_INTERMEDIATE, _LITE_INTERMEDIATE, _WRITE_FIGURES
+    previous = (
+        _WRITE_INTERMEDIATE,
+        _LITE_INTERMEDIATE,
+        _WRITE_FIGURES,
+    )
+    try:
+        return _run_pipeline_impl(*args, **kwargs)
+    finally:
+        (
+            _WRITE_INTERMEDIATE,
+            _LITE_INTERMEDIATE,
+            _WRITE_FIGURES,
+        ) = previous
 
 
 # ====== Optional K1/K2: Clustering + RNALocate/APEX-based annotation ======
 
 def _try_import_scanpy():
     try:
-        import scanpy as sc  # noqa: F401
+        __import__("scanpy")
         return True
     except Exception:
         return False
+
+
+def _annotation_neighbors_key_for_rep(rep_name: str) -> str:
+    rep = str(rep_name).strip()
+    if rep == "X_pca":
+        return "pca_nbrs"
+    if rep == "X_dgi_gcn":
+        return "gcn_nbrs"
+    if rep == "X_dgi_sage":
+        return "sage_nbrs"
+    return f"{rep[2:]}_nbrs" if rep.startswith("X_") else rep
 
 
 def _choose_annotation_neighbors_key(
     adata2: ad.AnnData,
     cluster_rep: Optional[str],
     rep_priority: Optional[Sequence[str]],
+    require_cluster_rep: bool = False,
 ) -> str:
     """Resolve the annotation graph without overriding an explicit choice."""
     if rep_priority is None:
         rep_priority = ["X_dgi_gcn", "X_dgi_sage", "X_expr", "X_pca"]
 
-    def _neighbors_key(rep_name: str) -> str:
-        rep = str(rep_name).strip()
-        if rep == "X_pca":
-            return "pca_nbrs"
-        if rep == "X_dgi_gcn":
-            return "gcn_nbrs"
-        if rep == "X_dgi_sage":
-            return "sage_nbrs"
-        return f"{rep[2:]}_nbrs" if rep.startswith("X_") else rep
-
     if cluster_rep and str(cluster_rep).strip().lower() != "auto":
-        explicit = _neighbors_key(str(cluster_rep))
+        explicit = _annotation_neighbors_key_for_rep(str(cluster_rep))
         if f"{explicit}_connectivities" in adata2.obsp:
             return explicit
+        if require_cluster_rep:
+            raise KeyError(
+                "Requested annotation.cluster_rep="
+                f"{cluster_rep!r} has no neighbor graph"
+            )
         _logging.getLogger("cellscope").warning(
             "Requested annotation.cluster_rep=%s has no neighbor graph; "
             "falling back to rep_priority.",
@@ -4881,7 +12615,7 @@ def _choose_annotation_neighbors_key(
         )
 
     for rep in rep_priority:
-        candidate = _neighbors_key(str(rep))
+        candidate = _annotation_neighbors_key_for_rep(str(rep))
         if f"{candidate}_connectivities" in adata2.obsp:
             return candidate
     return "pca_nbrs"
@@ -4899,6 +12633,7 @@ def _normalize_and_cluster_adata2(
     umap_spread: Optional[float] = None,
     umap_neighbors_key: Optional[str] = None,
     cluster_rep: Optional[str] = None,
+    require_cluster_rep: bool = False,
 ) -> ad.AnnData:
     """Normalize counts/log1p, run HVG+PCA+neighbors, and Leiden on preferred embeddings.
     Sets `adata2.obs['domain_type']` and aliases to `adata2.obs['leiden']` for downstream RAP-X.
@@ -4943,6 +12678,16 @@ def _normalize_and_cluster_adata2(
     sc.pp.highly_variable_genes(adata2, flavor='seurat', n_top_genes=_hvg_top)
     # Use mask_var to avoid deprecation warning
     _pca_comps = int(pca_n_comps) if (pca_n_comps is not None) else int(min(50, adata2.n_vars, adata2.n_obs))
+    # PCA runs on the highly-variable subset only, and the arpack solver
+    # requires n_components < min(n_samples, n_features). Clamp to the
+    # actual HVG count and n_obs - 1 so small MetaDomain sets (or few HVGs)
+    # do not raise ValueError.
+    _n_hvg = (
+        int(adata2.var["highly_variable"].sum())
+        if "highly_variable" in adata2.var.columns
+        else adata2.n_vars
+    )
+    _pca_comps = int(max(1, min(_pca_comps, _n_hvg, adata2.n_obs - 1)))
     try:
         sc.pp.pca(adata2, mask_var="highly_variable", n_comps=_pca_comps)
     except Exception:
@@ -4950,19 +12695,28 @@ def _normalize_and_cluster_adata2(
     sc.pp.neighbors(adata2, use_rep='X_pca', key_added='pca_nbrs', n_neighbors=int(n_neighbors))
 
     # Also build neighbors on available learned reps if present
-    reps = ['X_expr', 'X_dgi_sage', 'X_dgi_gcn']
+    reps = list(
+        dict.fromkeys(
+            [
+                *(
+                    [str(cluster_rep)]
+                    if cluster_rep
+                    and str(cluster_rep).strip().lower() != "auto"
+                    else []
+                ),
+                *([str(rep) for rep in rep_priority] if rep_priority else []),
+                "X_expr",
+                "X_dgi_sage",
+                "X_dgi_gcn",
+                METADOMAIN_DGI_KEY,
+                "X_expr_metadomain",
+            ]
+        )
+    )
     for rep in reps:
-        if rep in adata2.obsm:
+        if rep in adata2.obsm and rep != "X_pca":
             try:
-                # Explicit key names aligned with notebook expectations
-                if rep == 'X_dgi_gcn':
-                    key_std = 'gcn_nbrs'
-                elif rep == 'X_dgi_sage':
-                    key_std = 'sage_nbrs'
-                elif rep == 'X_expr':
-                    key_std = 'expr_nbrs'
-                else:
-                    key_std = f'{rep[2:]}_nbrs'
+                key_std = _annotation_neighbors_key_for_rep(rep)
                 sc.pp.neighbors(adata2, use_rep=rep, key_added=key_std, n_neighbors=int(n_neighbors))
             except Exception:
                 pass
@@ -4972,13 +12726,22 @@ def _normalize_and_cluster_adata2(
     try:
         if cluster_rep is None:
             _cfg = load_params_yaml()
-            cluster_rep = _cfg.get('annotation', {}).get('cluster_rep', None)
+            cluster_rep = resolve_annotation_configuration(_cfg).get(
+                "cluster_rep"
+            )
     except Exception:
         pass
     chosen_key = _choose_annotation_neighbors_key(
         adata2,
         cluster_rep=cluster_rep,
         rep_priority=rep_priority,
+        require_cluster_rep=require_cluster_rep,
+    )
+    adata2.uns["annotation_neighbors_key"] = chosen_key
+    adata2.uns["annotation_neighbors_rep"] = (
+        str(cluster_rep)
+        if cluster_rep and str(cluster_rep).strip().lower() != "auto"
+        else "priority_fallback"
     )
     # Future-proof: igraph flavor
     try:
@@ -5003,16 +12766,17 @@ def _normalize_and_cluster_adata2(
                 adata2.obs['domain_type'] = 'unknown'
     # alias for RAP-X
     adata2.obs['leiden'] = adata2.obs['domain_type'].astype(str)
-    # Optional UMAP visualization saved to intermediate (use chosen neighbors)
+    # Compute the optional UMAP from the chosen neighbors.  The production
+    # annotation colors are not available until RAP-X completes, so the named
+    # figure is saved later instead of coloring it with Leiden IDs here.
     try:
-        # Read annotation plotting switches from config; default off for speed
+        # Read resolved annotation plotting switches.
         _cfg = load_params_yaml()
-        ann = _cfg.get('annotation', {}) if _cfg else {}
+        ann = resolve_annotation_configuration(_cfg)
         _compute_umap = bool(ann.get('compute_umap', False))
         _save_umap_plot = bool(ann.get('save_umap_plot', False))
         if _compute_umap or _save_umap_plot:
             import scanpy as sc
-            import matplotlib.pyplot as plt
             _nbrs_for_umap = umap_neighbors_key if umap_neighbors_key else chosen_key
             if _compute_umap:
                 # Build kwargs dynamically to avoid signature lint issues across scanpy versions
@@ -5023,12 +12787,20 @@ def _normalize_and_cluster_adata2(
                     _umap_kwargs['spread'] = float(umap_spread)
                 # Call with keyword-only to maximize compatibility
                 sc.tl.umap(**dict(adata=adata2, **_umap_kwargs))
-            if _save_umap_plot and ('X_umap' in adata2.obsm):
-                fig = sc.pl.umap(adata2, color=['leiden'], return_fig=True, wspace=0.4)
-                _save_fig(fig, out_dir or os.getcwd(), "annotation_umap_leiden")
-                plt.close(fig)
-    except Exception:
-        pass
+                adata2.uns["annotation_umap_neighbors_key"] = str(
+                    _nbrs_for_umap
+                )
+                adata2.uns["annotation_umap_representation"] = (
+                    str(adata2.uns.get("annotation_neighbors_rep"))
+                    if _nbrs_for_umap == chosen_key
+                    else f"neighbor graph {_nbrs_for_umap}"
+                )
+    except Exception as exc:
+        _logging.getLogger("cellscope").warning(
+            "Annotation UMAP generation failed: %s",
+            exc,
+            exc_info=True,
+        )
     return adata2
 
 
@@ -5253,7 +13025,7 @@ def _load_manual_marker_data(path: Optional[str] = None) -> Optional[pd.DataFram
     Missing file or parse errors return None (non-fatal).
     """
     if path is None:
-        path = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'src', 'manual_marker.csv'))
+        path = bundled_resource_path("manual_marker.csv")
     if not os.path.exists(path):
         return None
     try:
@@ -6443,10 +14215,17 @@ def _ensure_obs_columns_initialized(adata, produced_label_col, meta_cols):
     import numpy as _np
     import pandas as _pd
 
+    updates: Dict[str, Any] = {}
     if produced_label_col not in adata.obs.columns:
-        adata.obs[produced_label_col] = _pd.Series([_pd.NA] * adata.n_obs, dtype="object", index=adata.obs_names)
+        updates[produced_label_col] = _pd.Series(
+            [_pd.NA] * adata.n_obs,
+            dtype="object",
+            index=adata.obs_names,
+        )
     else:
-        adata.obs[produced_label_col] = adata.obs[produced_label_col].astype("object")
+        updates[produced_label_col] = adata.obs[produced_label_col].astype(
+            "object"
+        )
 
     _meta_dtypes = {
         'top1': 'object', 'top2': 'object',
@@ -6486,7 +14265,12 @@ def _ensure_obs_columns_initialized(adata, produced_label_col, meta_cols):
                 fill = _np.nan
             else:
                 fill = _pd.NA
-            adata.obs[tgt] = _pd.Series([fill] * adata.n_obs, dtype=want, index=adata.obs_names)
+            updates[tgt] = _pd.Series(
+                [fill] * adata.n_obs,
+                dtype=want,
+                index=adata.obs_names,
+            )
+    _replace_obs_columns(adata, updates)
 
 
 def _refresh_subcellular_group_columns(
@@ -6503,10 +14287,15 @@ def _refresh_subcellular_group_columns(
         .groupby("leiden", observed=True)["_subcell_label"]
         .agg(lambda s: s.value_counts().idxmax() if len(s) else "Unassigned")
     )
-    adata.obs["leiden-dominant-subcellular"] = (
-        adata.obs["leiden"].map(dominant).astype(str)
+    _replace_obs_columns(
+        adata,
+        {
+            "leiden-dominant-subcellular": (
+                adata.obs["leiden"].map(dominant).astype(str)
+            ),
+            "cluster-subcellular": leiden + ":" + labels,
+        },
     )
-    adata.obs["cluster-subcellular"] = leiden + ":" + labels
 
 
 def _coerce_bool_series(values: pd.Series, default: bool = True) -> pd.Series:
@@ -7141,6 +14930,60 @@ def _apply_independent_evidence_policy(
     return out
 
 
+def _apply_independent_evidence_tracks(
+    annot_df: pd.DataFrame,
+    regions: Sequence[str],
+    *,
+    group_r_mean: Optional[pd.Series] = None,
+    **policy_kwargs,
+) -> pd.DataFrame:
+    """Return compartment-aware decisions plus an expression-only audit track.
+
+    The independent label policy is evaluated first without geometry so the
+    exact expression-only counterfactual is never lost.  When ``group_r_mean``
+    is supplied, a second evaluation restricts candidates to the broad
+    nuclear/cytoplasmic side while retaining the same seven-label,
+    single-stage evidence policy.
+    """
+    expression_only = _apply_independent_evidence_policy(
+        annot_df,
+        regions,
+        group_r_mean=None,
+        **policy_kwargs,
+    )
+    if group_r_mean is None:
+        selected = expression_only.copy()
+        feasibility_applied = False
+    else:
+        selected = _apply_independent_evidence_policy(
+            annot_df,
+            regions,
+            group_r_mean=group_r_mean,
+            **policy_kwargs,
+        )
+        feasibility_applied = True
+
+    audit_columns = pd.DataFrame(
+        {
+            "expression_only_label": (
+                expression_only["label"].astype(str)
+            ),
+            "expression_only_candidate_label": (
+                expression_only["candidate_label"].astype(str)
+            ),
+            "domain_compartment_feasibility_applied": bool(
+                feasibility_applied
+            ),
+        },
+        index=selected.index,
+    )
+    selected = selected.drop(
+        columns=audit_columns.columns,
+        errors="ignore",
+    )
+    return pd.concat([selected, audit_columns], axis=1)
+
+
 def _apply_local_compartment_guard(
     labels: pd.Series,
     r_values: pd.Series,
@@ -7161,23 +15004,141 @@ def _apply_local_compartment_guard(
     return out, conflict
 
 
+def _metaspot_compartment_guard_values(
+    obs: pd.DataFrame,
+) -> Optional[pd.Series]:
+    """Return the signed majority-side statistic for each MetaSpot.
+
+    ``r_p50`` is the median signed transcript location, so its sign follows
+    the majority nuclear/cytoplasmic side of a MetaSpot.  Do not fall back to
+    ``r_mean``: a minority of transcripts far from the boundary can dominate
+    the mean distance and reverse the local majority.
+    """
+    if "r_p50" not in obs.columns:
+        return None
+    return pd.to_numeric(obs["r_p50"], errors="coerce")
+
+
+def _map_metaspot_labels_to_transcripts(
+    adata: ad.AnnData,
+    final_df: pd.DataFrame,
+    label_col: str = "subcellular_annotation",
+) -> pd.Series:
+    """Broadcast one primary MetaSpot label to all member transcripts."""
+    if label_col not in adata.obs.columns:
+        raise KeyError(f"Missing MetaSpot label column: {label_col}")
+    if "metaspot" not in final_df.columns:
+        raise KeyError("Transcript table is missing the metaspot column")
+
+    if "metaspot" in adata.obs.columns:
+        metaspot_ids = adata.obs["metaspot"].astype(str)
+    else:
+        metaspot_ids = pd.Series(
+            adata.obs_names.astype(str),
+            index=adata.obs_names,
+        )
+    label_by_metaspot = pd.Series(
+        adata.obs[label_col].astype(str).to_numpy(),
+        index=pd.Index(metaspot_ids.to_numpy(), dtype=str),
+        dtype="object",
+    )
+    if not label_by_metaspot.index.is_unique:
+        raise ValueError(
+            "Primary annotation mapping requires unique MetaSpot IDs"
+        )
+
+    mapped = final_df["metaspot"].astype(str).map(label_by_metaspot)
+    if mapped.isna().any():
+        raise ValueError(
+            "Failed to map a primary annotation to every transcript"
+        )
+    return mapped
+
+
+def _metaspot_transcript_row_indexer(
+    adata: ad.AnnData,
+    final_df: pd.DataFrame,
+) -> np.ndarray:
+    """Resolve transcript MetaSpots to AnnData rows exactly once."""
+    if "metaspot" not in final_df.columns:
+        raise KeyError("Transcript table is missing the metaspot column")
+    if "metaspot" in adata.obs.columns:
+        metaspot_ids = pd.Index(adata.obs["metaspot"])
+    else:
+        metaspot_ids = pd.Index(adata.obs_names)
+    return _key_row_indexer(
+        metaspot_ids,
+        final_df["metaspot"],
+        error_context="primary annotation",
+    )
+
+
+def _key_row_indexer(
+    source_ids: pd.Index,
+    target_ids: pd.Series,
+    *,
+    error_context: str,
+) -> np.ndarray:
+    """Resolve string keys once and retain compact integer row codes."""
+    source_ids = pd.Index(source_ids)
+    if not source_ids.is_unique:
+        raise ValueError(f"{error_context} mapping requires unique source IDs")
+    # MetaSpot/MetaDomain columns are normally already string or categorical.
+    # Try their native compact representation first; converting hundreds of
+    # millions of exact string keys to Python objects just to hash them again
+    # is both slower and substantially more memory-intensive.
+    row_indexer = source_ids.get_indexer(target_ids)
+    if np.any(row_indexer < 0):
+        string_source_ids = pd.Index(source_ids.astype(str))
+        if not string_source_ids.is_unique:
+            raise ValueError(
+                f"{error_context} mapping requires unique string source IDs"
+            )
+        row_indexer = string_source_ids.get_indexer(target_ids.astype(str))
+    if np.any(row_indexer < 0):
+        raise ValueError(f"Failed to map {error_context} to every target row")
+    if len(source_ids) <= np.iinfo(np.int32).max:
+        row_indexer = row_indexer.astype(np.int32, copy=False)
+    return row_indexer
+
+
+def _take_obs_column_by_row_indexer(
+    values: pd.Series,
+    row_indexer: np.ndarray,
+    target_index: pd.Index,
+) -> pd.Series:
+    """Take one obs column while retaining compact categorical codes."""
+    if isinstance(values.dtype, pd.CategoricalDtype):
+        categorical = values.array
+        taken_codes = np.take(categorical.codes, row_indexer)
+        taken = pd.Categorical.from_codes(
+            taken_codes,
+            categories=categorical.categories,
+            ordered=categorical.ordered,
+        )
+        return pd.Series(taken, index=target_index, name=values.name)
+    taken = np.take(values.to_numpy(), row_indexer)
+    return pd.Series(taken, index=target_index, name=values.name)
+
+
 def _compose_omm_metaspot_labels(
     domain_labels: pd.Series,
     refined_states: pd.Series,
     domain_gates: pd.Series,
     competitor_labels: Optional[pd.Series] = None,
+    reference_posteriors: Optional[pd.Series] = None,
     *,
     identifiable: bool,
     ambiguous_policy: str = "explicit",
+    decision_policy: str = "strict",
+    posterior_high: float = 0.80,
 ) -> pd.Series:
     """Compose the primary MetaSpot track from domain and local OMM evidence.
 
-    Only a locally high OMM posterior inside a domain-confirmed gate can emit
-    OMM.  The pipeline's ``competitor`` policy makes intermediate or locally
-    unmeasured confirmed/shared spots fall back to the strongest ER/Cytosol
-    alternative so the primary annotation remains in the seven-class label
-    space.  The helper's ``explicit`` default preserves compatibility with
-    callers that retain ``ER-OMM shared`` as a prediction class.
+    ``strict`` requires a locally high OMM posterior inside a domain-confirmed
+    gate. ``balanced`` also lets a locally high posterior resolve a domain-level
+    ER/OMM shared state to OMM. The pipeline's ``competitor`` ambiguity policy
+    keeps unresolved spots in the seven-class primary label space.
 
     Ambiguity remains available in ``omm_refined_state``,
     ``omm_domain_gate``, and ``membrane_ambiguity`` regardless of the primary
@@ -7220,6 +15181,11 @@ def _compose_omm_metaspot_labels(
         raise ValueError(
             "ambiguous_policy must be one of {'competitor', 'explicit'}"
         )
+    decision = str(decision_policy).strip().lower()
+    if decision not in {"strict", "balanced"}:
+        raise ValueError(
+            "decision_policy must be one of {'strict', 'balanced'}"
+        )
 
     def _assign_ambiguous(mask: pd.Series) -> None:
         if policy == "explicit":
@@ -7238,6 +15204,28 @@ def _compose_omm_metaspot_labels(
     if not bool(identifiable):
         _assign_ambiguous(confirmed | shared)
         unsupported_omm = labels.eq("OMM")
+        labels.loc[unsupported_omm] = competitors.loc[unsupported_omm]
+        return _finalize()
+
+    if decision == "balanced":
+        if reference_posteriors is None:
+            raise ValueError(
+                "balanced OMM decision_policy requires reference_posteriors"
+            )
+        posterior = pd.to_numeric(
+            pd.Series(reference_posteriors, index=labels.index),
+            errors="coerce",
+        )
+        locally_high = posterior.ge(float(posterior_high))
+        supported = (confirmed | shared) & locally_high
+        labels.loc[supported] = "OMM"
+
+        unresolved = (confirmed | shared) & ~supported
+        locally_rejected = unresolved & states.eq("OMM-not-supported")
+        labels.loc[locally_rejected] = competitors.loc[locally_rejected]
+        _assign_ambiguous(unresolved & ~locally_rejected)
+
+        unsupported_omm = labels.eq("OMM") & ~supported
         labels.loc[unsupported_omm] = competitors.loc[unsupported_omm]
         return _finalize()
 
@@ -8288,7 +16276,7 @@ def plot_annotation_quality_summary(adata, annot_df, produced_label_col='subcell
 
     plt.tight_layout(); plt.show()
 
-    print(f"\n=== Annotation Quality Summary ===")
+    print("\n=== Annotation Quality Summary ===")
     print(f"Total meta-domains: {adata.n_obs:,}")
     if {"leiden", "compartment_pred"}.issubset(adata.obs.columns):
         annotation_groups = (
@@ -8524,6 +16512,7 @@ def run_rapx(
     independent_mixed_score_delta=0.75,
     independent_unknown_label="Unknown",
     independent_geometry_min_abs_r=0.05,
+    independent_domain_compartment_feasibility=False,
     independent_assignment_mode="strict",
     independent_exploratory_max_q=0.30,
     independent_exploratory_min_channel_support=2,
@@ -8535,7 +16524,9 @@ def run_rapx(
     import pandas as pd
     import scanpy as sc
     try:
-        annotation_cfg = (load_params_yaml() or {}).get("annotation", {}) or {}
+        annotation_cfg = resolve_annotation_configuration(
+            load_params_yaml() or {}
+        )
         low_conf_policy = str(
             annotation_cfg.get("low_conf_policy", low_conf_policy)
         )
@@ -8575,6 +16566,12 @@ def run_rapx(
                     independent_geometry_min_abs_r,
                 )
             ),
+        )
+        independent_domain_compartment_feasibility = bool(
+            annotation_cfg.get(
+                "independent_domain_compartment_feasibility",
+                independent_domain_compartment_feasibility,
+            )
         )
         independent_assignment_mode = str(
             annotation_cfg.get(
@@ -8959,8 +16956,15 @@ def run_rapx(
     # -----------------------------
     if use_two_stage:
         print("\n=== Stage 1: Nuclear vs Cytoplasmic classification ===")
-        adata.obs['compartment_pred'] = np.where(
-            adata.obs['r_mean'] < 0, 'Nuclear', 'Cytoplasmic'
+        _replace_obs_columns(
+            adata,
+            {
+                "compartment_pred": np.where(
+                    adata.obs["r_mean"] < 0,
+                    "Nuclear",
+                    "Cytoplasmic",
+                )
+            },
         )
 
         nuclear_labels = {'Nucleus', 'Nucleolus', 'Lamina', 'Nuclear Pore'}
@@ -9002,14 +17006,35 @@ def run_rapx(
             'membrane_ambiguity',
         ])
         _ensure_obs_columns_initialized(adata, produced_label_col, meta_cols)
+        _replace_obs_columns(
+            adata,
+            {
+                "subcellular_candidate": (
+                    adata.obs["subcellular_candidate"].astype("object")
+                    if "subcellular_candidate" in adata.obs.columns
+                    else pd.Series(
+                        pd.NA,
+                        index=adata.obs_names,
+                        dtype="object",
+                    )
+                ),
+                "subcell_margin": (
+                    pd.to_numeric(
+                        adata.obs["subcell_margin"],
+                        errors="coerce",
+                    ).astype("float32")
+                    if "subcell_margin" in adata.obs.columns
+                    else pd.Series(
+                        np.nan,
+                        index=adata.obs_names,
+                        dtype="float32",
+                    )
+                ),
+            },
+        )
         assigned_labels = adata.obs[produced_label_col].astype(object).to_numpy(copy=True)
         conservative_labels = np.full(adata.n_obs, pd.NA, dtype=object)
         confidence_levels = np.full(adata.n_obs, pd.NA, dtype=object)
-        if "subcellular_candidate" in adata.obs.columns:
-            adata.obs["subcellular_candidate"] = (
-                adata.obs["subcellular_candidate"].astype("object")
-            )
-
         annot_df_list = []
 
         for comp, comp_sets in [('Nuclear', nuclear_sets), ('Cytoplasmic', cyto_sets)]:
@@ -9178,12 +17203,6 @@ def run_rapx(
             candidate = adata_sub.obs["leiden"].map(
                 annot_sub["candidate_label"]
             ).astype("object")
-            if "subcellular_candidate" not in adata.obs.columns:
-                adata.obs["subcellular_candidate"] = pd.Series(
-                    pd.NA,
-                    index=adata.obs_names,
-                    dtype="object",
-                )
             adata.obs.loc[mask, "subcellular_candidate"] = candidate.values
 
             for col in meta_cols:
@@ -9266,32 +17285,39 @@ def run_rapx(
             annot_sub2 = annot_sub2.reset_index().set_index(['leiden','compartment'])
             annot_df_list.append(annot_sub2)
 
-        adata.obs[produced_label_col] = pd.Series(
+        produced_values = pd.Series(
             assigned_labels,
             index=adata.obs_names,
             dtype="object",
         )
-        cats = pd.unique(adata.obs[produced_label_col].dropna().astype(str))
-        adata.obs[produced_label_col] = pd.Categorical(
-            adata.obs[produced_label_col].astype(str),
-            categories=sorted(cats),
-            ordered=False
-        )
-        adata.obs["subcellular_annotation_conservative"] = pd.Categorical(
-            pd.Series(conservative_labels, index=adata.obs_names).astype(str)
-        )
+        cats = pd.unique(produced_values.dropna().astype(str))
+        two_stage_updates: Dict[str, Any] = {
+            produced_label_col: pd.Categorical(
+                produced_values.astype(str),
+                categories=sorted(cats),
+                ordered=False,
+            ),
+            "subcellular_annotation_conservative": pd.Categorical(
+                pd.Series(conservative_labels, index=adata.obs_names).astype(str)
+            ),
+            "subcellular_confidence": pd.Categorical(
+                pd.Series(confidence_levels, index=adata.obs_names).astype(str),
+                categories=["Low", "Medium", "High"],
+                ordered=True,
+            ),
+        }
         if (
             "subcell_strict_label" in adata.obs.columns
             and adata.obs["subcell_strict_label"].notna().any()
         ):
-            adata.obs["subcellular_annotation_strict"] = pd.Categorical(
+            two_stage_updates["subcellular_annotation_strict"] = pd.Categorical(
                 adata.obs["subcell_strict_label"].astype(str)
             )
         if (
             "subcell_exploratory_label" in adata.obs.columns
             and adata.obs["subcell_exploratory_label"].notna().any()
         ):
-            adata.obs[
+            two_stage_updates[
                 "subcellular_annotation_exploratory"
             ] = pd.Categorical(
                 adata.obs["subcell_exploratory_label"].astype(str)
@@ -9300,16 +17326,12 @@ def run_rapx(
             "subcell_annotation_tier" in adata.obs.columns
             and adata.obs["subcell_annotation_tier"].notna().any()
         ):
-            adata.obs["subcellular_annotation_tier"] = pd.Categorical(
+            two_stage_updates["subcellular_annotation_tier"] = pd.Categorical(
                 adata.obs["subcell_annotation_tier"].astype(str),
                 categories=["Strict", "Exploratory", "Candidate"],
                 ordered=True,
             )
-        adata.obs["subcellular_confidence"] = pd.Categorical(
-            pd.Series(confidence_levels, index=adata.obs_names).astype(str),
-            categories=["Low", "Medium", "High"],
-            ordered=True,
-        )
+        _replace_obs_columns(adata, two_stage_updates)
 
         _refresh_subcellular_group_columns(adata, produced_label_col)
 
@@ -9411,14 +17433,29 @@ def run_rapx(
             relaxed_q=low_conf_relaxed_q,
         )
         if decision_mode == "independent":
-            annot_df = _apply_independent_evidence_policy(
+            group_r_mean = None
+            if (
+                independent_domain_compartment_feasibility
+                and use_spatial_channel
+                and "r_mean" in adata.obs.columns
+            ):
+                group_r_mean = _annotation_group_mean(adata, "r_mean")
+            elif independent_domain_compartment_feasibility:
+                _logging.getLogger("cellscope").warning(
+                    "Independent MetaDomain compartment feasibility was "
+                    "requested but spatial r_mean is unavailable; using the "
+                    "expression-only decision"
+                )
+            _logging.getLogger("cellscope").info(
+                "Independent single-stage annotation | "
+                "domain_compartment_feasibility=%s | "
+                "expression_only_track_retained=true",
+                group_r_mean is not None,
+            )
+            annot_df = _apply_independent_evidence_tracks(
                 annot_df,
                 regions_ref,
-                group_r_mean=(
-                    _annotation_group_mean(adata, "r_mean")
-                    if use_spatial_channel
-                    else None
-                ),
+                group_r_mean=group_r_mean,
                 subtype_fdr=subtype_fdr,
                 min_effective_markers=min_effective_markers,
                 min_channel_support=min_channel_support,
@@ -9441,38 +17478,56 @@ def run_rapx(
                 ),
             )
 
-        adata.obs[produced_label_col] = adata.obs['leiden'].map(annot_df['label']).astype('category')
-        adata.obs["subcellular_candidate"] = (
-            adata.obs["leiden"].map(annot_df["candidate_label"]).astype("category")
-        )
-        adata.obs["subcellular_annotation_conservative"] = (
-            adata.obs["leiden"]
-            .map(annot_df["conservative_label"])
-            .astype("category")
-        )
+        obs_updates: Dict[str, Any] = {
+            produced_label_col: (
+                adata.obs["leiden"].map(annot_df["label"]).astype("category")
+            ),
+            "subcellular_candidate": (
+                adata.obs["leiden"]
+                .map(annot_df["candidate_label"])
+                .astype("category")
+            ),
+            "subcellular_annotation_conservative": (
+                adata.obs["leiden"]
+                .map(annot_df["conservative_label"])
+                .astype("category")
+            ),
+            "subcellular_confidence": pd.Categorical(
+                adata.obs["leiden"].map(annot_df["confidence_level"]),
+                categories=["Low", "Medium", "High"],
+                ordered=True,
+            ),
+        }
+        if "expression_only_label" in annot_df.columns:
+            obs_updates["subcellular_annotation_expression_only"] = (
+                adata.obs["leiden"]
+                .map(annot_df["expression_only_label"])
+                .astype("category")
+            )
+        if "expression_only_candidate_label" in annot_df.columns:
+            obs_updates["subcellular_candidate_expression_only"] = (
+                adata.obs["leiden"]
+                .map(annot_df["expression_only_candidate_label"])
+                .astype("category")
+            )
         if "strict_label" in annot_df.columns:
-            adata.obs["subcellular_annotation_strict"] = (
+            obs_updates["subcellular_annotation_strict"] = (
                 adata.obs["leiden"]
                 .map(annot_df["strict_label"])
                 .astype("category")
             )
         if "exploratory_label" in annot_df.columns:
-            adata.obs["subcellular_annotation_exploratory"] = (
+            obs_updates["subcellular_annotation_exploratory"] = (
                 adata.obs["leiden"]
                 .map(annot_df["exploratory_label"])
                 .astype("category")
             )
         if "annotation_tier" in annot_df.columns:
-            adata.obs["subcellular_annotation_tier"] = pd.Categorical(
+            obs_updates["subcellular_annotation_tier"] = pd.Categorical(
                 adata.obs["leiden"].map(annot_df["annotation_tier"]),
                 categories=["Strict", "Exploratory", "Candidate"],
                 ordered=True,
             )
-        adata.obs["subcellular_confidence"] = pd.Categorical(
-            adata.obs["leiden"].map(annot_df["confidence_level"]),
-            categories=["Low", "Medium", "High"],
-            ordered=True,
-        )
 
         for col in [
             'top1','z1','q1','top2','z2','q2',
@@ -9496,12 +17551,16 @@ def run_rapx(
             'primary_evidence_score','secondary_evidence_score',
             'evidence_score_gap',
             'primary_empirical_q','secondary_empirical_q',
+            'expression_only_label','expression_only_candidate_label',
+            'domain_compartment_feasibility_applied',
             'omm_raw_competitor_label','omm_raw_competitor_score',
             'omm_specificity_margin','omm_specificity_pass',
             'omm_domain_state','membrane_ambiguity',
         ]:
             if col in annot_df.columns:
-                adata.obs[f'subcell_{col}'] = adata.obs['leiden'].map(annot_df[col])
+                obs_updates[f"subcell_{col}"] = adata.obs["leiden"].map(
+                    annot_df[col]
+                )
 
         for region in regions_ref:
             for prefix in (
@@ -9519,15 +17578,16 @@ def run_rapx(
             ):
                 source = f"{prefix}__{region}"
                 if source in annot_df.columns:
-                    adata.obs[f"subcell_{source}"] = (
+                    obs_updates[f"subcell_{source}"] = (
                         adata.obs["leiden"].map(annot_df[source])
                     )
 
         if "margin" in annot_df.columns:
-            adata.obs["subcell_margin"] = pd.to_numeric(
+            obs_updates["subcell_margin"] = pd.to_numeric(
                 adata.obs['leiden'].map(annot_df["margin"]), errors="coerce"
             ).astype("float32").values
 
+        _replace_obs_columns(adata, obs_updates)
         _refresh_subcellular_group_columns(adata, produced_label_col)
 
     # -----------------------------
@@ -9621,6 +17681,9 @@ def run_rapx(
             'independent_geometry_min_abs_r': float(
                 independent_geometry_min_abs_r
             ),
+            'independent_domain_compartment_feasibility': bool(
+                independent_domain_compartment_feasibility
+            ),
             'independent_assignment_mode': str(
                 independent_assignment_mode
             ),
@@ -9651,6 +17714,7 @@ def run_rapx(
     if plot_umap:
         def _sanitize_color_cols(cols):
             out = []
+            plot_updates: Dict[str, Any] = {}
             for c in cols:
                 if c not in adata.obs.columns and c not in adata.var_names:
                     continue
@@ -9661,7 +17725,7 @@ def run_rapx(
                 if pd.api.types.is_bool_dtype(col) or str(col.dtype) == 'boolean':
                     new_c = f"{c}__plotnum"
                     if new_c not in adata.obs.columns:
-                        adata.obs[new_c] = col.astype('float32')
+                        plot_updates[new_c] = col.astype('float32')
                     out.append(new_c)
                     continue
                 if (
@@ -9674,8 +17738,21 @@ def run_rapx(
                     # one value per MetaDomain because they are not readable.
                     if int(col.nunique(dropna=True)) > 64:
                         continue
-                    adata.obs[c] = pd.Categorical(col.astype(str))
+                    categorical = pd.Categorical(col.astype(str))
+                    plot_updates[c] = categorical
+                    category_labels = [
+                        str(value) for value in categorical.categories
+                    ]
+                    if category_labels and all(
+                        label in _SUBCELLULAR_LABEL_PALETTE
+                        for label in category_labels
+                    ):
+                        adata.uns[f"{c}_colors"] = [
+                            _SUBCELLULAR_LABEL_PALETTE[label]
+                            for label in category_labels
+                        ]
                 out.append(c)
+            _replace_obs_columns(adata, plot_updates)
             return out
 
         primary_colors = [
@@ -9906,11 +17983,13 @@ def _load_default_gold_tables(
     apex_omm_min_delta: float = 0.50,
     return_omm_audit: bool = False,
 ):
-    base = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src'))
-    apex = os.path.join(base, '2019_CELL_APEXSeq.tsv')
-    rna = os.path.join(base, 'RNALocateV3.txt')
+    apex = bundled_resource_path("2019_CELL_APEXSeq.tsv")
+    rna = bundled_resource_path("RNALocateV3.txt")
     if not os.path.exists(apex) or not os.path.exists(rna):
-        raise FileNotFoundError(f"Gold files not found under {base}")
+        raise FileNotFoundError(
+            "Bundled APEX/RNALocate reference files are missing from the "
+            "CellScoper installation"
+        )
     apex_raw = pd.read_table(apex)
     rna_locate = pd.read_table(rna)
     gold_apex, omm_audit = _prepare_apex_gold_reference(
@@ -9937,6 +18016,4750 @@ def _configure_rnalocate_augmentation(
     return out
 
 
+def _stable_group_layout(
+    group_codes: np.ndarray,
+    n_groups: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return stable member order, offsets, and sizes for dense group codes."""
+    codes = np.asarray(group_codes)
+    if codes.ndim != 1:
+        raise ValueError("group_codes must be one-dimensional")
+    if n_groups < 0:
+        raise ValueError("n_groups must be non-negative")
+    if codes.size:
+        if np.any(codes < 0) or int(codes.max()) >= int(n_groups):
+            raise ValueError(
+                "group_codes must be in the dense range [0, n_groups)"
+            )
+
+    member_order = np.argsort(codes, kind="stable")
+    if codes.size <= np.iinfo(np.int32).max:
+        member_order = member_order.astype(np.int32, copy=False)
+    group_sizes = np.bincount(
+        codes.astype(np.int64, copy=False),
+        minlength=int(n_groups),
+    ).astype(np.int64, copy=False)
+    group_offsets = np.empty(int(n_groups) + 1, dtype=np.int64)
+    group_offsets[0] = 0
+    np.cumsum(group_sizes, out=group_offsets[1:])
+    return member_order, group_offsets, group_sizes
+
+
+def _unique_cell_counts_for_masks(
+    cell_ids: Sequence[object],
+    masks: Sequence[Sequence[bool]],
+) -> Tuple[int, List[int]]:
+    """Count unique cells under several masks using compact integer codes."""
+    cell_codes, unique_cells = pd.factorize(cell_ids, sort=False)
+    if len(unique_cells) <= np.iinfo(np.int32).max:
+        cell_codes = cell_codes.astype(np.int32, copy=False)
+    valid_cells = cell_codes >= 0
+    counts: List[int] = []
+    for mask in masks:
+        mask_values = np.asarray(mask, dtype=bool)
+        if mask_values.shape != cell_codes.shape:
+            raise ValueError("Cell coverage mask length does not match cell IDs")
+        selected_codes = cell_codes[valid_cells & mask_values]
+        if selected_codes.size == 0:
+            counts.append(0)
+            continue
+        occupied = np.bincount(
+            selected_codes,
+            minlength=len(unique_cells),
+        )
+        counts.append(int(np.count_nonzero(occupied)))
+    return int(len(unique_cells)), counts
+
+
+def _dense_group_codes(
+    group_ids: Sequence[object],
+    *,
+    error_context: str,
+) -> Tuple[np.ndarray, int]:
+    """Return dense non-negative codes, reusing an existing code array."""
+    values = np.asarray(group_ids)
+    if values.ndim != 1:
+        raise ValueError(f"{error_context} IDs must be one-dimensional")
+    if values.size == 0:
+        return np.empty(0, dtype=np.int32), 0
+    if np.issubdtype(values.dtype, np.integer):
+        minimum = int(values.min())
+        maximum = int(values.max())
+        if minimum >= 0 and maximum < values.size:
+            dtype = np.int32 if maximum <= np.iinfo(np.int32).max else np.int64
+            return values.astype(dtype, copy=False), maximum + 1
+
+    codes, unique_groups = pd.factorize(group_ids, sort=False)
+    if np.any(codes < 0):
+        raise ValueError(f"{error_context} IDs contain missing values")
+    if len(unique_groups) <= np.iinfo(np.int32).max:
+        codes = codes.astype(np.int32, copy=False)
+    return codes, int(len(unique_groups))
+
+
+def _high_confidence_cell_coverage(
+    cell_ids: Sequence[object],
+    labels: Sequence[object],
+    confidence: Sequence[object],
+) -> Tuple[int, pd.Series]:
+    """Return exact label-wise cell coverage without object-table deduping."""
+    label_codes, unique_labels = pd.factorize(labels, sort=False)
+    high = np.asarray(pd.Series(confidence).eq("High"), dtype=bool)
+    masks = [
+        high & (label_codes == label_index)
+        for label_index in range(len(unique_labels))
+    ]
+    total_cells, counts = _unique_cell_counts_for_masks(cell_ids, masks)
+    coverage = pd.Series(
+        counts,
+        index=pd.Index(unique_labels).astype(str),
+        dtype=np.int64,
+    ).sort_values(ascending=False)
+    return total_cells, coverage
+
+
+def _build_same_cell_metaspot_dgi_pool(
+    adata1: ad.AnnData,
+    broad_prior: Sequence[object],
+    *,
+    rep_key: str = METASPOT_DGI_KEY,
+    n_neighbors: int = 8,
+) -> Tuple[sp.csr_matrix, np.ndarray]:
+    """Return an unweighted DGI-neighborhood pooling matrix.
+
+    Neighbors are selected independently inside each original cell and broad
+    compartment.  L2-normalizing the DGI vectors makes Euclidean KDTree
+    neighbors equivalent to cosine-nearest neighbors.  The diagonal is always
+    present, so a small compartment in a cell safely pools only with itself.
+    """
+    if "cell_id" not in adata1.obs.columns:
+        raise KeyError(
+            "MetaSpot annotation.unit='metaspot' requires adata1.obs['cell_id']"
+        )
+    if rep_key not in adata1.obsm:
+        raise KeyError(
+            "MetaSpot annotation.unit='metaspot' requires the native MetaSpot "
+            f"DGI representation adata1.obsm[{rep_key!r}]. Set "
+            "module8.dgi_unit: metaspot and rerun build_anndata."
+        )
+    try:
+        k = int(n_neighbors)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("annotation.metaspot_pool_k must be an integer") from exc
+    if k < 1:
+        raise ValueError("annotation.metaspot_pool_k must be >= 1")
+
+    logger = _logging.getLogger("cellscope")
+    started_at = _time.perf_counter()
+    logger.info(
+        "MetaSpot same-cell DGI pooling start | metaspots=%d | neighbors=%d",
+        int(adata1.n_obs),
+        int(k),
+    )
+
+    embedding = adata1.obsm[rep_key]
+    if sp.issparse(embedding):
+        embedding = embedding.toarray()
+    embedding = np.asarray(embedding, dtype=np.float32)
+    if embedding.ndim != 2 or embedding.shape[0] != adata1.n_obs:
+        raise ValueError(
+            f"adata1.obsm[{rep_key!r}] must have shape "
+            f"({adata1.n_obs}, n_features)"
+        )
+    embedding = np.nan_to_num(
+        embedding,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+        copy=True,
+    )
+    norms = np.linalg.norm(embedding, axis=1, keepdims=True)
+    embedding /= np.maximum(norms, 1e-8)
+
+    broad = pd.Series(broad_prior, index=adata1.obs_names, dtype="string")
+    if len(broad) != adata1.n_obs:
+        raise ValueError("broad_prior length must match adata1.n_obs")
+    cells = adata1.obs["cell_id"].astype("string").fillna("<missing-cell>")
+    broad = broad.fillna("Unknown")
+    group_index = pd.MultiIndex.from_arrays(
+        [cells.to_numpy(), broad.to_numpy()],
+        names=["cell_id", "broad_prior"],
+    )
+    group_codes, group_levels = pd.factorize(group_index, sort=False)
+    n_groups = len(group_levels)
+    logger.info(
+        "MetaSpot same-cell DGI pooling grouped | groups=%d | "
+        "elapsed_seconds=%.1f",
+        int(n_groups),
+        _time.perf_counter() - started_at,
+    )
+
+    # Build group membership once. The previous implementation evaluated
+    # ``group_codes == group_code`` for every group, repeatedly scanning all
+    # MetaSpots and making the work proportional to n_obs * n_groups.
+    member_order, group_offsets, group_sizes = _stable_group_layout(
+        group_codes,
+        n_groups,
+    )
+    poolable_group = np.fromiter(
+        (
+            str(level[1]) in {"Nuclear", "Cytoplasmic"}
+            for level in group_levels
+        ),
+        dtype=bool,
+        count=n_groups,
+    )
+    group_neighbor_counts = np.where(
+        poolable_group,
+        np.minimum(group_sizes, int(k)),
+        1,
+    ).astype(np.int32, copy=False)
+    row_neighbor_counts = group_neighbor_counts[group_codes]
+
+    indptr = np.empty(adata1.n_obs + 1, dtype=np.int64)
+    indptr[0] = 0
+    np.cumsum(row_neighbor_counts, dtype=np.int64, out=indptr[1:])
+    n_edges = int(indptr[-1])
+    index_dtype = (
+        np.int32
+        if adata1.n_obs <= np.iinfo(np.int32).max
+        else np.int64
+    )
+    indices = np.empty(n_edges, dtype=index_dtype)
+
+    progress_every = max(1, n_groups // 10)
+    for group_code, level in enumerate(group_levels):
+        start = int(group_offsets[group_code])
+        stop = int(group_offsets[group_code + 1])
+        members = member_order[start:stop]
+        group_size = int(members.size)
+        local_k = int(group_neighbor_counts[group_code])
+        positions = (
+            indptr[members, None]
+            + np.arange(local_k, dtype=np.int64)[None, :]
+        ).reshape(-1)
+
+        group_broad = str(level[1])
+        if group_broad not in {"Nuclear", "Cytoplasmic"}:
+            neighbor_ids = members
+        elif group_size <= k:
+            # Querying every point in a group returns the full group. Filling
+            # it directly avoids constructing a KDTree for small groups.
+            neighbor_ids = np.tile(members, group_size)
+        else:
+            tree = KDTree(embedding[members])
+            local_indices = np.asarray(
+                tree.query(
+                    embedding[members],
+                    k=local_k,
+                    return_distance=False,
+                ),
+                dtype=np.int64,
+            )
+            local_self = np.arange(group_size, dtype=np.int64)
+            missing_self = ~np.any(
+                local_indices == local_self[:, None],
+                axis=1,
+            )
+            if missing_self.any():
+                local_indices[missing_self, -1] = local_self[missing_self]
+            neighbor_ids = members[local_indices.reshape(-1)]
+        indices[positions] = neighbor_ids
+
+        processed = group_code + 1
+        if processed % progress_every == 0 or processed == n_groups:
+            logger.info(
+                "MetaSpot same-cell DGI pooling progress | groups=%d/%d "
+                "| elapsed_seconds=%.1f",
+                int(processed),
+                int(n_groups),
+                _time.perf_counter() - started_at,
+            )
+
+    data = np.ones(n_edges, dtype=np.float32)
+    pooling = sp.csr_matrix(
+        (data, indices, indptr),
+        shape=(adata1.n_obs, adata1.n_obs),
+        dtype=np.float32,
+    )
+    pooling.sum_duplicates()
+    pooling.data[:] = 1.0
+    pool_size = row_neighbor_counts.astype(np.int32, copy=False)
+    if np.any(pool_size < 1):
+        raise RuntimeError("Every MetaSpot must include itself in local pooling")
+    logger.info(
+        "MetaSpot same-cell DGI pooling done | metaspots=%d | groups=%d "
+        "| edges=%d | elapsed_seconds=%.1f",
+        int(adata1.n_obs),
+        int(n_groups),
+        int(pooling.nnz),
+        _time.perf_counter() - started_at,
+    )
+    return pooling, pool_size
+
+
+def _prepare_metaspot_marker_sets(
+    gold_df: pd.DataFrame,
+    var_names: Sequence[object],
+    annotation_cfg: Mapping[str, Any],
+) -> Dict[str, List[str]]:
+    """Build exclusive, measured marker sets for local MetaSpot evidence."""
+    gold_mat = prepare_gold_matrix(
+        gold_df,
+        normalize_columns=bool(
+            annotation_cfg.get("gold_column_normalize", False)
+        ),
+    )
+    marker_sets, _, _ = build_specific_marker_sets(
+        gold_mat,
+        target=int(annotation_cfg.get("marker_set_target", 600)),
+        min_weight=float(annotation_cfg.get("marker_min_weight", 0.05)),
+        min_margin=float(annotation_cfg.get("marker_min_margin", 0.05)),
+    )
+    measured = {str(gene).upper() for gene in var_names}
+    labels = [
+        "Nucleus",
+        "Nucleolus",
+        "Lamina",
+        "Nuclear Pore",
+        "Cytosol",
+        "ER",
+        "OMM",
+    ]
+    return {
+        label: sorted(
+            {
+                str(gene).upper()
+                for gene in marker_sets.get(label, [])
+                if str(gene).upper() in measured
+            }
+        )
+        for label in labels
+    }
+
+
+def _resolve_metaspot_omm_confirmation(
+    adata1: ad.AnnData,
+    *,
+    require_confirmation: bool,
+    posterior_high: float,
+) -> Tuple[str, np.ndarray]:
+    """Resolve global OMM identifiability and per-MetaSpot confirmation.
+
+    Returns a global mode (``disabled``, ``identifiable``,
+    ``unidentifiable``, or ``unavailable``) and a boolean confirmation mask.
+    ``unavailable`` is distinct from a negative confirmation: it means the
+    independent confirmation model or its required output columns are absent.
+    """
+    n_obs = adata1.n_obs
+    if not require_confirmation:
+        return "disabled", np.ones(n_obs, dtype=bool)
+
+    refinement_meta = adata1.uns.get("omm_metaspot_refinement")
+    identifiable: Optional[bool] = None
+    if (
+        isinstance(refinement_meta, Mapping)
+        and "identifiable" in refinement_meta
+    ):
+        raw_identifiable = refinement_meta.get("identifiable")
+        if isinstance(raw_identifiable, str):
+            normalized = raw_identifiable.strip().lower()
+            if normalized in {"true", "1", "yes"}:
+                identifiable = True
+            elif normalized in {"false", "0", "no"}:
+                identifiable = False
+        else:
+            try:
+                raw_array = np.asarray(raw_identifiable)
+                if raw_array.size == 1:
+                    identifiable = bool(raw_array.reshape(-1)[0])
+            except (TypeError, ValueError):
+                identifiable = None
+
+    required_columns = {"omm_domain_gate", "omm_refined_state"}
+    if identifiable is False:
+        return "unidentifiable", np.zeros(n_obs, dtype=bool)
+    if identifiable is not True or not required_columns.issubset(
+        adata1.obs.columns
+    ):
+        return "unavailable", np.zeros(n_obs, dtype=bool)
+
+    gates = (
+        adata1.obs["omm_domain_gate"]
+        .astype("string")
+        .fillna("")
+        .str.lower()
+    )
+    states = adata1.obs["omm_refined_state"].astype("string").fillna("")
+    confirmed_state = gates.eq("confirmed") & states.eq("OMM-supported")
+    posterior_supported = pd.Series(False, index=adata1.obs_names)
+    if "omm_reference_posterior" in adata1.obs.columns:
+        posterior = pd.to_numeric(
+            adata1.obs["omm_reference_posterior"],
+            errors="coerce",
+        )
+        posterior_supported = (
+            gates.isin(["confirmed", "shared"])
+            & posterior.ge(float(posterior_high))
+        )
+    confirmed = (confirmed_state | posterior_supported).to_numpy(dtype=bool)
+    return "identifiable", confirmed
+
+
+def _resolve_metaspot_label_thresholds(
+    annotation_cfg: Mapping[str, Any],
+    labels: Sequence[str],
+    defaults: Mapping[str, Any],
+) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict[str, Any]]]:
+    """Resolve validated per-label overrides for the MetaSpot fine head."""
+    raw_overrides = annotation_cfg.get("metaspot_label_thresholds", {}) or {}
+    if not isinstance(raw_overrides, Mapping):
+        raise ValueError(
+            "annotation.metaspot_label_thresholds must be a mapping"
+        )
+
+    integer_fields = {
+        "min_marker_transcripts",
+        "min_marker_genes",
+    }
+    probability_fields = {
+        "subtype_fdr",
+        "exploratory_max_q",
+        "min_dgi_support",
+        "min_dgi_margin",
+    }
+    allowed_fields = set(defaults)
+    label_lookup = {str(label).casefold(): str(label) for label in labels}
+    normalized_overrides: Dict[str, Mapping[str, Any]] = {}
+    for raw_label, raw_values in raw_overrides.items():
+        normalized_label = label_lookup.get(str(raw_label).strip().casefold())
+        if normalized_label is None:
+            raise ValueError(
+                "annotation.metaspot_label_thresholds contains an unknown "
+                f"label: {raw_label!r}"
+            )
+        if not isinstance(raw_values, Mapping):
+            raise ValueError(
+                "Each annotation.metaspot_label_thresholds entry must be "
+                f"a mapping; got {raw_label!r}"
+            )
+        unknown_fields = sorted(set(raw_values).difference(allowed_fields))
+        if unknown_fields:
+            raise ValueError(
+                "Unknown MetaSpot label threshold fields for "
+                f"{normalized_label!r}: {unknown_fields}"
+            )
+        normalized_overrides[normalized_label] = raw_values
+
+    arrays: Dict[str, np.ndarray] = {}
+    resolved_by_label: Dict[str, Dict[str, Any]] = {}
+    for label in labels:
+        resolved_by_label[str(label)] = {}
+    for field, default in defaults.items():
+        values: List[Any] = []
+        for label in labels:
+            raw_value = normalized_overrides.get(str(label), {}).get(
+                field,
+                default,
+            )
+            if field in integer_fields:
+                try:
+                    value: Any = int(raw_value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"MetaSpot threshold {field!r} for {label!r} must "
+                        "be an integer"
+                    ) from exc
+                if value < 1:
+                    raise ValueError(
+                        f"MetaSpot threshold {field!r} for {label!r} must "
+                        "be >= 1"
+                    )
+            else:
+                try:
+                    value = float(raw_value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"MetaSpot threshold {field!r} for {label!r} must "
+                        "be numeric"
+                    ) from exc
+                if not np.isfinite(value) or value < 0.0:
+                    raise ValueError(
+                        f"MetaSpot threshold {field!r} for {label!r} must "
+                        "be finite and >= 0"
+                    )
+                if field in probability_fields and value > 1.0:
+                    raise ValueError(
+                        f"MetaSpot threshold {field!r} for {label!r} must "
+                        "be <= 1"
+                    )
+            values.append(value)
+            resolved_by_label[str(label)][field] = value
+        dtype = np.int32 if field in integer_fields else np.float64
+        arrays[field] = np.asarray(values, dtype=dtype)
+
+    for label_idx, label in enumerate(labels):
+        if (
+            arrays["exploratory_max_q"][label_idx]
+            < arrays["subtype_fdr"][label_idx]
+        ):
+            raise ValueError(
+                "MetaSpot exploratory_max_q must be >= subtype_fdr for "
+                f"{label!r}"
+            )
+    return arrays, resolved_by_label
+
+
+def _compute_metaspot_dgi_consensus(
+    pooling: sp.csr_matrix,
+    raw_scores: np.ndarray,
+    raw_counts: np.ndarray,
+    raw_distinct_genes: np.ndarray,
+    broad_values: np.ndarray,
+    labels: Sequence[str],
+    allowed: Mapping[str, Sequence[str]],
+    *,
+    seed_min_transcripts: int,
+    seed_min_genes: int,
+    seed_min_enrichment: float,
+    min_informative_neighbors: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Propagate marker-only subtype seeds over leave-one-out DGI edges.
+
+    The seed labels are computed from unpooled counts.  Removing the diagonal
+    prevents a MetaSpot from manufacturing DGI support for its own marker
+    candidate.  This makes the returned consensus an independently auditable
+    representation branch rather than a second name for pooled counts.
+    """
+    n_obs, n_labels = raw_scores.shape
+    label_to_idx = {str(label): idx for idx, label in enumerate(labels)}
+    subtype_labels = {
+        str(label)
+        for label in labels
+        if str(label) not in {"Nucleus", "Cytosol", "Unknown"}
+    }
+    marker_candidate_indices = np.full(n_obs, -1, dtype=np.int32)
+    marker_candidate_gap = np.full(n_obs, np.nan, dtype=np.float64)
+    for compartment, compartment_labels in allowed.items():
+        rows = np.flatnonzero(broad_values == compartment)
+        label_indices = np.asarray(
+            [label_to_idx[str(label)] for label in compartment_labels],
+            dtype=np.int64,
+        )
+        if rows.size == 0 or label_indices.size == 0:
+            continue
+        local_scores = raw_scores[np.ix_(rows, label_indices)]
+        best_local = np.argmax(local_scores, axis=1)
+        best_scores = local_scores[np.arange(rows.size), best_local]
+        finite_best = np.isfinite(best_scores)
+        chosen = label_indices[best_local]
+        marker_candidate_indices[rows[finite_best]] = chosen[finite_best]
+        if label_indices.size > 1:
+            sorted_scores = np.sort(local_scores, axis=1)
+            gaps = sorted_scores[:, -1] - sorted_scores[:, -2]
+            gaps[~np.isfinite(gaps)] = np.nan
+            marker_candidate_gap[rows] = gaps
+
+    row_ids = np.arange(n_obs)
+    safe_indices = np.maximum(marker_candidate_indices, 0)
+    candidate_counts = raw_counts[row_ids, safe_indices]
+    candidate_genes = raw_distinct_genes[row_ids, safe_indices]
+    candidate_scores = raw_scores[row_ids, safe_indices]
+    label_values = np.asarray(labels, dtype=object)
+    marker_candidate_labels = np.full(n_obs, "Unknown", dtype=object)
+    valid_candidate = marker_candidate_indices >= 0
+    marker_candidate_labels[valid_candidate] = label_values[
+        marker_candidate_indices[valid_candidate]
+    ]
+    seed_mask = (
+        np.isin(marker_candidate_labels, list(subtype_labels))
+        & (candidate_counts >= int(seed_min_transcripts))
+        & (candidate_genes >= int(seed_min_genes))
+        & (candidate_scores >= float(seed_min_enrichment))
+        & np.isfinite(candidate_scores)
+    )
+
+    seed_onehot = np.zeros((n_obs, n_labels), dtype=np.float32)
+    seed_rows = np.flatnonzero(seed_mask)
+    if seed_rows.size:
+        seed_onehot[
+            seed_rows,
+            marker_candidate_indices[seed_rows],
+        ] = 1.0
+
+    # The pooling contract guarantees a unit diagonal. Subtracting the focal
+    # seed after multiplication is the exact leave-one-out result and avoids a
+    # second multi-gigabyte CSR copy solely to clear the diagonal.
+    votes = np.asarray(pooling @ seed_onehot, dtype=np.float32)
+    votes -= seed_onehot
+    seed_values = seed_mask.astype(np.float32)
+    informative = np.asarray(pooling @ seed_values).ravel() - seed_values
+    support = np.zeros((n_obs, n_labels), dtype=np.float32)
+    available = informative >= int(min_informative_neighbors)
+    support[available] = votes[available] / informative[available, None]
+    return (
+        marker_candidate_indices,
+        marker_candidate_gap,
+        support,
+        informative.astype(np.int32),
+    )
+
+
+def _select_metaspot_cell_coverage_rescues(
+    cell_ids: np.ndarray,
+    candidate: np.ndarray,
+    already_supported: np.ndarray,
+    marker_base_evidence: np.ndarray,
+    dgi_available: np.ndarray,
+    candidate_dgi_support: np.ndarray,
+    candidate_dgi_margin: np.ndarray,
+    candidate_scores: np.ndarray,
+    score_gap: np.ndarray,
+    candidate_q: np.ndarray,
+    candidate_counts: np.ndarray,
+    cell_marker_counts: np.ndarray,
+    cell_marker_genes: np.ndarray,
+    cell_marker_enrichment: np.ndarray,
+    cell_marker_binomial_p: np.ndarray,
+    *,
+    labels: Sequence[str],
+    min_cell_transcripts: int,
+    min_cell_genes: int,
+    min_cell_enrichment: float,
+    max_cell_p: float,
+    min_dgi_support: float,
+    min_dgi_margin: float,
+    max_per_cell_label: int,
+) -> np.ndarray:
+    """Select bounded, evidence-backed fine labels missing from each cell.
+
+    This is a discovery rescue, not a forced seven-label assignment. A label
+    is eligible only when the cell has coherent multi-transcript, multi-gene
+    evidence for it, the focal MetaSpot passes its own marker gates, and an
+    independent leave-one-out DGI neighborhood supports that local placement.
+    At most ``max_per_cell_label`` MetaSpots are selected for a label that is
+    currently absent from a cell.
+    """
+    n_obs = len(candidate)
+    rescued = np.zeros(n_obs, dtype=bool)
+    if n_obs == 0 or max_per_cell_label <= 0 or not labels:
+        return rescued
+
+    cell_values, n_cells = _dense_group_codes(
+        cell_ids,
+        error_context="MetaSpot cell-coverage rescue",
+    )
+    candidate_values = np.asarray(candidate, dtype=object)
+    supported_values = np.asarray(already_supported, dtype=bool)
+    eligible_base = (
+        np.asarray(marker_base_evidence, dtype=bool)
+        & np.asarray(dgi_available, dtype=bool)
+        & np.isfinite(candidate_dgi_support)
+        & np.isfinite(candidate_dgi_margin)
+        & (candidate_dgi_support >= float(min_dgi_support))
+        & (candidate_dgi_margin >= float(min_dgi_margin))
+        & (np.asarray(cell_marker_counts, dtype=float) >= int(min_cell_transcripts))
+        & (np.asarray(cell_marker_genes, dtype=float) >= int(min_cell_genes))
+        & (
+            np.asarray(cell_marker_enrichment, dtype=float)
+            >= float(min_cell_enrichment)
+        )
+        & np.isfinite(np.asarray(cell_marker_binomial_p, dtype=float))
+        & (
+            np.asarray(cell_marker_binomial_p, dtype=float)
+            <= float(max_cell_p)
+        )
+        & ~supported_values
+    )
+
+    for label in labels:
+        label_value = str(label)
+        present_by_cell = np.bincount(
+            cell_values[
+                supported_values & (candidate_values == label_value)
+            ],
+            minlength=n_cells,
+        ).astype(bool, copy=False)
+        eligible_rows = np.flatnonzero(
+            eligible_base
+            & (candidate_values == label_value)
+            & ~present_by_cell[cell_values]
+        )
+        if eligible_rows.size == 0:
+            continue
+
+        ranked = pd.DataFrame(
+            {
+                "row": eligible_rows,
+                "cell_id": cell_values[eligible_rows],
+                "dgi_support": candidate_dgi_support[eligible_rows],
+                "dgi_margin": candidate_dgi_margin[eligible_rows],
+                "enrichment": candidate_scores[eligible_rows],
+                "score_gap": score_gap[eligible_rows],
+                "q": candidate_q[eligible_rows],
+                "marker_transcripts": candidate_counts[eligible_rows],
+                "cell_marker_transcripts": np.asarray(cell_marker_counts)[
+                    eligible_rows
+                ],
+                "cell_marker_genes": np.asarray(cell_marker_genes)[
+                    eligible_rows
+                ],
+                "cell_marker_enrichment": np.asarray(
+                    cell_marker_enrichment
+                )[eligible_rows],
+                "cell_marker_binomial_p": np.asarray(
+                    cell_marker_binomial_p
+                )[eligible_rows],
+            }
+        )
+        ranked.sort_values(
+            [
+                "cell_id",
+                "dgi_support",
+                "dgi_margin",
+                "enrichment",
+                "score_gap",
+                "q",
+                "marker_transcripts",
+                "cell_marker_enrichment",
+                "cell_marker_transcripts",
+                "cell_marker_genes",
+                "cell_marker_binomial_p",
+                "row",
+            ],
+            ascending=[
+                True,
+                False,
+                False,
+                False,
+                False,
+                True,
+                False,
+                False,
+                False,
+                False,
+                True,
+                True,
+            ],
+            kind="mergesort",
+            inplace=True,
+        )
+        selected = ranked.groupby("cell_id", sort=False).head(
+            int(max_per_cell_label)
+        )
+        rescued[selected["row"].to_numpy(dtype=np.int64)] = True
+    return rescued
+
+
+def _select_metaspot_labelwise_cell_coverage_rescues(
+    cell_ids: np.ndarray,
+    broad_values: np.ndarray,
+    current_labels: np.ndarray,
+    already_supported: np.ndarray,
+    local_counts: np.ndarray,
+    local_genes: np.ndarray,
+    local_enrichment: np.ndarray,
+    local_q: np.ndarray,
+    dgi_available: np.ndarray,
+    dgi_support: np.ndarray,
+    cell_marker_counts: np.ndarray,
+    cell_marker_genes: np.ndarray,
+    cell_marker_enrichment: np.ndarray,
+    cell_marker_binomial_p: np.ndarray,
+    *,
+    labels: Sequence[str],
+    all_labels: Sequence[str],
+    allowed: Mapping[str, Sequence[str]],
+    min_local_transcripts: np.ndarray,
+    min_local_genes: np.ndarray,
+    min_local_enrichment: np.ndarray,
+    min_cell_transcripts: int,
+    min_cell_genes: int,
+    min_cell_enrichment: float,
+    max_cell_p: float,
+    min_dgi_support: float,
+    min_dgi_margin: float,
+    max_per_cell_label: int,
+) -> np.ndarray:
+    """Return independently supported fine labels for bounded rescue rows.
+
+    The ordinary MetaSpot head first chooses one label with the largest local
+    marker enrichment. That winner-takes-all step is useful for a primary
+    candidate, but it can hide a second fine structure even when that label
+    has its own focal marker, coherent cell-level multi-gene evidence, and
+    leave-one-out DGI neighborhood support. This helper evaluates each allowed
+    rescue label against its own evidence arrays before candidate competition.
+
+    No label is invented from DGI alone. Every selected row must contain a
+    measured marker for the emitted label, the cell must pass exact pooled
+    marker gates in the matching broad compartment, and the label must tie or
+    beat every same-compartment label in the independent DGI vote. Selection
+    is bounded per cell/label and a MetaSpot can receive at most one label.
+    """
+    n_obs = len(cell_ids)
+    rescue_labels = np.full(n_obs, "", dtype=object)
+    if n_obs == 0 or int(max_per_cell_label) <= 0 or not labels:
+        return rescue_labels
+
+    matrices = {
+        "local_counts": np.asarray(local_counts),
+        "local_genes": np.asarray(local_genes),
+        "local_enrichment": np.asarray(local_enrichment),
+        "local_q": np.asarray(local_q),
+        "dgi_support": np.asarray(dgi_support),
+        "cell_marker_counts": np.asarray(cell_marker_counts),
+        "cell_marker_genes": np.asarray(cell_marker_genes),
+        "cell_marker_enrichment": np.asarray(cell_marker_enrichment),
+        "cell_marker_binomial_p": np.asarray(cell_marker_binomial_p),
+    }
+    n_labels = len(all_labels)
+    for name, matrix in matrices.items():
+        if matrix.shape != (n_obs, n_labels):
+            raise ValueError(
+                f"{name} must have shape {(n_obs, n_labels)}, got "
+                f"{matrix.shape}"
+            )
+
+    cell_values, n_cells = _dense_group_codes(
+        cell_ids,
+        error_context="MetaSpot labelwise cell-coverage rescue",
+    )
+    broad = np.asarray(broad_values, dtype=object)
+    current = np.asarray(current_labels, dtype=object)
+    supported = np.asarray(already_supported, dtype=bool)
+    available = np.asarray(dgi_available, dtype=bool)
+    if any(
+        array.shape != (n_obs,)
+        for array in (broad, current, supported, available)
+    ):
+        raise ValueError(
+            "MetaSpot labelwise rescue row arrays must be one-dimensional"
+        )
+
+    label_to_idx = {
+        str(label): idx for idx, label in enumerate(all_labels)
+    }
+    label_to_compartment = {
+        str(label): str(compartment)
+        for compartment, compartment_labels in allowed.items()
+        for label in compartment_labels
+    }
+    rows: List[pd.DataFrame] = []
+    for raw_label in labels:
+        label = str(raw_label)
+        if label not in label_to_idx or label not in label_to_compartment:
+            raise ValueError(
+                f"Unknown labelwise cell-coverage rescue label: {label!r}"
+            )
+        label_idx = label_to_idx[label]
+        compartment = label_to_compartment[label]
+        alternative_indices = np.asarray(
+            [
+                label_to_idx[str(other)]
+                for other in allowed[compartment]
+                if str(other) != label
+            ],
+            dtype=np.int64,
+        )
+        label_dgi_support = matrices["dgi_support"][:, label_idx].astype(
+            float, copy=False
+        )
+        if alternative_indices.size:
+            alternative_support = np.max(
+                matrices["dgi_support"][:, alternative_indices], axis=1
+            )
+        else:
+            alternative_support = np.zeros(n_obs, dtype=float)
+        label_dgi_margin = label_dgi_support - alternative_support
+
+        present_by_cell = np.bincount(
+            cell_values[supported & (current == label)],
+            minlength=n_cells,
+        ).astype(bool, copy=False)
+        eligible = (
+            ~supported
+            & (broad == compartment)
+            & ~present_by_cell[cell_values]
+            & (
+                matrices["local_counts"][:, label_idx]
+                >= int(min_local_transcripts[label_idx])
+            )
+            & (
+                matrices["local_genes"][:, label_idx]
+                >= int(min_local_genes[label_idx])
+            )
+            & np.isfinite(matrices["local_enrichment"][:, label_idx])
+            & (
+                matrices["local_enrichment"][:, label_idx]
+                >= float(min_local_enrichment[label_idx])
+            )
+            & np.isfinite(matrices["local_q"][:, label_idx])
+            & available
+            & np.isfinite(label_dgi_support)
+            & np.isfinite(label_dgi_margin)
+            & (label_dgi_support >= float(min_dgi_support))
+            & (label_dgi_margin >= float(min_dgi_margin))
+            & (
+                matrices["cell_marker_counts"][:, label_idx]
+                >= int(min_cell_transcripts)
+            )
+            & (
+                matrices["cell_marker_genes"][:, label_idx]
+                >= int(min_cell_genes)
+            )
+            & np.isfinite(
+                matrices["cell_marker_enrichment"][:, label_idx]
+            )
+            & (
+                matrices["cell_marker_enrichment"][:, label_idx]
+                >= float(min_cell_enrichment)
+            )
+            & np.isfinite(
+                matrices["cell_marker_binomial_p"][:, label_idx]
+            )
+            & (
+                matrices["cell_marker_binomial_p"][:, label_idx]
+                <= float(max_cell_p)
+            )
+        )
+        eligible_rows = np.flatnonzero(eligible)
+        if eligible_rows.size == 0:
+            continue
+        rows.append(
+            pd.DataFrame(
+                {
+                    "row": eligible_rows,
+                    "cell_id": cell_values[eligible_rows],
+                    "label": label,
+                    "dgi_support": label_dgi_support[eligible_rows],
+                    "dgi_margin": label_dgi_margin[eligible_rows],
+                    "local_enrichment": matrices["local_enrichment"][
+                        eligible_rows, label_idx
+                    ],
+                    "local_transcripts": matrices["local_counts"][
+                        eligible_rows, label_idx
+                    ],
+                    "local_genes": matrices["local_genes"][
+                        eligible_rows, label_idx
+                    ],
+                    "cell_enrichment": matrices[
+                        "cell_marker_enrichment"
+                    ][eligible_rows, label_idx],
+                    "cell_transcripts": matrices["cell_marker_counts"][
+                        eligible_rows, label_idx
+                    ],
+                    "cell_genes": matrices["cell_marker_genes"][
+                        eligible_rows, label_idx
+                    ],
+                    "cell_p": matrices["cell_marker_binomial_p"][
+                        eligible_rows, label_idx
+                    ],
+                    "label_order": label_idx,
+                }
+            )
+        )
+
+    if not rows:
+        return rescue_labels
+
+    ranked = pd.concat(rows, ignore_index=True)
+    ranked.sort_values(
+        [
+            "dgi_support",
+            "dgi_margin",
+            "local_enrichment",
+            "local_transcripts",
+            "local_genes",
+            "cell_enrichment",
+            "cell_transcripts",
+            "cell_genes",
+            "cell_p",
+            "label_order",
+            "cell_id",
+            "row",
+        ],
+        ascending=[
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+            True,
+            True,
+            True,
+            True,
+        ],
+        kind="mergesort",
+        inplace=True,
+    )
+
+    used_rows: set[int] = set()
+    selected_per_cell_label: Counter[Tuple[int, str]] = Counter()
+    for record in ranked.itertuples(index=False):
+        row = int(record.row)
+        key = (int(record.cell_id), str(record.label))
+        if row in used_rows:
+            continue
+        if selected_per_cell_label[key] >= int(max_per_cell_label):
+            continue
+        rescue_labels[row] = str(record.label)
+        used_rows.add(row)
+        selected_per_cell_label[key] += 1
+    return rescue_labels
+
+
+def _select_metaspot_multistructure_first_loci(
+    cell_ids: Sequence[object],
+    current_labels: Sequence[object],
+    already_supported: Sequence[bool],
+    presence_score: np.ndarray,
+    localization_score: np.ndarray,
+    structure_evidence: np.ndarray,
+    spatial_coherence: np.ndarray,
+    geometry_compatible: np.ndarray,
+    local_marker_transcripts: np.ndarray,
+    local_marker_genes: np.ndarray,
+    cell_marker_transcripts: np.ndarray,
+    cell_marker_genes: np.ndarray,
+    cell_marker_enrichment: np.ndarray,
+    cell_marker_binomial_p: np.ndarray,
+    dgi_available: Sequence[bool],
+    metaspot_total_transcripts: Sequence[float],
+    *,
+    structures: Sequence[str],
+    min_presence_score: float,
+    min_localization_score: float,
+    min_spatial_coherence: Sequence[float],
+    min_evidence_score: Sequence[float],
+    min_local_marker_transcripts: Sequence[int],
+    min_local_marker_genes: Sequence[int],
+    min_cell_marker_transcripts: Sequence[int],
+    min_cell_marker_genes: Sequence[int],
+    min_cell_marker_enrichment: Sequence[float],
+    max_cell_marker_p: Sequence[float],
+    max_projected_burden: float,
+) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    """Select one evidence-supported missing locus per cell and structure."""
+    n_obs = len(cell_ids)
+    n_structures = len(structures)
+    selected_labels = np.full(n_obs, "", dtype=object)
+    diagnostics = {
+        "eligible": np.zeros(n_obs, dtype=bool),
+        "selected": np.zeros(n_obs, dtype=bool),
+        "burden_rejected": np.zeros(n_obs, dtype=bool),
+        "presence_score": np.full(n_obs, np.nan, dtype=float),
+        "localization_score": np.full(n_obs, np.nan, dtype=float),
+        "evidence_score": np.full(n_obs, np.nan, dtype=float),
+        "spatial_coherence": np.full(n_obs, np.nan, dtype=float),
+        "projected_burden": np.full(n_obs, np.nan, dtype=float),
+    }
+    if n_obs == 0 or n_structures == 0:
+        return selected_labels, diagnostics
+
+    matrices = {
+        "presence_score": np.asarray(presence_score, dtype=float),
+        "localization_score": np.asarray(localization_score, dtype=float),
+        "structure_evidence": np.asarray(structure_evidence, dtype=float),
+        "spatial_coherence": np.asarray(spatial_coherence, dtype=float),
+        "geometry_compatible": np.asarray(geometry_compatible, dtype=bool),
+        "local_marker_transcripts": np.asarray(local_marker_transcripts),
+        "local_marker_genes": np.asarray(local_marker_genes),
+        "cell_marker_transcripts": np.asarray(cell_marker_transcripts),
+        "cell_marker_genes": np.asarray(cell_marker_genes),
+        "cell_marker_enrichment": np.asarray(cell_marker_enrichment),
+        "cell_marker_binomial_p": np.asarray(cell_marker_binomial_p),
+    }
+    expected_shape = (n_obs, n_structures)
+    for name, values in matrices.items():
+        if values.shape != expected_shape:
+            raise ValueError(
+                f"{name} must have shape {expected_shape}, got {values.shape}"
+            )
+
+    vector_parameters = {
+        "min_evidence_score": np.asarray(min_evidence_score, dtype=float),
+        "min_local_marker_transcripts": np.asarray(
+            min_local_marker_transcripts, dtype=int
+        ),
+        "min_local_marker_genes": np.asarray(min_local_marker_genes, dtype=int),
+        "min_cell_marker_transcripts": np.asarray(
+            min_cell_marker_transcripts, dtype=int
+        ),
+        "min_cell_marker_genes": np.asarray(min_cell_marker_genes, dtype=int),
+        "min_cell_marker_enrichment": np.asarray(
+            min_cell_marker_enrichment, dtype=float
+        ),
+        "max_cell_marker_p": np.asarray(max_cell_marker_p, dtype=float),
+        "min_spatial_coherence": np.asarray(
+            min_spatial_coherence, dtype=float
+        ),
+    }
+    for name, values in vector_parameters.items():
+        if values.shape != (n_structures,):
+            raise ValueError(
+                f"{name} must have shape {(n_structures,)}, got {values.shape}"
+            )
+    score_parameters = np.concatenate(
+        [
+            np.asarray(
+                [
+                    min_presence_score,
+                    min_localization_score,
+                    max_projected_burden,
+                ],
+                dtype=float,
+            ),
+            vector_parameters["min_evidence_score"],
+            vector_parameters["min_spatial_coherence"],
+        ]
+    )
+    if not np.isfinite(score_parameters).all() or (
+        (score_parameters < 0.0) | (score_parameters > 1.0)
+    ).any():
+        raise ValueError("First-locus score and burden thresholds must be in [0, 1]")
+    if any(
+        (values < 1).any()
+        for name, values in vector_parameters.items()
+        if name not in {
+            "min_evidence_score",
+            "min_cell_marker_enrichment",
+            "max_cell_marker_p",
+            "min_spatial_coherence",
+        }
+    ):
+        raise ValueError("First-locus marker minima must be >= 1")
+
+    supported = np.asarray(already_supported, dtype=bool)
+    current = np.asarray(current_labels, dtype=object)
+    available = np.asarray(dgi_available, dtype=bool)
+    transcripts = np.asarray(metaspot_total_transcripts, dtype=float)
+    if any(
+        values.shape != (n_obs,)
+        for values in (supported, current, available, transcripts)
+    ):
+        raise ValueError("First-locus row arrays must match the MetaSpot count")
+    if not np.isfinite(transcripts).all() or (transcripts < 0).any():
+        raise ValueError(
+            "metaspot_total_transcripts must contain finite non-negative values"
+        )
+
+    cell_codes, n_cells = _dense_group_codes(
+        np.asarray(cell_ids, dtype=object),
+        error_context="MetaSpot multi-structure first-locus selection",
+    )
+    cell_totals = np.bincount(
+        cell_codes, weights=transcripts, minlength=n_cells
+    ).astype(float)
+    projected = np.divide(
+        transcripts,
+        cell_totals[cell_codes],
+        out=np.full(n_obs, np.inf),
+        where=cell_totals[cell_codes] > 0,
+    )
+    ranked_parts: List[pd.DataFrame] = []
+    for structure_idx, raw_structure in enumerate(structures):
+        structure = str(raw_structure)
+        present_by_cell = np.bincount(
+            cell_codes[supported & (current == structure)],
+            minlength=n_cells,
+        ).astype(bool, copy=False)
+        evidence_eligible = (
+            ~supported
+            & ~present_by_cell[cell_codes]
+            & available
+            & matrices["geometry_compatible"][:, structure_idx]
+            & (
+                matrices["local_marker_transcripts"][:, structure_idx]
+                >= vector_parameters["min_local_marker_transcripts"][structure_idx]
+            )
+            & (
+                matrices["local_marker_genes"][:, structure_idx]
+                >= vector_parameters["min_local_marker_genes"][structure_idx]
+            )
+            & (
+                matrices["cell_marker_transcripts"][:, structure_idx]
+                >= vector_parameters["min_cell_marker_transcripts"][structure_idx]
+            )
+            & (
+                matrices["cell_marker_genes"][:, structure_idx]
+                >= vector_parameters["min_cell_marker_genes"][structure_idx]
+            )
+            & np.isfinite(matrices["cell_marker_enrichment"][:, structure_idx])
+            & (
+                matrices["cell_marker_enrichment"][:, structure_idx]
+                >= vector_parameters["min_cell_marker_enrichment"][structure_idx]
+            )
+            & np.isfinite(matrices["cell_marker_binomial_p"][:, structure_idx])
+            & (
+                matrices["cell_marker_binomial_p"][:, structure_idx]
+                <= vector_parameters["max_cell_marker_p"][structure_idx]
+            )
+            & np.isfinite(matrices["presence_score"][:, structure_idx])
+            & (
+                matrices["presence_score"][:, structure_idx]
+                >= float(min_presence_score)
+            )
+            & np.isfinite(matrices["localization_score"][:, structure_idx])
+            & (
+                matrices["localization_score"][:, structure_idx]
+                >= float(min_localization_score)
+            )
+            & np.isfinite(matrices["structure_evidence"][:, structure_idx])
+            & (
+                matrices["structure_evidence"][:, structure_idx]
+                >= vector_parameters["min_evidence_score"][structure_idx]
+            )
+            & np.isfinite(matrices["spatial_coherence"][:, structure_idx])
+            & (
+                matrices["spatial_coherence"][:, structure_idx]
+                >= vector_parameters["min_spatial_coherence"][structure_idx]
+            )
+        )
+        diagnostics["burden_rejected"] |= evidence_eligible & (
+            projected > float(max_projected_burden)
+        )
+        rows = np.flatnonzero(
+            evidence_eligible & (projected <= float(max_projected_burden))
+        )
+        diagnostics["eligible"][rows] = True
+        if rows.size == 0:
+            continue
+        ranked_parts.append(
+            pd.DataFrame(
+                {
+                    "row": rows,
+                    "cell": cell_codes[rows],
+                    "structure": structure,
+                    "structure_idx": structure_idx,
+                    "evidence": matrices["structure_evidence"][
+                        rows, structure_idx
+                    ],
+                    "spatial_coherence": matrices["spatial_coherence"][
+                        rows, structure_idx
+                    ],
+                    "localization": matrices["localization_score"][
+                        rows, structure_idx
+                    ],
+                    "presence": matrices["presence_score"][
+                        rows, structure_idx
+                    ],
+                    "projected_burden": projected[rows],
+                }
+            )
+        )
+
+    if not ranked_parts:
+        return selected_labels, diagnostics
+    ranked = pd.concat(ranked_parts, ignore_index=True).sort_values(
+        [
+            "evidence",
+            "localization",
+            "presence",
+            "projected_burden",
+            "structure_idx",
+            "row",
+        ],
+        ascending=[False, False, False, True, True, True],
+        kind="mergesort",
+    )
+    used_rows: set[int] = set()
+    selected_cell_structures: set[Tuple[int, str]] = set()
+    added_burden = np.zeros(n_cells, dtype=float)
+    for record in ranked.itertuples(index=False):
+        row = int(record.row)
+        cell = int(record.cell)
+        structure = str(record.structure)
+        key = (cell, structure)
+        projected_total = added_burden[cell] + float(record.projected_burden)
+        if row in used_rows or key in selected_cell_structures:
+            continue
+        if projected_total > float(max_projected_burden):
+            diagnostics["burden_rejected"][row] = True
+            continue
+        selected_labels[row] = structure
+        diagnostics["selected"][row] = True
+        diagnostics["presence_score"][row] = float(record.presence)
+        diagnostics["localization_score"][row] = float(record.localization)
+        diagnostics["evidence_score"][row] = float(record.evidence)
+        diagnostics["spatial_coherence"][row] = float(record.spatial_coherence)
+        diagnostics["projected_burden"][row] = float(record.projected_burden)
+        used_rows.add(row)
+        selected_cell_structures.add(key)
+        added_burden[cell] = projected_total
+    return selected_labels, diagnostics
+
+
+def _apply_metaspot_diminishing_return_selection(
+    cell_ids: Sequence[object],
+    final_labels: Sequence[object],
+    strict_supported: Sequence[bool],
+    broad_values: Sequence[object],
+    local_enrichment: np.ndarray,
+    dgi_support: np.ndarray,
+    metaspot_total_transcripts: Sequence[float],
+    *,
+    enabled_labels: Sequence[str],
+    all_labels: Sequence[str],
+    allowed: Mapping[str, Sequence[str]],
+    min_local_enrichment: Sequence[float],
+    dgi_weight: float,
+    min_dgi_support: float,
+    log_penalty: float,
+    burden_penalty: float,
+) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    """Keep the first supported locus and raise evidence for later loci."""
+    labels = np.asarray(final_labels, dtype=object)
+    n_obs = labels.size
+    diagnostics = {
+        "eligible": np.zeros(n_obs, dtype=bool),
+        "kept": np.ones(n_obs, dtype=bool),
+        "pruned": np.zeros(n_obs, dtype=bool),
+        "first_locus": np.zeros(n_obs, dtype=bool),
+        "rank": np.zeros(n_obs, dtype=np.int32),
+        "evidence_score": np.full(n_obs, np.nan, dtype=float),
+        "required_score": np.full(n_obs, np.nan, dtype=float),
+        "burden_before": np.full(n_obs, np.nan, dtype=float),
+    }
+    if n_obs == 0 or not enabled_labels:
+        return diagnostics["kept"], diagnostics
+
+    enrichment = np.asarray(local_enrichment, dtype=float)
+    support = np.asarray(dgi_support, dtype=float)
+    strict = np.asarray(strict_supported, dtype=bool)
+    broad = np.asarray(broad_values, dtype=object)
+    transcripts = np.asarray(metaspot_total_transcripts, dtype=float)
+    minimum_enrichment = np.asarray(min_local_enrichment, dtype=float)
+    n_labels = len(all_labels)
+    if enrichment.shape != (n_obs, n_labels) or support.shape != (
+        n_obs,
+        n_labels,
+    ):
+        raise ValueError(
+            "Diminishing-return enrichment and DGI matrices must match "
+            "(n_metaspots, n_labels)"
+        )
+    if any(array.shape != (n_obs,) for array in (strict, broad, transcripts)):
+        raise ValueError(
+            "Diminishing-return row arrays must match the MetaSpot count"
+        )
+    if minimum_enrichment.shape != (n_labels,):
+        raise ValueError(
+            "Diminishing-return label thresholds must match all_labels"
+        )
+    numeric_parameters = np.asarray(
+        [dgi_weight, min_dgi_support, log_penalty, burden_penalty],
+        dtype=float,
+    )
+    if not np.isfinite(numeric_parameters).all() or (
+        numeric_parameters < 0
+    ).any():
+        raise ValueError(
+            "Diminishing-return parameters must be finite and non-negative"
+        )
+    if min_dgi_support > 1.0:
+        raise ValueError(
+            "Diminishing-return min_dgi_support must be <= 1"
+        )
+    if not np.isfinite(transcripts).all() or (transcripts < 0).any():
+        raise ValueError(
+            "Diminishing-return transcript counts must be finite and "
+            "non-negative"
+        )
+
+    cell_codes, n_cells = _dense_group_codes(
+        np.asarray(cell_ids, dtype=object),
+        error_context="MetaSpot diminishing-return selection",
+    )
+    label_to_idx = {str(label): idx for idx, label in enumerate(all_labels)}
+    label_to_compartment = {
+        str(label): str(compartment)
+        for compartment, compartment_labels in allowed.items()
+        for label in compartment_labels
+    }
+    compartment_totals = {
+        compartment: np.bincount(
+            cell_codes[broad == compartment],
+            weights=transcripts[broad == compartment],
+            minlength=n_cells,
+        )
+        for compartment in allowed
+    }
+
+    for raw_label in enabled_labels:
+        label = str(raw_label)
+        if label not in label_to_idx or label not in label_to_compartment:
+            raise ValueError(
+                f"Unknown diminishing-return label: {label!r}"
+            )
+        label_idx = label_to_idx[label]
+        compartment = label_to_compartment[label]
+        rows = np.flatnonzero(labels == label)
+        if rows.size == 0:
+            continue
+        label_support = support[rows, label_idx]
+        label_enrichment = enrichment[rows, label_idx]
+        evidence = label_enrichment + float(dgi_weight) * label_support
+        if not np.isfinite(evidence).all():
+            raise ValueError(
+                f"Selected {label!r} loci require finite local and DGI evidence"
+            )
+        diagnostics["eligible"][rows] = True
+        diagnostics["evidence_score"][rows] = evidence
+        ranked = pd.DataFrame(
+            {
+                "row": rows,
+                "cell": cell_codes[rows],
+                "strict": strict[rows],
+                "evidence": evidence,
+                "transcripts": transcripts[rows],
+            }
+        ).sort_values(
+            ["cell", "strict", "evidence", "transcripts", "row"],
+            ascending=[True, False, False, True, True],
+            kind="mergesort",
+        )
+        for cell_code, group in ranked.groupby("cell", sort=False):
+            denominator = float(compartment_totals[compartment][cell_code])
+            if denominator <= 0.0:
+                raise ValueError(
+                    f"Selected {label!r} locus has no {compartment} denominator"
+                )
+            kept_count = 0
+            kept_transcripts = 0.0
+            for rank, record in enumerate(group.itertuples(index=False), 1):
+                row = int(record.row)
+                burden_before = kept_transcripts / denominator
+                diagnostics["rank"][row] = rank
+                diagnostics["burden_before"][row] = burden_before
+                first_locus = kept_count == 0
+                diagnostics["first_locus"][row] = first_locus
+                required = (
+                    minimum_enrichment[label_idx]
+                    + float(dgi_weight) * float(min_dgi_support)
+                    + float(log_penalty) * np.log1p(kept_count)
+                    + float(burden_penalty) * burden_before
+                )
+                diagnostics["required_score"][row] = required
+                keep = bool(record.strict) or first_locus or (
+                    float(record.evidence) >= required
+                )
+                diagnostics["kept"][row] = keep
+                if keep:
+                    kept_count += 1
+                    kept_transcripts += float(record.transcripts)
+
+    diagnostics["pruned"] = diagnostics["eligible"] & ~diagnostics["kept"]
+    if np.any(diagnostics["pruned"] & strict):
+        raise RuntimeError("Diminishing-return selection pruned strict evidence")
+    return diagnostics["kept"], diagnostics
+
+
+def _select_metaspot_hierarchical_cell_rescues(
+    cell_ids: np.ndarray,
+    broad_values: np.ndarray,
+    already_supported: np.ndarray,
+    local_counts: np.ndarray,
+    local_genes: np.ndarray,
+    local_enrichment: np.ndarray,
+    dgi_available: np.ndarray,
+    dgi_support: np.ndarray,
+    cell_marker_counts: np.ndarray,
+    cell_marker_genes: np.ndarray,
+    cell_marker_enrichment: np.ndarray,
+    cell_marker_binomial_p: np.ndarray,
+    metaspot_total_transcripts: np.ndarray,
+    *,
+    labels: Sequence[str],
+    all_labels: Sequence[str],
+    allowed: Mapping[str, Sequence[str]],
+    min_cell_transcripts: int,
+    min_metaspots: int,
+    min_presence_score: float,
+    min_localization_score: float,
+    min_joint_score: float,
+    min_local_marker_transcripts: int,
+    min_local_marker_genes: int,
+    min_cell_marker_transcripts: int,
+    min_cell_marker_genes: int,
+    min_dgi_support: float,
+    min_dgi_margin: float,
+) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    """Rescue one fine structure in callable cells using graded evidence.
+
+    This is the final Tier-B coverage branch.  It is evaluated only for cells
+    that do not already contain an evidence-supported fine structure.  Cell
+    callability is defined from total transcript and MetaSpot depth, while a
+    label must retain three independent anchors: cell-level marker presence,
+    a measured marker in the focal MetaSpot, and leave-one-out DGI support for
+    the local placement.  The best label/MetaSpot pair is selected once per
+    cell; cells are never assigned a quota of structures.
+
+    The bounded scores are evidence scores, not calibrated probabilities.
+    Their fixed weights are returned through the annotation metadata so the
+    decision remains reproducible and auditable.
+    """
+    n_obs = len(cell_ids)
+    n_labels = len(all_labels)
+    rescue_labels = np.full(n_obs, "", dtype=object)
+    diagnostics: Dict[str, np.ndarray] = {
+        "callable": np.zeros(n_obs, dtype=bool),
+        "eligible_cell": np.zeros(n_obs, dtype=bool),
+        "status": np.full(n_obs, "not_callable", dtype=object),
+        "cell_total_transcripts": np.full(n_obs, np.nan, dtype=float),
+        "cell_metaspots": np.full(n_obs, np.nan, dtype=float),
+        "presence_score": np.full(n_obs, np.nan, dtype=float),
+        "localization_score": np.full(n_obs, np.nan, dtype=float),
+        "joint_score": np.full(n_obs, np.nan, dtype=float),
+        "best_label": np.full(n_obs, "", dtype=object),
+        "best_presence_score": np.full(n_obs, np.nan, dtype=float),
+        "best_localization_score": np.full(n_obs, np.nan, dtype=float),
+        "best_joint_score": np.full(n_obs, np.nan, dtype=float),
+        "best_dgi_support": np.full(n_obs, np.nan, dtype=float),
+        "best_dgi_margin": np.full(n_obs, np.nan, dtype=float),
+    }
+    if n_obs == 0:
+        return rescue_labels, diagnostics
+
+    matrices = {
+        "local_counts": np.asarray(local_counts),
+        "local_genes": np.asarray(local_genes),
+        "local_enrichment": np.asarray(local_enrichment),
+        "dgi_support": np.asarray(dgi_support),
+        "cell_marker_counts": np.asarray(cell_marker_counts),
+        "cell_marker_genes": np.asarray(cell_marker_genes),
+        "cell_marker_enrichment": np.asarray(cell_marker_enrichment),
+        "cell_marker_binomial_p": np.asarray(cell_marker_binomial_p),
+    }
+    for name, values in matrices.items():
+        if values.shape != (n_obs, n_labels):
+            raise ValueError(
+                f"{name} must have shape {(n_obs, n_labels)}, got "
+                f"{values.shape}"
+            )
+
+    cell_values, n_cells = _dense_group_codes(
+        cell_ids,
+        error_context="MetaSpot hierarchical cell rescue",
+    )
+    broad = np.asarray(broad_values, dtype=object)
+    supported = np.asarray(already_supported, dtype=bool)
+    available = np.asarray(dgi_available, dtype=bool)
+    spot_transcripts = np.asarray(
+        metaspot_total_transcripts, dtype=float
+    ).reshape(-1)
+    if any(
+        values.shape != (n_obs,)
+        for values in (broad, supported, available, spot_transcripts)
+    ):
+        raise ValueError(
+            "MetaSpot hierarchical rescue row arrays must be one-dimensional"
+        )
+    if not np.isfinite(spot_transcripts).all() or (
+        spot_transcripts < 0
+    ).any():
+        raise ValueError(
+            "metaspot_total_transcripts must contain finite non-negative values"
+        )
+
+    cell_total_values = np.bincount(
+        cell_values,
+        weights=spot_transcripts,
+        minlength=n_cells,
+    ).astype(float)
+    cell_metaspot_values = np.bincount(
+        cell_values,
+        minlength=n_cells,
+    ).astype(float)
+    cell_total_by_row = cell_total_values[cell_values]
+    cell_metaspots_by_row = cell_metaspot_values[cell_values]
+    callable_rows = (
+        (cell_total_by_row >= int(min_cell_transcripts))
+        & (cell_metaspots_by_row >= int(min_metaspots))
+    )
+    supported_by_cell = np.bincount(
+        cell_values[supported],
+        minlength=n_cells,
+    ).astype(bool, copy=False)
+    eligible_cell_rows = callable_rows & ~supported_by_cell[cell_values]
+    diagnostics["callable"] = callable_rows
+    diagnostics["eligible_cell"] = eligible_cell_rows
+    diagnostics["status"][callable_rows] = "already_has_fine_structure"
+    diagnostics["status"][eligible_cell_rows] = "no_anchored_candidate"
+    diagnostics["cell_total_transcripts"] = cell_total_by_row
+    diagnostics["cell_metaspots"] = cell_metaspots_by_row
+    if not labels or not eligible_cell_rows.any():
+        return rescue_labels, diagnostics
+
+    label_to_idx = {
+        str(label): idx for idx, label in enumerate(all_labels)
+    }
+    label_to_compartment = {
+        str(label): str(compartment)
+        for compartment, compartment_labels in allowed.items()
+        for label in compartment_labels
+    }
+
+    def _enrichment_score(values: np.ndarray) -> np.ndarray:
+        scaled = np.clip(np.asarray(values, dtype=float) / 0.5, -12.0, 12.0)
+        return 1.0 / (1.0 + np.exp(-scaled))
+
+    ranked_parts: List[pd.DataFrame] = []
+    for raw_label in labels:
+        label = str(raw_label)
+        if label not in label_to_idx or label not in label_to_compartment:
+            raise ValueError(
+                f"Unknown hierarchical cell rescue label: {label!r}"
+            )
+        label_idx = label_to_idx[label]
+        compartment = label_to_compartment[label]
+        alternative_indices = np.asarray(
+            [
+                label_to_idx[str(other)]
+                for other in allowed[compartment]
+                if str(other) != label
+            ],
+            dtype=np.int64,
+        )
+        label_dgi_support = matrices["dgi_support"][:, label_idx].astype(
+            float, copy=False
+        )
+        if alternative_indices.size:
+            alternative_support = np.max(
+                matrices["dgi_support"][:, alternative_indices], axis=1
+            )
+        else:
+            alternative_support = np.zeros(n_obs, dtype=float)
+        label_dgi_margin = label_dgi_support - alternative_support
+
+        local_count = matrices["local_counts"][:, label_idx].astype(float)
+        local_gene = matrices["local_genes"][:, label_idx].astype(float)
+        local_enrich = matrices["local_enrichment"][:, label_idx].astype(
+            float
+        )
+        cell_count = matrices["cell_marker_counts"][:, label_idx].astype(
+            float
+        )
+        cell_gene = matrices["cell_marker_genes"][:, label_idx].astype(float)
+        cell_enrich = matrices["cell_marker_enrichment"][:, label_idx].astype(
+            float
+        )
+        cell_p = matrices["cell_marker_binomial_p"][:, label_idx].astype(
+            float
+        )
+
+        # These scores deliberately saturate at modest marker counts. Fine
+        # structures are sparse, so extra copies strengthen confidence without
+        # allowing abundant transcripts to dominate the DGI placement term.
+        presence_score = (
+            0.30 * np.clip(cell_count / 2.0, 0.0, 1.0)
+            + 0.25 * np.clip(cell_gene / 2.0, 0.0, 1.0)
+            + 0.25 * _enrichment_score(cell_enrich)
+            + 0.20 * np.clip(1.0 - cell_p, 0.0, 1.0)
+        )
+        localization_score = (
+            0.15 * np.clip(local_count / 2.0, 0.0, 1.0)
+            + 0.10 * np.clip(local_gene / 2.0, 0.0, 1.0)
+            + 0.20 * _enrichment_score(local_enrich)
+            + 0.45 * np.clip(label_dgi_support, 0.0, 1.0)
+            + 0.10 * np.clip((label_dgi_margin + 1.0) / 2.0, 0.0, 1.0)
+        )
+        joint_score = np.sqrt(
+            np.clip(presence_score, 0.0, 1.0)
+            * np.clip(localization_score, 0.0, 1.0)
+        )
+
+        anchored = (
+            eligible_cell_rows
+            & (broad == compartment)
+            & (local_count >= int(min_local_marker_transcripts))
+            & (local_gene >= int(min_local_marker_genes))
+            & np.isfinite(local_enrich)
+            & (cell_count >= int(min_cell_marker_transcripts))
+            & (cell_gene >= int(min_cell_marker_genes))
+            & np.isfinite(cell_enrich)
+            & np.isfinite(cell_p)
+            & available
+            & np.isfinite(label_dgi_support)
+            & np.isfinite(label_dgi_margin)
+            & (label_dgi_support >= float(min_dgi_support))
+            & (label_dgi_margin >= float(min_dgi_margin))
+            & np.isfinite(presence_score)
+            & np.isfinite(localization_score)
+            & np.isfinite(joint_score)
+        )
+        rows = np.flatnonzero(anchored)
+        if rows.size == 0:
+            continue
+        ranked_parts.append(
+            pd.DataFrame(
+                {
+                    "row": rows,
+                    "cell_id": cell_values[rows],
+                    "label": label,
+                    "presence_score": presence_score[rows],
+                    "localization_score": localization_score[rows],
+                    "joint_score": joint_score[rows],
+                    "dgi_support": label_dgi_support[rows],
+                    "dgi_margin": label_dgi_margin[rows],
+                    "local_enrichment": local_enrich[rows],
+                    "local_transcripts": local_count[rows],
+                    "cell_enrichment": cell_enrich[rows],
+                    "cell_transcripts": cell_count[rows],
+                    "passes_score_thresholds": (
+                        (presence_score[rows] >= float(min_presence_score))
+                        & (
+                            localization_score[rows]
+                            >= float(min_localization_score)
+                        )
+                        & (joint_score[rows] >= float(min_joint_score))
+                    ),
+                    "label_order": label_idx,
+                }
+            )
+        )
+
+    if not ranked_parts:
+        return rescue_labels, diagnostics
+
+    ranked = pd.concat(ranked_parts, ignore_index=True)
+    ranked.sort_values(
+        [
+            "cell_id",
+            "joint_score",
+            "presence_score",
+            "localization_score",
+            "dgi_support",
+            "dgi_margin",
+            "local_enrichment",
+            "local_transcripts",
+            "cell_enrichment",
+            "cell_transcripts",
+            "label_order",
+            "row",
+        ],
+        ascending=[
+            True,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+            True,
+            True,
+        ],
+        kind="mergesort",
+        inplace=True,
+    )
+    best = ranked.groupby("cell_id", sort=False).head(1)
+    best_rows = best["row"].to_numpy(dtype=np.int64)
+    diagnostics["best_label"][best_rows] = best["label"].astype(str).to_numpy()
+    for source, target in (
+        ("presence_score", "best_presence_score"),
+        ("localization_score", "best_localization_score"),
+        ("joint_score", "best_joint_score"),
+        ("dgi_support", "best_dgi_support"),
+        ("dgi_margin", "best_dgi_margin"),
+    ):
+        diagnostics[target][best_rows] = best[source].to_numpy(dtype=float)
+    diagnostics["status"][
+        np.isin(cell_values, ranked["cell_id"].unique())
+    ] = "score_below_threshold"
+
+    selected = ranked.loc[
+        ranked["passes_score_thresholds"]
+    ].groupby("cell_id", sort=False).head(1)
+    if selected.empty:
+        return rescue_labels, diagnostics
+    selected_rows = selected["row"].to_numpy(dtype=np.int64)
+    rescue_labels[selected_rows] = selected["label"].astype(str).to_numpy()
+    diagnostics["status"][
+        np.isin(cell_values, selected["cell_id"].unique())
+    ] = "selected"
+    for name in ("presence_score", "localization_score", "joint_score"):
+        diagnostics[name][selected_rows] = selected[name].to_numpy(dtype=float)
+    return rescue_labels, diagnostics
+
+
+def _select_metaspot_omm_cell_coherent_rescues(
+    cell_ids: np.ndarray,
+    candidate: np.ndarray,
+    already_supported: np.ndarray,
+    broad_values: np.ndarray,
+    local_counts: np.ndarray,
+    local_genes: np.ndarray,
+    local_enrichment: np.ndarray,
+    local_score_gap: np.ndarray,
+    dgi_available: np.ndarray,
+    dgi_support: np.ndarray,
+    dgi_margin: np.ndarray,
+    cell_counts: np.ndarray,
+    cell_genes: np.ndarray,
+    cell_enrichment: np.ndarray,
+    cell_binomial_p: np.ndarray,
+    *,
+    min_cell_transcripts: int,
+    min_cell_genes: int,
+    min_cell_enrichment: float,
+    max_cell_p: float,
+    min_local_transcripts: int,
+    min_local_genes: int,
+    min_local_enrichment: float,
+    min_local_score_gap: float,
+    min_dgi_support: float,
+    min_dgi_margin: float,
+    max_per_cell: int,
+) -> np.ndarray:
+    """Select OMM loci only inside cells with coherent multi-gene evidence.
+
+    A MetaSpot-level binomial test is underpowered when mitochondrial RNAs are
+    split across several small MetaSpots.  This rescue therefore establishes
+    OMM presence at the cell level, using exact pooled marker counts and
+    distinct genes, before placing the label on a bounded number of local
+    MetaSpots.  Local OMM-over-ER/Cytosol separation and leave-one-out DGI
+    agreement remain mandatory, so this is not a per-cell OMM quota.
+    """
+    n_obs = len(candidate)
+    rescued = np.zeros(n_obs, dtype=bool)
+    if n_obs == 0 or int(max_per_cell) <= 0:
+        return rescued
+
+    cell_values, n_cells = _dense_group_codes(
+        cell_ids,
+        error_context="MetaSpot OMM cell-coherent rescue",
+    )
+    candidate_values = np.asarray(candidate, dtype=object)
+    supported_values = np.asarray(already_supported, dtype=bool)
+    broad = np.asarray(broad_values, dtype=object)
+
+    present_by_cell = np.bincount(
+        cell_values[supported_values & (candidate_values == "OMM")],
+        minlength=n_cells,
+    ).astype(bool, copy=False)
+    eligible = (
+        (candidate_values == "OMM")
+        & ~supported_values
+        & (broad == "Cytoplasmic")
+        & ~present_by_cell[cell_values]
+        & (np.asarray(local_counts, dtype=float) >= int(min_local_transcripts))
+        & (np.asarray(local_genes, dtype=float) >= int(min_local_genes))
+        & (np.asarray(local_enrichment, dtype=float) >= float(min_local_enrichment))
+        & (np.asarray(local_score_gap, dtype=float) >= float(min_local_score_gap))
+        & np.asarray(dgi_available, dtype=bool)
+        & (np.asarray(dgi_support, dtype=float) >= float(min_dgi_support))
+        & (np.asarray(dgi_margin, dtype=float) >= float(min_dgi_margin))
+        & (np.asarray(cell_counts, dtype=float) >= int(min_cell_transcripts))
+        & (np.asarray(cell_genes, dtype=float) >= int(min_cell_genes))
+        & (np.asarray(cell_enrichment, dtype=float) >= float(min_cell_enrichment))
+        & np.isfinite(np.asarray(cell_binomial_p, dtype=float))
+        & (np.asarray(cell_binomial_p, dtype=float) <= float(max_cell_p))
+    )
+    eligible_rows = np.flatnonzero(eligible)
+    if eligible_rows.size == 0:
+        return rescued
+
+    ranked = pd.DataFrame(
+        {
+            "row": eligible_rows,
+            "cell_id": cell_values[eligible_rows],
+            "dgi_support": np.asarray(dgi_support)[eligible_rows],
+            "dgi_margin": np.asarray(dgi_margin)[eligible_rows],
+            "local_enrichment": np.asarray(local_enrichment)[eligible_rows],
+            "local_score_gap": np.asarray(local_score_gap)[eligible_rows],
+            "local_transcripts": np.asarray(local_counts)[eligible_rows],
+        }
+    )
+    ranked.sort_values(
+        [
+            "cell_id",
+            "dgi_support",
+            "dgi_margin",
+            "local_enrichment",
+            "local_score_gap",
+            "local_transcripts",
+            "row",
+        ],
+        ascending=[True, False, False, False, False, False, True],
+        kind="mergesort",
+        inplace=True,
+    )
+    selected = ranked.groupby("cell_id", sort=False).head(int(max_per_cell))
+    rescued[selected["row"].to_numpy(dtype=np.int64)] = True
+    return rescued
+
+
+def _compute_multistructure_evidence(
+    local_counts: np.ndarray,
+    local_genes: np.ndarray,
+    local_enrichment: np.ndarray,
+    metadomain_affinity: np.ndarray,
+    dgi_support: np.ndarray,
+    geometry_compatible: np.ndarray,
+    competitor_margin: np.ndarray,
+    rapx_calibrated_score: np.ndarray,
+    cell_counts: np.ndarray,
+    cell_genes: np.ndarray,
+    cell_enrichment: np.ndarray,
+    cell_binomial_p: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compose bounded cell-presence and MetaSpot-localization evidence."""
+    arrays = [
+        np.asarray(values, dtype=float)
+        for values in (
+            local_counts,
+            local_genes,
+            local_enrichment,
+            metadomain_affinity,
+            dgi_support,
+            geometry_compatible,
+            competitor_margin,
+            rapx_calibrated_score,
+            cell_counts,
+            cell_genes,
+            cell_enrichment,
+            cell_binomial_p,
+        )
+    ]
+    if any(values.shape != arrays[0].shape for values in arrays):
+        raise ValueError("Multi-structure evidence arrays must share one shape")
+
+    def _sigmoid(values: np.ndarray, scale: float) -> np.ndarray:
+        output = np.zeros(values.shape, dtype=float)
+        finite = np.isfinite(values)
+        output[finite] = 1.0 / (
+            1.0
+            + np.exp(-np.clip(values[finite] / float(scale), -12.0, 12.0))
+        )
+        return output
+
+    (
+        local_count,
+        local_gene,
+        local_enrich,
+        domain_affinity,
+        local_dgi,
+        geometry,
+        contrast,
+        rapx_score,
+        cell_count,
+        cell_gene,
+        cell_enrich,
+        cell_p,
+    ) = arrays
+    one_minus_p = np.zeros(cell_p.shape, dtype=float)
+    finite_p = np.isfinite(cell_p)
+    one_minus_p[finite_p] = np.clip(1.0 - cell_p[finite_p], 0.0, 1.0)
+    presence = (
+        0.30 * np.clip(cell_count / 2.0, 0.0, 1.0)
+        + 0.25 * np.clip(cell_gene / 2.0, 0.0, 1.0)
+        + 0.25 * _sigmoid(cell_enrich, 0.5)
+        + 0.20 * one_minus_p
+    )
+    marker = (
+        0.30 * np.clip(local_count / 2.0, 0.0, 1.0)
+        + 0.25 * np.clip(local_gene / 2.0, 0.0, 1.0)
+        + 0.45 * _sigmoid(local_enrich, 0.5)
+    )
+    geometry_mask = np.asarray(geometry, dtype=bool)
+    localization = (
+        0.25 * marker
+        + 0.20 * np.clip(domain_affinity, 0.0, 1.0)
+        + 0.20 * np.clip(local_dgi, 0.0, 1.0)
+        + 0.10 * geometry_mask
+        + 0.15 * _sigmoid(contrast, 0.5)
+        + 0.10 * _sigmoid(rapx_score, 1.0)
+    )
+    localization *= geometry_mask
+    evidence = np.sqrt(
+        np.clip(presence, 0.0, 1.0)
+        * np.clip(localization, 0.0, 1.0)
+    )
+    return (
+        presence.astype(np.float32),
+        localization.astype(np.float32),
+        evidence.astype(np.float32),
+    )
+
+
+def _compute_cell_structure_spatial_coherence(
+    cell_codes: np.ndarray,
+    broad_values: Sequence[object],
+    local_marker_counts: np.ndarray,
+    metaspot_total_transcripts: Sequence[float],
+    structures: Sequence[str],
+    structure_compartments: Mapping[str, str],
+) -> np.ndarray:
+    """Measure marker concentration within each cell compartment."""
+    codes = np.asarray(cell_codes)
+    broad = np.asarray(broad_values, dtype=object)
+    marker_counts = np.asarray(local_marker_counts, dtype=float)
+    transcripts = np.asarray(metaspot_total_transcripts, dtype=float)
+    if marker_counts.ndim != 2 or marker_counts.shape[0] != len(codes):
+        raise ValueError("Spatial coherence marker counts must match cell codes")
+    if broad.shape != codes.shape or transcripts.shape != codes.shape:
+        raise ValueError("Spatial coherence row arrays must match cell codes")
+    n_cells = int(codes.max()) + 1 if codes.size else 0
+    coherence = np.zeros((len(codes), len(structures)), dtype=float)
+    for structure_idx, structure in enumerate(structures):
+        compartment = str(structure_compartments[str(structure)])
+        rows = broad == compartment
+        if not rows.any():
+            continue
+        marker_totals = np.bincount(
+            codes[rows],
+            weights=marker_counts[rows, structure_idx],
+            minlength=n_cells,
+        )
+        compartment_totals = np.bincount(
+            codes[rows],
+            weights=transcripts[rows],
+            minlength=n_cells,
+        )
+        compartment_marker_counts = np.where(
+            rows, marker_counts[:, structure_idx], 0.0
+        )
+        marker_share = np.divide(
+            compartment_marker_counts,
+            marker_totals[codes],
+            out=np.zeros(len(codes), dtype=float),
+            where=marker_totals[codes] > 0,
+        )
+        transcript_share = np.divide(
+            transcripts,
+            compartment_totals[codes],
+            out=np.zeros(len(codes), dtype=float),
+            where=rows & (compartment_totals[codes] > 0),
+        )
+        distance = np.abs(marker_share - transcript_share)
+        total_variation = 0.5 * np.bincount(
+            codes,
+            weights=distance,
+            minlength=n_cells,
+        )
+        coherence[:, structure_idx] = total_variation[codes]
+    return np.clip(coherence, 0.0, 1.0).astype(np.float32)
+
+
+def _refine_metaspot_annotations_with_local_dgi(
+    adata1: ad.AnnData,
+    gold_df: pd.DataFrame,
+    annotation_cfg: Mapping[str, Any],
+    *,
+    build_score_table: bool = True,
+) -> Tuple[ad.AnnData, Optional[pd.DataFrame], Dict[str, Any]]:
+    """Refine a MetaDomain broad prior with local MetaSpot marker evidence.
+
+    The broad nuclear/cytoplasmic parent is fixed before DGI pooling.  Fine
+    labels can therefore compete only with labels from the same compartment.
+    Strict subtypes require pooled marker count, distinct genes, enrichment,
+    score separation, and a label-wise BH q-value. A separately tagged
+    exploratory track may rescue marker-qualified candidates only when
+    leave-one-out DGI neighbors agree strongly. Every unsupported decision is
+    exposed as an unresolved fine state while the compatibility label falls
+    back to the broad parent.
+    """
+    if "subcellular_annotation" not in adata1.obs.columns:
+        raise KeyError(
+            "MetaSpot refinement requires a mapped MetaDomain annotation"
+        )
+
+    def _finite_float(name: str, default: float, lower: float = 0.0) -> float:
+        try:
+            value = float(annotation_cfg.get(name, default))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"annotation.{name} must be numeric") from exc
+        if not np.isfinite(value) or value < lower:
+            raise ValueError(
+                f"annotation.{name} must be finite and >= {lower}"
+            )
+        return value
+
+    try:
+        min_transcripts = int(
+            annotation_cfg.get("metaspot_min_marker_transcripts", 2)
+        )
+        min_genes = int(annotation_cfg.get("metaspot_min_marker_genes", 1))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "annotation.metaspot_min_marker_transcripts and "
+            "metaspot_min_marker_genes must be integers"
+        ) from exc
+    if min_transcripts < 1 or min_genes < 1:
+        raise ValueError(
+            "annotation MetaSpot marker minima must both be >= 1"
+        )
+    min_enrichment = _finite_float(
+        "metaspot_min_log2_enrichment", 0.3
+    )
+    min_gap = _finite_float("metaspot_min_score_gap", 0.1)
+    strict_fdr = _finite_float("metaspot_subtype_fdr", 0.10)
+    exploratory_q = _finite_float("metaspot_exploratory_max_q", 0.40)
+    prior_strength = _finite_float(
+        "metaspot_background_prior_strength", 2.0
+    )
+    dgi_consensus_weight = _finite_float(
+        "metaspot_dgi_consensus_weight", 0.75
+    )
+    dgi_seed_min_enrichment = _finite_float(
+        "metaspot_dgi_seed_min_log2_enrichment", 0.5
+    )
+    dgi_exploratory_enabled = bool(
+        annotation_cfg.get("metaspot_dgi_exploratory", True)
+    )
+    dgi_exploratory_min_support = _finite_float(
+        "metaspot_dgi_exploratory_min_support",
+        0.75,
+    )
+    dgi_exploratory_min_margin = _finite_float(
+        "metaspot_dgi_exploratory_min_margin",
+        0.25,
+    )
+    if (
+        dgi_exploratory_min_support > 1.0
+        or dgi_exploratory_min_margin > 1.0
+    ):
+        raise ValueError(
+            "annotation MetaSpot DGI exploratory support and margin must "
+            "both be <= 1"
+        )
+    try:
+        dgi_seed_min_transcripts = int(
+            annotation_cfg.get(
+                "metaspot_dgi_seed_min_marker_transcripts",
+                2,
+            )
+        )
+        dgi_seed_min_genes = int(
+            annotation_cfg.get("metaspot_dgi_seed_min_marker_genes", 1)
+        )
+        dgi_min_informative_neighbors = int(
+            annotation_cfg.get(
+                "metaspot_dgi_min_informative_neighbors",
+                2,
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "MetaSpot DGI seed and neighbor minima must be integers"
+        ) from exc
+    if (
+        dgi_seed_min_transcripts < 1
+        or dgi_seed_min_genes < 1
+        or dgi_min_informative_neighbors < 1
+    ):
+        raise ValueError(
+            "MetaSpot DGI seed and neighbor minima must be >= 1"
+        )
+    require_dgi_support = bool(
+        annotation_cfg.get("metaspot_require_dgi_support", False)
+    )
+    if strict_fdr > 1.0 or exploratory_q > 1.0:
+        raise ValueError("MetaSpot q-value thresholds must be <= 1")
+    if exploratory_q < strict_fdr:
+        raise ValueError(
+            "annotation.metaspot_exploratory_max_q must be >= "
+            "annotation.metaspot_subtype_fdr"
+        )
+
+    omm_unidentifiable_policy = str(
+        annotation_cfg.get(
+            "metaspot_omm_unidentifiable_policy",
+            "unresolved",
+        )
+    ).strip().lower()
+    if omm_unidentifiable_policy not in {"unresolved", "strict_local"}:
+        raise ValueError(
+            "annotation.metaspot_omm_unidentifiable_policy must be "
+            "'unresolved' or 'strict_local'"
+        )
+
+    prior_column = (
+        "subcellular_annotation_domain"
+        if "subcellular_annotation_domain" in adata1.obs.columns
+        else "subcellular_annotation"
+    )
+    prior_labels = (
+        adata1.obs[prior_column]
+        .astype("string")
+        .fillna("Unknown")
+    )
+    broad = prior_labels.map(
+        lambda value: _label_compartment(str(value)) or "Unknown"
+    )
+    geometry = _metaspot_compartment_guard_values(adata1.obs)
+    if geometry is not None and bool(
+        annotation_cfg.get("metaspot_compartment_correction", True)
+    ):
+        numeric_geometry = pd.to_numeric(geometry, errors="coerce")
+        broad.loc[numeric_geometry.lt(0)] = "Nuclear"
+        broad.loc[numeric_geometry.gt(0)] = "Cytoplasmic"
+    fallback = broad.map(
+        {"Nuclear": "Nucleus", "Cytoplasmic": "Cytosol"}
+    ).fillna("Unknown")
+
+    rep_key = str(
+        annotation_cfg.get("metaspot_pool_rep", METASPOT_DGI_KEY)
+    )
+    pooling, pool_size = _build_same_cell_metaspot_dgi_pool(
+        adata1,
+        broad,
+        rep_key=rep_key,
+        n_neighbors=int(annotation_cfg.get("metaspot_pool_k", 8)),
+    )
+    marker_sets = _prepare_metaspot_marker_sets(
+        gold_df,
+        adata1.var_names,
+        annotation_cfg,
+    )
+    labels = [
+        "Nucleus",
+        "Nucleolus",
+        "Lamina",
+        "Nuclear Pore",
+        "Cytosol",
+        "ER",
+        "OMM",
+    ]
+    fine_structure_labels = [
+        "Nucleolus",
+        "Lamina",
+        "Nuclear Pore",
+        "ER",
+        "OMM",
+    ]
+    cell_coverage_rescue_enabled = bool(
+        annotation_cfg.get("metaspot_cell_coverage_rescue", False)
+    )
+    cell_coverage_min_dgi_support = _finite_float(
+        "metaspot_cell_coverage_min_dgi_support",
+        0.50,
+    )
+    cell_coverage_min_dgi_margin = _finite_float(
+        "metaspot_cell_coverage_min_dgi_margin",
+        0.0,
+        lower=-1.0,
+    )
+    if (
+        cell_coverage_min_dgi_support > 1.0
+        or cell_coverage_min_dgi_margin > 1.0
+    ):
+        raise ValueError(
+            "annotation MetaSpot cell-coverage DGI support and margin "
+            "must both be <= 1"
+        )
+    try:
+        cell_coverage_min_transcripts = int(
+            annotation_cfg.get(
+                "metaspot_cell_coverage_min_marker_transcripts",
+                4,
+            )
+        )
+        cell_coverage_min_genes = int(
+            annotation_cfg.get(
+                "metaspot_cell_coverage_min_marker_genes",
+                3,
+            )
+        )
+        cell_coverage_min_local_transcripts = int(
+            annotation_cfg.get(
+                "metaspot_cell_coverage_min_local_marker_transcripts", 1
+            )
+        )
+        cell_coverage_min_local_genes = int(
+            annotation_cfg.get(
+                "metaspot_cell_coverage_min_local_marker_genes", 1
+            )
+        )
+        cell_coverage_max_per_label = int(
+            annotation_cfg.get(
+                "metaspot_cell_coverage_max_per_label",
+                1,
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "MetaSpot cell-coverage marker minima and max_per_label must "
+            "be integers"
+        ) from exc
+    if min(
+        cell_coverage_min_transcripts,
+        cell_coverage_min_genes,
+        cell_coverage_min_local_transcripts,
+        cell_coverage_min_local_genes,
+        cell_coverage_max_per_label,
+    ) < 1:
+        raise ValueError(
+            "MetaSpot cell-coverage marker minima and max_per_label must "
+            "be >= 1"
+        )
+    cell_coverage_min_enrichment = _finite_float(
+        "metaspot_cell_coverage_min_log2_enrichment",
+        0.0,
+        lower=-1.0,
+    )
+    cell_coverage_min_local_enrichment = _finite_float(
+        "metaspot_cell_coverage_min_local_log2_enrichment", 0.0
+    )
+    cell_coverage_max_p = _finite_float(
+        "metaspot_cell_coverage_max_binomial_p",
+        0.50,
+    )
+    if cell_coverage_max_p > 1.0:
+        raise ValueError(
+            "annotation.metaspot_cell_coverage_max_binomial_p must be <= 1"
+        )
+
+    coverage_labels_raw = annotation_cfg.get(
+        "metaspot_cell_coverage_labels",
+        ["Nucleolus", "Lamina", "Nuclear Pore", "ER"],
+    )
+    if isinstance(coverage_labels_raw, str):
+        coverage_labels_raw = [
+            value.strip()
+            for value in coverage_labels_raw.split(",")
+            if value.strip()
+        ]
+    if not isinstance(coverage_labels_raw, (list, tuple)):
+        raise ValueError(
+            "annotation.metaspot_cell_coverage_labels must be a list or "
+            "comma-separated string"
+        )
+    coverage_label_lookup = {
+        label.casefold().replace("_", " "): label for label in labels
+    }
+    cell_coverage_labels: list[str] = []
+    for raw_label in coverage_labels_raw:
+        normalized = str(raw_label).strip().casefold().replace("_", " ")
+        resolved_label = coverage_label_lookup.get(normalized)
+        if resolved_label is None:
+            raise ValueError(
+                "annotation.metaspot_cell_coverage_labels contains "
+                f"unknown label {raw_label!r}"
+            )
+        if resolved_label in {"Nucleus", "Cytosol", "OMM"}:
+            raise ValueError(
+                "MetaSpot cell-coverage rescue accepts only Nucleolus, "
+                "Lamina, Nuclear Pore, and ER; OMM keeps its independent "
+                "confirmation/strict-local gate"
+            )
+        if resolved_label not in cell_coverage_labels:
+            cell_coverage_labels.append(resolved_label)
+
+    first_locus_enabled = bool(
+        annotation_cfg.get("metaspot_multistructure_first_locus", False)
+    )
+    first_locus_min_presence = _finite_float(
+        "metaspot_multistructure_first_locus_min_presence", 0.55
+    )
+    first_locus_min_localization = _finite_float(
+        "metaspot_multistructure_first_locus_min_localization", 0.55
+    )
+    spatial_coherence_raw = annotation_cfg.get(
+        "metaspot_fine_min_spatial_coherence", 0.50
+    )
+    if isinstance(spatial_coherence_raw, Mapping):
+        unknown_coherence_labels = set(spatial_coherence_raw).difference(
+            fine_structure_labels
+        )
+        if unknown_coherence_labels:
+            raise ValueError(
+                "Unknown spatial-coherence structures: "
+                f"{sorted(unknown_coherence_labels)}"
+            )
+        min_spatial_coherence = np.asarray(
+            [
+                float(spatial_coherence_raw.get(label, 0.50))
+                for label in fine_structure_labels
+            ],
+            dtype=float,
+        )
+    else:
+        min_spatial_coherence = np.full(
+            len(fine_structure_labels),
+            float(spatial_coherence_raw),
+            dtype=float,
+        )
+    if (
+        not np.isfinite(min_spatial_coherence).all()
+        or (min_spatial_coherence < 0.0).any()
+        or (min_spatial_coherence > 1.0).any()
+    ):
+        raise ValueError(
+            "annotation.metaspot_fine_min_spatial_coherence values must be in [0, 1]"
+        )
+    first_locus_max_projected_burden = _finite_float(
+        "metaspot_multistructure_first_locus_max_projected_burden", 0.20
+    )
+    if max(
+        first_locus_min_presence,
+        first_locus_min_localization,
+        first_locus_max_projected_burden,
+    ) > 1.0:
+        raise ValueError(
+            "MetaSpot first-locus score and burden thresholds must be <= 1"
+        )
+    first_locus_thresholds_raw = annotation_cfg.get(
+        "metaspot_multistructure_first_locus_min_evidence",
+        {},
+    )
+    if not isinstance(first_locus_thresholds_raw, Mapping):
+        raise ValueError(
+            "annotation.metaspot_multistructure_first_locus_min_evidence "
+            "must be a mapping"
+        )
+    unknown_first_locus_labels = set(first_locus_thresholds_raw).difference(
+        fine_structure_labels
+    )
+    if unknown_first_locus_labels:
+        raise ValueError(
+            "Unknown first-locus structures: "
+            f"{sorted(unknown_first_locus_labels)}"
+        )
+    first_locus_min_evidence = np.asarray(
+        [
+            float(first_locus_thresholds_raw.get(label, 0.75))
+            for label in fine_structure_labels
+        ],
+        dtype=float,
+    )
+    if not np.isfinite(first_locus_min_evidence).all() or (
+        (first_locus_min_evidence < 0.0)
+        | (first_locus_min_evidence > 1.0)
+    ).any():
+        raise ValueError(
+            "MetaSpot first-locus evidence thresholds must be in [0, 1]"
+        )
+
+    diminishing_return_enabled = bool(
+        annotation_cfg.get("metaspot_diminishing_return_selection", False)
+    )
+    diminishing_labels_raw = annotation_cfg.get(
+        "metaspot_diminishing_return_labels",
+        ["Nucleolus", "Lamina", "Nuclear Pore", "ER", "OMM"],
+    )
+    if isinstance(diminishing_labels_raw, str):
+        diminishing_labels_raw = [
+            value.strip()
+            for value in diminishing_labels_raw.split(",")
+            if value.strip()
+        ]
+    if not isinstance(diminishing_labels_raw, (list, tuple)):
+        raise ValueError(
+            "annotation.metaspot_diminishing_return_labels must be a list "
+            "or comma-separated string"
+        )
+    diminishing_return_labels: list[str] = []
+    for raw_label in diminishing_labels_raw:
+        normalized = str(raw_label).strip().casefold().replace("_", " ")
+        resolved_label = coverage_label_lookup.get(normalized)
+        if resolved_label in {None, "Nucleus", "Cytosol"}:
+            raise ValueError(
+                "MetaSpot diminishing-return selection accepts only fine "
+                f"structures; got {raw_label!r}"
+            )
+        if resolved_label not in diminishing_return_labels:
+            diminishing_return_labels.append(resolved_label)
+    diminishing_return_log_penalty = _finite_float(
+        "metaspot_diminishing_return_log_penalty", 0.10
+    )
+    diminishing_return_burden_penalty = _finite_float(
+        "metaspot_diminishing_return_burden_penalty", 0.50
+    )
+    diminishing_return_min_dgi_support = _finite_float(
+        "metaspot_diminishing_return_min_dgi_support", 0.50
+    )
+    if diminishing_return_min_dgi_support > 1.0:
+        raise ValueError(
+            "annotation.metaspot_diminishing_return_min_dgi_support "
+            "must be <= 1"
+        )
+
+    hierarchical_cell_rescue_enabled = bool(
+        annotation_cfg.get("metaspot_hierarchical_cell_rescue", False)
+    )
+    try:
+        hierarchical_min_cell_transcripts = int(
+            annotation_cfg.get(
+                "metaspot_hierarchical_min_cell_transcripts", 200
+            )
+        )
+        hierarchical_min_metaspots = int(
+            annotation_cfg.get("metaspot_hierarchical_min_metaspots", 20)
+        )
+        hierarchical_min_local_transcripts = int(
+            annotation_cfg.get(
+                "metaspot_hierarchical_min_local_marker_transcripts", 1
+            )
+        )
+        hierarchical_min_local_genes = int(
+            annotation_cfg.get(
+                "metaspot_hierarchical_min_local_marker_genes", 1
+            )
+        )
+        hierarchical_min_cell_marker_transcripts = int(
+            annotation_cfg.get(
+                "metaspot_hierarchical_min_cell_marker_transcripts", 1
+            )
+        )
+        hierarchical_min_cell_marker_genes = int(
+            annotation_cfg.get(
+                "metaspot_hierarchical_min_cell_marker_genes", 1
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "MetaSpot hierarchical callability and marker minima must be "
+            "integers"
+        ) from exc
+    if min(
+        hierarchical_min_cell_transcripts,
+        hierarchical_min_metaspots,
+        hierarchical_min_local_transcripts,
+        hierarchical_min_local_genes,
+        hierarchical_min_cell_marker_transcripts,
+        hierarchical_min_cell_marker_genes,
+    ) < 1:
+        raise ValueError(
+            "MetaSpot hierarchical callability and marker minima must be "
+            ">= 1"
+        )
+    hierarchical_min_presence_score = _finite_float(
+        "metaspot_hierarchical_min_presence_score", 0.55
+    )
+    hierarchical_min_localization_score = _finite_float(
+        "metaspot_hierarchical_min_localization_score", 0.55
+    )
+    hierarchical_min_joint_score = _finite_float(
+        "metaspot_hierarchical_min_joint_score", 0.60
+    )
+    hierarchical_min_dgi_support = _finite_float(
+        "metaspot_hierarchical_min_dgi_support", 0.35
+    )
+    hierarchical_min_dgi_margin = _finite_float(
+        "metaspot_hierarchical_min_dgi_margin", -0.25, lower=-1.0
+    )
+    if max(
+        hierarchical_min_presence_score,
+        hierarchical_min_localization_score,
+        hierarchical_min_joint_score,
+        hierarchical_min_dgi_support,
+        hierarchical_min_dgi_margin,
+    ) > 1.0:
+        raise ValueError(
+            "MetaSpot hierarchical evidence scores, DGI support, and DGI "
+            "margin must be <= 1"
+        )
+
+    omm_cell_rescue_enabled = bool(
+        annotation_cfg.get("metaspot_omm_cell_coherent_rescue", False)
+    )
+    try:
+        omm_cell_min_transcripts = int(
+            annotation_cfg.get("metaspot_omm_cell_min_marker_transcripts", 8)
+        )
+        omm_cell_min_genes = int(
+            annotation_cfg.get("metaspot_omm_cell_min_marker_genes", 4)
+        )
+        omm_local_min_transcripts = int(
+            annotation_cfg.get("metaspot_omm_local_min_marker_transcripts", 2)
+        )
+        omm_local_min_genes = int(
+            annotation_cfg.get("metaspot_omm_local_min_marker_genes", 2)
+        )
+        omm_cell_max_per_cell = int(
+            annotation_cfg.get("metaspot_omm_cell_max_per_cell", 3)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "OMM cell-coherent marker minima and max_per_cell must be integers"
+        ) from exc
+    if min(
+        omm_cell_min_transcripts,
+        omm_cell_min_genes,
+        omm_local_min_transcripts,
+        omm_local_min_genes,
+        omm_cell_max_per_cell,
+    ) < 1:
+        raise ValueError(
+            "OMM cell-coherent marker minima and max_per_cell must be >= 1"
+        )
+    omm_cell_min_enrichment = _finite_float(
+        "metaspot_omm_cell_min_log2_enrichment", 0.50
+    )
+    omm_cell_max_p = _finite_float(
+        "metaspot_omm_cell_max_binomial_p", 0.05
+    )
+    omm_cell_exploratory_max_p = _finite_float(
+        "metaspot_omm_cell_exploratory_max_binomial_p", 0.20
+    )
+    omm_local_min_enrichment = _finite_float(
+        "metaspot_omm_local_min_log2_enrichment", 0.50
+    )
+    omm_local_min_gap = _finite_float(
+        "metaspot_omm_local_min_score_gap", 0.15
+    )
+    omm_local_min_dgi_support = _finite_float(
+        "metaspot_omm_local_min_dgi_support", 0.60
+    )
+    omm_local_min_dgi_margin = _finite_float(
+        "metaspot_omm_local_min_dgi_margin", 0.0
+    )
+    if (
+        omm_cell_max_p > 1.0
+        or omm_cell_exploratory_max_p > 1.0
+        or omm_local_min_dgi_support > 1.0
+        or (
+        omm_local_min_dgi_margin > 1.0
+        )
+    ):
+        raise ValueError(
+            "OMM cell-coherent p-value, DGI support, and DGI margin must be <= 1"
+        )
+    if omm_cell_exploratory_max_p < omm_cell_max_p:
+        raise ValueError(
+            "annotation.metaspot_omm_cell_exploratory_max_binomial_p "
+            "must be >= metaspot_omm_cell_max_binomial_p"
+        )
+    allowed = {
+        "Nuclear": ["Nucleus", "Nucleolus", "Lamina", "Nuclear Pore"],
+        "Cytoplasmic": ["Cytosol", "ER", "OMM"],
+    }
+    threshold_arrays, thresholds_by_label = (
+        _resolve_metaspot_label_thresholds(
+            annotation_cfg,
+            labels,
+            {
+                "min_marker_transcripts": min_transcripts,
+                "min_marker_genes": min_genes,
+                "min_log2_enrichment": min_enrichment,
+                "min_score_gap": min_gap,
+                "subtype_fdr": strict_fdr,
+                "exploratory_max_q": exploratory_q,
+                "min_dgi_support": _finite_float(
+                    "metaspot_min_dgi_support",
+                    0.0,
+                ),
+                "min_dgi_margin": _finite_float(
+                    "metaspot_min_dgi_margin",
+                    0.0,
+                ),
+            },
+        )
+    )
+    marker_union = sorted(
+        set().union(*(set(marker_sets[label]) for label in labels))
+    )
+    if not marker_union:
+        raise RuntimeError(
+            "No measured genes overlap the exclusive MetaSpot annotation "
+            "marker sets"
+        )
+
+    var_position: Dict[str, int] = {}
+    for position, gene in enumerate(adata1.var_names.astype(str)):
+        var_position.setdefault(gene.upper(), position)
+    matrix = adata1.layers.get("counts", adata1.X)
+    if not _is_count_like_matrix(matrix):
+        raise ValueError(
+            "MetaSpot evidence testing requires raw integer transcript counts "
+            "in adata1.X or adata1.layers['counts']"
+        )
+    marker_positions = [var_position[gene] for gene in marker_union]
+    marker_matrix = matrix[:, marker_positions]
+    if not sp.issparse(marker_matrix):
+        marker_matrix = sp.csr_matrix(marker_matrix)
+    marker_matrix = marker_matrix.tocsr().astype(np.float64)
+    union_position = {gene: idx for idx, gene in enumerate(marker_union)}
+
+    n_obs = adata1.n_obs
+    n_labels = len(labels)
+    original_counts = np.zeros((n_obs, n_labels), dtype=np.float64)
+    original_distinct_genes = np.zeros(
+        (n_obs, n_labels),
+        dtype=np.int32,
+    )
+    pooled_matrix: Optional[sp.csr_matrix] = None
+    pooled_counts: Optional[np.ndarray] = None
+    distinct_genes: Optional[np.ndarray] = None
+    if build_score_table:
+        pooled_matrix = (pooling @ marker_matrix).tocsr()
+        pooled_counts = np.zeros((n_obs, n_labels), dtype=np.float64)
+        distinct_genes = np.zeros((n_obs, n_labels), dtype=np.int32)
+    for label_idx, label in enumerate(labels):
+        columns = np.asarray(
+            [union_position[gene] for gene in marker_sets[label]],
+            dtype=np.int64,
+        )
+        if columns.size == 0:
+            continue
+        original_label = marker_matrix[:, columns]
+        original_counts[:, label_idx] = np.asarray(
+            original_label.sum(axis=1)
+        ).ravel()
+        original_distinct_genes[:, label_idx] = original_label.getnnz(
+            axis=1
+        )
+        if pooled_matrix is not None:
+            assert pooled_counts is not None and distinct_genes is not None
+            pooled_label = pooled_matrix[:, columns]
+            pooled_counts[:, label_idx] = np.asarray(
+                pooled_label.sum(axis=1)
+            ).ravel()
+            distinct_genes[:, label_idx] = pooled_label.getnnz(axis=1)
+
+    broad_values = broad.astype(str).to_numpy()
+
+    # Hard annotation evidence is computed from the focal MetaSpot only.
+    # DGI-neighbor pooling is retained strictly for consensus/support and
+    # diagnostics, so neighboring transcripts cannot inflate marker counts,
+    # enrichment, or binomial significance for the focal MetaSpot.
+    scores = np.full((n_obs, n_labels), -np.inf, dtype=np.float64)
+    raw_scores = scores
+    pooled_scores: Optional[np.ndarray] = None
+    if build_score_table:
+        pooled_scores = np.full(
+            (n_obs, n_labels),
+            -np.inf,
+            dtype=np.float64,
+        )
+    p_values = np.full((n_obs, n_labels), np.nan, dtype=np.float64)
+    q_values = np.full((n_obs, n_labels), np.nan, dtype=np.float64)
+    local_totals = np.zeros(n_obs, dtype=np.float64)
+    pooled_totals: Optional[np.ndarray] = None
+    if build_score_table:
+        pooled_totals = np.zeros(n_obs, dtype=np.float64)
+    background_probability = np.full(n_labels, np.nan, dtype=np.float64)
+    label_to_idx = {label: idx for idx, label in enumerate(labels)}
+
+    for compartment, compartment_labels in allowed.items():
+        rows = broad_values == compartment
+        label_indices = np.asarray(
+            [label_to_idx[label] for label in compartment_labels],
+            dtype=np.int64,
+        )
+        measured_indices = np.asarray(
+            [
+                label_idx
+                for label_idx in label_indices
+                if marker_sets[labels[label_idx]]
+            ],
+            dtype=np.int64,
+        )
+        if not rows.any() or measured_indices.size == 0:
+            continue
+
+        row_indices = np.flatnonzero(rows)
+
+        # Self-local marker totals are the only totals used by the statistical
+        # evidence gate.
+        self_total = original_counts[
+            np.ix_(row_indices, measured_indices)
+        ].sum(axis=1)
+        local_totals[row_indices] = self_total
+
+        # Neighbor-pooled totals are diagnostic only.
+        if pooled_counts is not None:
+            pooled_total = pooled_counts[
+                np.ix_(row_indices, measured_indices)
+            ].sum(axis=1)
+            assert pooled_totals is not None
+            pooled_totals[row_indices] = pooled_total
+
+        # Estimate the compartment-specific marker background from focal
+        # MetaSpots, never from DGI-pooled pseudo-replicates.
+        background_label_counts = original_counts[
+            np.ix_(row_indices, measured_indices)
+        ].sum(axis=0)
+        background_total = float(background_label_counts.sum())
+        alpha = 0.5
+        background = (background_label_counts + alpha) / (
+            background_total + alpha * measured_indices.size
+        )
+
+        for local_idx, label_idx in enumerate(measured_indices):
+            bg = float(np.clip(background[local_idx], 1e-8, 1.0 - 1e-8))
+
+            # ------------------------------------------------------------
+            # Self-local evidence used by candidate selection and hard gate
+            # ------------------------------------------------------------
+            self_count = original_counts[row_indices, label_idx]
+            self_fraction = (self_count + prior_strength * bg) / (
+                self_total + prior_strength
+            )
+            self_enrichment = np.log2(
+                np.maximum(self_fraction, 1e-12) / bg
+            )
+            scores[row_indices, label_idx] = self_enrichment
+            background_probability[label_idx] = bg
+
+            tested = self_total > 0
+            tested_rows = row_indices[tested]
+            if tested_rows.size:
+                p_values[tested_rows, label_idx] = binom.sf(
+                    np.rint(self_count[tested]).astype(np.int64) - 1,
+                    np.rint(self_total[tested]).astype(np.int64),
+                    bg,
+                )
+
+            # ------------------------------------------------------------
+            # DGI-neighbor pooled enrichment retained for diagnostics only
+            # ------------------------------------------------------------
+            if pooled_counts is not None and pooled_scores is not None:
+                pooled_count = pooled_counts[row_indices, label_idx]
+                pooled_fraction = (pooled_count + prior_strength * bg) / (
+                    pooled_total + prior_strength
+                )
+                pooled_scores[row_indices, label_idx] = np.log2(
+                    np.maximum(pooled_fraction, 1e-12) / bg
+                )
+
+    for label_idx in range(n_labels):
+        tested = np.isfinite(p_values[:, label_idx])
+        if tested.any():
+            q_values[tested, label_idx] = multipletests(
+                p_values[tested, label_idx],
+                method="fdr_bh",
+            )[1]
+
+    # Fine-structure RNA can be distributed over several small MetaSpots in a
+    # cell. Aggregate exact counts and distinct genes separately within the
+    # nuclear and cytoplasmic compartments. These arrays establish cell-level
+    # presence only; the final location must still be anchored by focal marker
+    # evidence and independent leave-one-out DGI agreement.
+    cell_marker_counts = np.zeros((n_obs, n_labels), dtype=np.float64)
+    cell_marker_genes = np.zeros((n_obs, n_labels), dtype=np.int32)
+    cell_marker_enrichment = np.full(
+        (n_obs, n_labels), np.nan, dtype=np.float64
+    )
+    cell_marker_p = np.full((n_obs, n_labels), np.nan, dtype=np.float64)
+    cell_marker_q = np.full((n_obs, n_labels), np.nan, dtype=np.float64)
+    cell_codes: Optional[np.ndarray] = None
+    unique_cells: Optional[np.ndarray] = None
+    if "cell_id" in adata1.obs.columns:
+        cell_codes, unique_cells = pd.factorize(
+            adata1.obs["cell_id"],
+            sort=False,
+        )
+        n_cells = len(unique_cells)
+        if n_cells <= np.iinfo(np.int32).max:
+            cell_codes = cell_codes.astype(np.int32, copy=False)
+
+        for compartment, compartment_labels in allowed.items():
+            compartment_rows = np.flatnonzero(
+                broad_values == compartment
+            )
+            if compartment_rows.size == 0:
+                continue
+            membership = sp.csr_matrix(
+                (
+                    np.ones(compartment_rows.size, dtype=np.float64),
+                    (cell_codes[compartment_rows], compartment_rows),
+                ),
+                shape=(n_cells, n_obs),
+            )
+            cell_compartment_matrix = (membership @ marker_matrix).tocsr()
+            compartment_columns = np.asarray(
+                sorted(
+                    {
+                        union_position[gene]
+                        for label in compartment_labels
+                        for gene in marker_sets[label]
+                    }
+                ),
+                dtype=np.int64,
+            )
+            cell_total_values = np.asarray(
+                cell_compartment_matrix[:, compartment_columns].sum(axis=1)
+            ).ravel()
+
+            for label in compartment_labels:
+                label_idx = label_to_idx[label]
+                label_columns = np.asarray(
+                    [
+                        union_position[gene]
+                        for gene in marker_sets[label]
+                    ],
+                    dtype=np.int64,
+                )
+                if label_columns.size == 0:
+                    continue
+                cell_count_values = np.asarray(
+                    cell_compartment_matrix[:, label_columns].sum(axis=1)
+                ).ravel()
+                cell_gene_values = np.asarray(
+                    cell_compartment_matrix[:, label_columns].getnnz(axis=1),
+                    dtype=np.int32,
+                )
+                bg = float(background_probability[label_idx])
+                if not np.isfinite(bg):
+                    continue
+                bg = float(np.clip(bg, 1e-8, 1.0 - 1e-8))
+                cell_fraction = (
+                    cell_count_values + prior_strength * bg
+                ) / (cell_total_values + prior_strength)
+                cell_enrichment_values = np.log2(
+                    np.maximum(cell_fraction, 1e-12) / bg
+                )
+                cell_p_values = np.full(n_cells, np.nan, dtype=float)
+                tested_cells = cell_total_values > 0
+                cell_p_values[tested_cells] = binom.sf(
+                    np.rint(cell_count_values[tested_cells]).astype(np.int64)
+                    - 1,
+                    np.rint(cell_total_values[tested_cells]).astype(np.int64),
+                    bg,
+                )
+                cell_q_values = np.full(n_cells, np.nan, dtype=float)
+                finite_test = np.isfinite(cell_p_values)
+                if finite_test.any():
+                    cell_q_values[finite_test] = multipletests(
+                        cell_p_values[finite_test], method="fdr_bh"
+                    )[1]
+
+                cell_marker_counts[:, label_idx] = cell_count_values[
+                    cell_codes
+                ]
+                cell_marker_genes[:, label_idx] = cell_gene_values[
+                    cell_codes
+                ]
+                cell_marker_enrichment[:, label_idx] = (
+                    cell_enrichment_values[cell_codes]
+                )
+                cell_marker_p[:, label_idx] = cell_p_values[cell_codes]
+                cell_marker_q[:, label_idx] = cell_q_values[cell_codes]
+
+    rescue_cell_ids: Sequence[object] = (
+        cell_codes if cell_codes is not None else adata1.obs["cell_id"]
+    )
+    omm_idx = label_to_idx["OMM"]
+    omm_cell_counts = cell_marker_counts[:, omm_idx]
+    omm_cell_genes = cell_marker_genes[:, omm_idx]
+    omm_cell_enrichment = cell_marker_enrichment[:, omm_idx]
+    omm_cell_p = cell_marker_p[:, omm_idx]
+    omm_cell_q = cell_marker_q[:, omm_idx]
+
+    (
+        marker_candidate_indices,
+        marker_candidate_gap,
+        dgi_support,
+        dgi_informative_neighbors,
+    ) = _compute_metaspot_dgi_consensus(
+        pooling,
+        raw_scores,
+        original_counts,
+        original_distinct_genes,
+        broad_values,
+        labels,
+        allowed,
+        seed_min_transcripts=dgi_seed_min_transcripts,
+        seed_min_genes=dgi_seed_min_genes,
+        seed_min_enrichment=dgi_seed_min_enrichment,
+        min_informative_neighbors=dgi_min_informative_neighbors,
+    )
+    dgi_available = (
+        dgi_informative_neighbors >= dgi_min_informative_neighbors
+    )
+
+    fine_structure_indices = np.asarray(
+        [label_to_idx[label] for label in fine_structure_labels],
+        dtype=np.int64,
+    )
+    metaspot_total_transcripts = np.asarray(
+        matrix.sum(axis=1), dtype=float
+    ).ravel()
+    structure_compartments = {
+        label: str(_label_compartment(label))
+        for label in fine_structure_labels
+    }
+    multistructure_spatial_coherence = (
+        _compute_cell_structure_spatial_coherence(
+            cell_codes,
+            broad_values,
+            original_counts[:, fine_structure_indices],
+            metaspot_total_transcripts,
+            fine_structure_labels,
+            structure_compartments,
+        )
+    )
+    adata1.obsm["X_subcellular_structure_spatial_coherence"] = (
+        multistructure_spatial_coherence
+    )
+    metadomain_affinity = np.zeros(
+        (n_obs, len(fine_structure_labels)), dtype=float
+    )
+    rapx_calibrated_score = np.full_like(metadomain_affinity, np.nan)
+    structure_geometry = np.zeros_like(metadomain_affinity, dtype=bool)
+    competitor_margin = np.full_like(metadomain_affinity, np.nan)
+    for fine_idx, label in enumerate(fine_structure_labels):
+        label_idx = label_to_idx[label]
+        compartment = str(_label_compartment(label))
+        compatible_indices = [
+            label_to_idx[other]
+            for other in allowed[compartment]
+            if other != label
+        ]
+        alternative = np.max(scores[:, compatible_indices], axis=1)
+        finite_margin = np.isfinite(scores[:, label_idx]) & np.isfinite(
+            alternative
+        )
+        competitor_margin[finite_margin, fine_idx] = (
+            scores[finite_margin, label_idx] - alternative[finite_margin]
+        )
+
+        affinity_column = f"subcell_relative_evidence__{label}"
+        if affinity_column in adata1.obs.columns:
+            metadomain_affinity[:, fine_idx] = pd.to_numeric(
+                adata1.obs[affinity_column], errors="coerce"
+            ).fillna(0.0)
+        rapx_column = f"subcell_subtype_calibrated_score__{label}"
+        if rapx_column in adata1.obs.columns:
+            rapx_calibrated_score[:, fine_idx] = pd.to_numeric(
+                adata1.obs[rapx_column], errors="coerce"
+            )
+        geometry_column = f"subcell_geometry_feasible__{label}"
+        structure_geometry[:, fine_idx] = broad_values == compartment
+        if geometry_column in adata1.obs.columns:
+            structure_geometry[:, fine_idx] &= (
+                adata1.obs[geometry_column].fillna(False).astype(bool)
+            )
+
+    (
+        multistructure_presence,
+        multistructure_localization,
+        multistructure_evidence,
+    ) = _compute_multistructure_evidence(
+        original_counts[:, fine_structure_indices],
+        original_distinct_genes[:, fine_structure_indices],
+        scores[:, fine_structure_indices],
+        metadomain_affinity,
+        dgi_support[:, fine_structure_indices],
+        structure_geometry,
+        competitor_margin,
+        rapx_calibrated_score,
+        cell_marker_counts[:, fine_structure_indices],
+        cell_marker_genes[:, fine_structure_indices],
+        cell_marker_enrichment[:, fine_structure_indices],
+        cell_marker_p[:, fine_structure_indices],
+    )
+    adata1.obsm["X_subcellular_structure_presence"] = (
+        multistructure_presence
+    )
+    adata1.obsm["X_subcellular_structure_localization"] = (
+        multistructure_localization
+    )
+    adata1.obsm["X_subcellular_structure_evidence"] = (
+        multistructure_evidence
+    )
+
+    # Fused scores are retained as an audit quantity only.  They do not choose
+    # the candidate and do not enter the count/enrichment/q-value hard gate.
+    fused_scores: Optional[np.ndarray] = None
+    if build_score_table:
+        fused_scores = scores.copy()
+    if fused_scores is not None and dgi_consensus_weight > 0.0:
+        for label_idx, label in enumerate(labels):
+            if label in {"Nucleus", "Cytosol"}:
+                continue
+            eligible = dgi_available & np.isfinite(
+                fused_scores[:, label_idx]
+            )
+            fused_scores[eligible, label_idx] += (
+                dgi_consensus_weight * dgi_support[eligible, label_idx]
+            )
+
+    # Candidate selection is self-local. DGI can support/rescue a candidate
+    # later, but cannot create a candidate by importing neighbor transcripts.
+    candidate = np.asarray(fallback.astype(str), dtype=object)
+    score_gap = np.full(n_obs, np.nan, dtype=np.float64)
+    for compartment, compartment_labels in allowed.items():
+        rows = np.flatnonzero(broad_values == compartment)
+        label_indices = np.asarray(
+            [label_to_idx[label] for label in compartment_labels],
+            dtype=np.int64,
+        )
+        if rows.size == 0:
+            continue
+
+        local_scores = scores[np.ix_(rows, label_indices)]
+        best_local = np.argmax(local_scores, axis=1)
+        best_scores = local_scores[np.arange(rows.size), best_local]
+        finite_best = np.isfinite(best_scores)
+        chosen_indices = label_indices[best_local]
+
+        if finite_best.any():
+            candidate[rows[finite_best]] = np.asarray(
+                labels,
+                dtype=object,
+            )[chosen_indices[finite_best]]
+
+        if label_indices.size > 1:
+            sorted_scores = np.sort(local_scores, axis=1)
+            gaps = sorted_scores[:, -1] - sorted_scores[:, -2]
+            gaps[~np.isfinite(gaps)] = np.nan
+            score_gap[rows] = gaps
+
+    candidate_indices = pd.Categorical(
+        candidate,
+        categories=labels,
+    ).codes.astype(np.int64, copy=False)
+    if np.any(candidate_indices < 0):
+        raise RuntimeError("MetaSpot candidate labels escaped the seven-label space")
+    row_ids = np.arange(n_obs)
+
+    # All hard-gate quantities below come from the focal MetaSpot itself.
+    candidate_counts = original_counts[row_ids, candidate_indices]
+    candidate_genes = original_distinct_genes[row_ids, candidate_indices]
+    candidate_scores = scores[row_ids, candidate_indices]
+    candidate_fused_scores = (
+        fused_scores[row_ids, candidate_indices]
+        if fused_scores is not None
+        else None
+    )
+    candidate_p = p_values[row_ids, candidate_indices]
+    candidate_q = q_values[row_ids, candidate_indices]
+    candidate_cell_counts = cell_marker_counts[row_ids, candidate_indices]
+    candidate_cell_genes = cell_marker_genes[row_ids, candidate_indices]
+    candidate_cell_enrichment = cell_marker_enrichment[
+        row_ids, candidate_indices
+    ]
+    candidate_cell_p = cell_marker_p[row_ids, candidate_indices]
+    candidate_cell_q = cell_marker_q[row_ids, candidate_indices]
+
+    # Neighbor-pooled values are kept only for diagnostics.
+    candidate_pooled_counts = (
+        pooled_counts[row_ids, candidate_indices]
+        if pooled_counts is not None
+        else None
+    )
+    candidate_pooled_genes = (
+        distinct_genes[row_ids, candidate_indices]
+        if distinct_genes is not None
+        else None
+    )
+    candidate_pooled_scores = (
+        pooled_scores[row_ids, candidate_indices]
+        if pooled_scores is not None
+        else None
+    )
+    marker_only_candidate = np.asarray(
+        fallback.astype(str),
+        dtype=object,
+    ).copy()
+    marker_candidate_valid = marker_candidate_indices >= 0
+    marker_only_candidate[marker_candidate_valid] = np.asarray(
+        labels,
+        dtype=object,
+    )[marker_candidate_indices[marker_candidate_valid]]
+    candidate_dgi_support = dgi_support[row_ids, candidate_indices]
+    candidate_dgi_margin = np.full(n_obs, np.nan, dtype=np.float64)
+    for compartment, compartment_labels in allowed.items():
+        rows = np.flatnonzero(broad_values == compartment)
+        label_indices = np.asarray(
+            [label_to_idx[label] for label in compartment_labels],
+            dtype=np.int64,
+        )
+        if rows.size == 0:
+            continue
+        local_support = dgi_support[np.ix_(rows, label_indices)].copy()
+        local_lookup = np.full(n_labels, -1, dtype=np.int8)
+        local_lookup[label_indices] = np.arange(
+            label_indices.size,
+            dtype=np.int8,
+        )
+        selected_local = local_lookup[candidate_indices[rows]]
+        valid_selected = selected_local >= 0
+        local_support[
+            np.arange(rows.size)[valid_selected],
+            selected_local[valid_selected],
+        ] = -np.inf
+        alternative_support = np.max(local_support, axis=1)
+        alternative_support[~np.isfinite(alternative_support)] = 0.0
+        candidate_dgi_margin[rows] = (
+            candidate_dgi_support[rows] - alternative_support
+        )
+    candidate_is_subtype = ~np.isin(
+        candidate,
+        ["Nucleus", "Cytosol", "Unknown"],
+    )
+    candidate_spatial_coherence = np.ones(n_obs, dtype=float)
+    candidate_spatial_coherence_threshold = np.zeros(n_obs, dtype=float)
+    for fine_idx, label in enumerate(fine_structure_labels):
+        rows = candidate == label
+        candidate_spatial_coherence[rows] = (
+            multistructure_spatial_coherence[rows, fine_idx]
+        )
+        candidate_spatial_coherence_threshold[rows] = (
+            min_spatial_coherence[fine_idx]
+        )
+    candidate_spatial_coherence_pass = (
+        candidate_spatial_coherence >= candidate_spatial_coherence_threshold
+    )
+
+    candidate_min_transcripts = threshold_arrays[
+        "min_marker_transcripts"
+    ][candidate_indices]
+    candidate_min_genes = threshold_arrays["min_marker_genes"][
+        candidate_indices
+    ]
+    candidate_min_enrichment = threshold_arrays[
+        "min_log2_enrichment"
+    ][candidate_indices]
+    candidate_min_gap = threshold_arrays["min_score_gap"][
+        candidate_indices
+    ]
+    candidate_strict_fdr = threshold_arrays["subtype_fdr"][
+        candidate_indices
+    ]
+    candidate_exploratory_q = threshold_arrays[
+        "exploratory_max_q"
+    ][candidate_indices]
+    candidate_min_dgi_support = threshold_arrays[
+        "min_dgi_support"
+    ][candidate_indices]
+    candidate_min_dgi_margin = threshold_arrays["min_dgi_margin"][
+        candidate_indices
+    ]
+    enough_counts = candidate_counts >= candidate_min_transcripts
+    enough_genes = candidate_genes >= candidate_min_genes
+    enough_enrichment = candidate_scores >= candidate_min_enrichment
+    enough_gap = score_gap >= candidate_min_gap
+    needs_dgi_support = (
+        require_dgi_support
+        | (candidate_min_dgi_support > 0.0)
+        | (candidate_min_dgi_margin > 0.0)
+    )
+    enough_dgi_support = (
+        ~needs_dgi_support
+        | (
+            dgi_available
+            & (candidate_dgi_support >= candidate_min_dgi_support)
+            & (candidate_dgi_margin >= candidate_min_dgi_margin)
+        )
+    )
+    marker_base_evidence = (
+        candidate_is_subtype
+        & enough_counts
+        & enough_genes
+        & enough_enrichment
+        & enough_gap
+        & np.isfinite(candidate_q)
+        & candidate_spatial_coherence_pass
+    )
+    local_base_evidence = marker_base_evidence & enough_dgi_support
+
+    # This is deliberately a separate exploratory track rather than an FDR
+    # call. It may rescue a marker-qualified candidate only when independent,
+    # leave-one-out DGI neighbors agree strongly. This rescue never upgrades a
+    # call to Strict; that tier retains the marker test and label-wise BH gate.
+    dgi_exploratory_support_threshold = np.maximum(
+        dgi_exploratory_min_support,
+        candidate_min_dgi_support,
+    )
+    dgi_exploratory_margin_threshold = np.maximum(
+        dgi_exploratory_min_margin,
+        candidate_min_dgi_margin,
+    )
+    dgi_exploratory_supported = (
+        dgi_exploratory_enabled
+        & marker_base_evidence
+        & dgi_available
+        & (
+            candidate_dgi_support
+            >= dgi_exploratory_support_threshold
+        )
+        & (
+            candidate_dgi_margin
+            >= dgi_exploratory_margin_threshold
+        )
+    )
+
+    require_omm = bool(
+        annotation_cfg.get("metaspot_require_omm_confirmation", True)
+    )
+    omm_confirmation_mode, omm_confirmed = (
+        _resolve_metaspot_omm_confirmation(
+            adata1,
+            require_confirmation=require_omm,
+            posterior_high=float(
+                annotation_cfg.get("omm_metaspot_posterior_high", 0.80)
+            ),
+        )
+    )
+    is_omm = candidate == "OMM"
+    local_strict_supported = local_base_evidence & (
+        candidate_q <= candidate_strict_fdr
+    )
+    statistical_exploratory_supported = local_base_evidence & (
+        candidate_q <= candidate_exploratory_q
+    )
+    dgi_exploratory_supported &= ~statistical_exploratory_supported
+    local_exploratory_supported = (
+        statistical_exploratory_supported
+        | dgi_exploratory_supported
+    )
+    strict_supported = local_strict_supported.copy()
+    exploratory_supported = local_exploratory_supported.copy()
+    if require_omm and omm_confirmation_mode == "identifiable":
+        strict_supported[is_omm] &= omm_confirmed[is_omm]
+        exploratory_supported[is_omm] &= omm_confirmed[is_omm]
+    elif require_omm and omm_confirmation_mode in {
+        "unidentifiable",
+        "unavailable",
+    }:
+        if omm_unidentifiable_policy == "strict_local":
+            exploratory_supported[is_omm] = local_strict_supported[is_omm]
+        else:
+            # A missing independent confirmation is uncertainty, not positive
+            # OMM evidence. Keep strict-local candidates in diagnostics but do
+            # not turn them into hard production labels.
+            strict_supported[is_omm] = False
+            exploratory_supported[is_omm] = False
+
+    supported_before_cell_coverage = exploratory_supported.copy()
+    omm_cell_coherent_rescued = np.zeros(n_obs, dtype=bool)
+    omm_cell_exploratory_candidate = np.zeros(n_obs, dtype=bool)
+    if omm_cell_rescue_enabled:
+        omm_idx = label_to_idx["OMM"]
+        omm_cell_coherent_rescued = (
+            _select_metaspot_omm_cell_coherent_rescues(
+                rescue_cell_ids,
+                candidate,
+                exploratory_supported,
+                broad_values,
+                original_counts[:, omm_idx],
+                original_distinct_genes[:, omm_idx],
+                scores[:, omm_idx],
+                score_gap,
+                dgi_available,
+                dgi_support[:, omm_idx],
+                (
+                    dgi_support[:, omm_idx]
+                    - np.maximum(
+                        dgi_support[:, label_to_idx["ER"]],
+                        dgi_support[:, label_to_idx["Cytosol"]],
+                    )
+                ),
+                omm_cell_counts,
+                omm_cell_genes,
+                omm_cell_enrichment,
+                omm_cell_p,
+                min_cell_transcripts=omm_cell_min_transcripts,
+                min_cell_genes=omm_cell_min_genes,
+                min_cell_enrichment=omm_cell_min_enrichment,
+                max_cell_p=omm_cell_max_p,
+                min_local_transcripts=omm_local_min_transcripts,
+                min_local_genes=omm_local_min_genes,
+                min_local_enrichment=omm_local_min_enrichment,
+                min_local_score_gap=omm_local_min_gap,
+                min_dgi_support=omm_local_min_dgi_support,
+                min_dgi_margin=omm_local_min_dgi_margin,
+                max_per_cell=omm_cell_max_per_cell,
+            )
+        )
+        omm_cell_coherent_rescued &= (
+            multistructure_spatial_coherence[:, fine_structure_labels.index("OMM")]
+            >= min_spatial_coherence[fine_structure_labels.index("OMM")]
+        )
+        # An identifiable independent model still has veto authority. The
+        # cell-coherent path is primarily a principled fallback for the
+        # currently unidentifiable OMM confirmation model.
+        if require_omm and omm_confirmation_mode == "identifiable":
+            omm_cell_coherent_rescued &= omm_confirmed
+        exploratory_supported |= omm_cell_coherent_rescued
+        if omm_cell_exploratory_max_p > omm_cell_max_p:
+            # A second, explicitly audit-only sensitivity layer.  It uses the
+            # identical local marker, OMM-vs-ER/Cytosol, and leave-one-out DGI
+            # gates; only the cell-level presence p-value is relaxed.  These
+            # loci never enter ``exploratory_supported`` or public labels.
+            omm_cell_exploratory_candidate = (
+                _select_metaspot_omm_cell_coherent_rescues(
+                    rescue_cell_ids,
+                    candidate,
+                    exploratory_supported,
+                    broad_values,
+                    original_counts[:, omm_idx],
+                    original_distinct_genes[:, omm_idx],
+                    scores[:, omm_idx],
+                    score_gap,
+                    dgi_available,
+                    dgi_support[:, omm_idx],
+                    (
+                        dgi_support[:, omm_idx]
+                        - np.maximum(
+                            dgi_support[:, label_to_idx["ER"]],
+                            dgi_support[:, label_to_idx["Cytosol"]],
+                        )
+                    ),
+                    omm_cell_counts,
+                    omm_cell_genes,
+                    omm_cell_enrichment,
+                    omm_cell_p,
+                    min_cell_transcripts=omm_cell_min_transcripts,
+                    min_cell_genes=omm_cell_min_genes,
+                    min_cell_enrichment=omm_cell_min_enrichment,
+                    max_cell_p=omm_cell_exploratory_max_p,
+                    min_local_transcripts=omm_local_min_transcripts,
+                    min_local_genes=omm_local_min_genes,
+                    min_local_enrichment=omm_local_min_enrichment,
+                    min_local_score_gap=omm_local_min_gap,
+                    min_dgi_support=omm_local_min_dgi_support,
+                    min_dgi_margin=omm_local_min_dgi_margin,
+                    max_per_cell=omm_cell_max_per_cell,
+                )
+            )
+
+    cell_coverage_rescued = np.zeros(n_obs, dtype=bool)
+    cell_coverage_rescue_labels = np.full(n_obs, "", dtype=object)
+    labelwise_cell_coverage_rescued = np.zeros(n_obs, dtype=bool)
+    if cell_coverage_rescue_enabled:
+        if "cell_id" not in adata1.obs.columns:
+            raise KeyError(
+                "MetaSpot cell-coverage rescue requires adata1.obs['cell_id']"
+            )
+        cell_coverage_rescued = _select_metaspot_cell_coverage_rescues(
+            rescue_cell_ids,
+            candidate,
+            exploratory_supported,
+            marker_base_evidence,
+            dgi_available,
+            candidate_dgi_support,
+            candidate_dgi_margin,
+            candidate_scores,
+            score_gap,
+            candidate_q,
+            candidate_counts,
+            candidate_cell_counts,
+            candidate_cell_genes,
+            candidate_cell_enrichment,
+            candidate_cell_p,
+            labels=cell_coverage_labels,
+            min_cell_transcripts=cell_coverage_min_transcripts,
+            min_cell_genes=cell_coverage_min_genes,
+            min_cell_enrichment=cell_coverage_min_enrichment,
+            max_cell_p=cell_coverage_max_p,
+            min_dgi_support=cell_coverage_min_dgi_support,
+            min_dgi_margin=cell_coverage_min_dgi_margin,
+            max_per_cell_label=cell_coverage_max_per_label,
+        )
+        exploratory_supported |= cell_coverage_rescued
+        cell_coverage_rescue_labels[cell_coverage_rescued] = candidate[
+            cell_coverage_rescued
+        ]
+
+        # The primary head chooses one maximum-enrichment label before its
+        # gates are evaluated. Independently test every still-missing label
+        # against its own marker, exact cell-level, and DGI evidence. This
+        # recovers real secondary structure signals without turning the
+        # feature into a per-cell quota.
+        labelwise_rescue_labels = (
+            _select_metaspot_labelwise_cell_coverage_rescues(
+                rescue_cell_ids,
+                broad_values,
+                candidate,
+                exploratory_supported,
+                original_counts,
+                original_distinct_genes,
+                scores,
+                q_values,
+                dgi_available,
+                dgi_support,
+                cell_marker_counts,
+                cell_marker_genes,
+                cell_marker_enrichment,
+                cell_marker_p,
+                labels=cell_coverage_labels,
+                all_labels=labels,
+                allowed=allowed,
+                min_local_transcripts=np.full(
+                    len(labels), cell_coverage_min_local_transcripts
+                ),
+                min_local_genes=np.full(
+                    len(labels), cell_coverage_min_local_genes
+                ),
+                min_local_enrichment=np.full(
+                    len(labels), cell_coverage_min_local_enrichment
+                ),
+                min_cell_transcripts=cell_coverage_min_transcripts,
+                min_cell_genes=cell_coverage_min_genes,
+                min_cell_enrichment=cell_coverage_min_enrichment,
+                max_cell_p=cell_coverage_max_p,
+                min_dgi_support=cell_coverage_min_dgi_support,
+                min_dgi_margin=cell_coverage_min_dgi_margin,
+                max_per_cell_label=cell_coverage_max_per_label,
+            )
+        )
+        labelwise_cell_coverage_rescued = labelwise_rescue_labels != ""
+        for fine_idx, label in enumerate(fine_structure_labels):
+            rows = labelwise_rescue_labels == label
+            labelwise_rescue_labels[
+                rows
+                & (
+                    multistructure_spatial_coherence[:, fine_idx]
+                    < min_spatial_coherence[fine_idx]
+                )
+            ] = ""
+        labelwise_cell_coverage_rescued = labelwise_rescue_labels != ""
+        cell_coverage_rescue_labels[
+            labelwise_cell_coverage_rescued
+        ] = labelwise_rescue_labels[labelwise_cell_coverage_rescued]
+        cell_coverage_rescued |= labelwise_cell_coverage_rescued
+        exploratory_supported |= labelwise_cell_coverage_rescued
+
+    supported_before_hierarchical_rescue = exploratory_supported.copy()
+    hierarchical_rescue_labels = np.full(n_obs, "", dtype=object)
+    hierarchical_diagnostics: Dict[str, np.ndarray] = {
+        "callable": np.zeros(n_obs, dtype=bool),
+        "eligible_cell": np.zeros(n_obs, dtype=bool),
+        "status": np.full(n_obs, "disabled", dtype=object),
+        "cell_total_transcripts": np.full(n_obs, np.nan, dtype=float),
+        "cell_metaspots": np.full(n_obs, np.nan, dtype=float),
+        "presence_score": np.full(n_obs, np.nan, dtype=float),
+        "localization_score": np.full(n_obs, np.nan, dtype=float),
+        "joint_score": np.full(n_obs, np.nan, dtype=float),
+        "best_label": np.full(n_obs, "", dtype=object),
+        "best_presence_score": np.full(n_obs, np.nan, dtype=float),
+        "best_localization_score": np.full(n_obs, np.nan, dtype=float),
+        "best_joint_score": np.full(n_obs, np.nan, dtype=float),
+        "best_dgi_support": np.full(n_obs, np.nan, dtype=float),
+        "best_dgi_margin": np.full(n_obs, np.nan, dtype=float),
+    }
+    if hierarchical_cell_rescue_enabled:
+        if "cell_id" not in adata1.obs.columns:
+            raise KeyError(
+                "MetaSpot hierarchical cell rescue requires "
+                "adata1.obs['cell_id']"
+            )
+        metaspot_total_transcripts = np.asarray(
+            matrix.sum(axis=1), dtype=float
+        ).ravel()
+        (
+            hierarchical_rescue_labels,
+            hierarchical_diagnostics,
+        ) = _select_metaspot_hierarchical_cell_rescues(
+            rescue_cell_ids,
+            broad_values,
+            exploratory_supported,
+            original_counts,
+            original_distinct_genes,
+            scores,
+            dgi_available,
+            dgi_support,
+            cell_marker_counts,
+            cell_marker_genes,
+            cell_marker_enrichment,
+            cell_marker_p,
+            metaspot_total_transcripts,
+            labels=cell_coverage_labels,
+            all_labels=labels,
+            allowed=allowed,
+            min_cell_transcripts=hierarchical_min_cell_transcripts,
+            min_metaspots=hierarchical_min_metaspots,
+            min_presence_score=hierarchical_min_presence_score,
+            min_localization_score=(
+                hierarchical_min_localization_score
+            ),
+            min_joint_score=hierarchical_min_joint_score,
+            min_local_marker_transcripts=(
+                hierarchical_min_local_transcripts
+            ),
+            min_local_marker_genes=hierarchical_min_local_genes,
+            min_cell_marker_transcripts=(
+                hierarchical_min_cell_marker_transcripts
+            ),
+            min_cell_marker_genes=(
+                hierarchical_min_cell_marker_genes
+            ),
+            min_dgi_support=hierarchical_min_dgi_support,
+            min_dgi_margin=hierarchical_min_dgi_margin,
+        )
+    hierarchical_cell_rescued = hierarchical_rescue_labels != ""
+    for fine_idx, label in enumerate(fine_structure_labels):
+        rows = hierarchical_rescue_labels == label
+        hierarchical_rescue_labels[
+            rows
+            & (
+                multistructure_spatial_coherence[:, fine_idx]
+                < min_spatial_coherence[fine_idx]
+            )
+        ] = ""
+    hierarchical_cell_rescued = hierarchical_rescue_labels != ""
+    cell_coverage_rescue_labels[hierarchical_cell_rescued] = (
+        hierarchical_rescue_labels[hierarchical_cell_rescued]
+    )
+    exploratory_supported |= hierarchical_cell_rescued
+    all_cell_coverage_rescued = (
+        cell_coverage_rescued | hierarchical_cell_rescued
+    )
+
+    cell_coverage_local_counts = np.full(n_obs, np.nan, dtype=float)
+    cell_coverage_local_genes = np.full(n_obs, np.nan, dtype=float)
+    cell_coverage_local_enrichment = np.full(n_obs, np.nan, dtype=float)
+    cell_coverage_dgi_support = np.full(n_obs, np.nan, dtype=float)
+    cell_coverage_dgi_margin = np.full(n_obs, np.nan, dtype=float)
+    cell_coverage_cell_counts = np.full(n_obs, np.nan, dtype=float)
+    cell_coverage_cell_genes = np.full(n_obs, np.nan, dtype=float)
+    cell_coverage_cell_enrichment = np.full(n_obs, np.nan, dtype=float)
+    cell_coverage_cell_p = np.full(n_obs, np.nan, dtype=float)
+    for rescue_label in cell_coverage_labels:
+        rescue_rows = np.flatnonzero(
+            all_cell_coverage_rescued
+            & (cell_coverage_rescue_labels == rescue_label)
+        )
+        if rescue_rows.size == 0:
+            continue
+        rescue_idx = label_to_idx[rescue_label]
+        compartment = _label_compartment(rescue_label)
+        alternative_indices = np.asarray(
+            [
+                label_to_idx[label]
+                for label in allowed[str(compartment)]
+                if label != rescue_label
+            ],
+            dtype=np.int64,
+        )
+        alternative_support = np.max(
+            dgi_support[np.ix_(rescue_rows, alternative_indices)],
+            axis=1,
+        ) if alternative_indices.size else np.zeros(rescue_rows.size)
+        cell_coverage_local_counts[rescue_rows] = original_counts[
+            rescue_rows, rescue_idx
+        ]
+        cell_coverage_local_genes[rescue_rows] = original_distinct_genes[
+            rescue_rows, rescue_idx
+        ]
+        cell_coverage_local_enrichment[rescue_rows] = scores[
+            rescue_rows, rescue_idx
+        ]
+        cell_coverage_dgi_support[rescue_rows] = dgi_support[
+            rescue_rows, rescue_idx
+        ]
+        cell_coverage_dgi_margin[rescue_rows] = (
+            dgi_support[rescue_rows, rescue_idx] - alternative_support
+        )
+        cell_coverage_cell_counts[rescue_rows] = cell_marker_counts[
+            rescue_rows, rescue_idx
+        ]
+        cell_coverage_cell_genes[rescue_rows] = cell_marker_genes[
+            rescue_rows, rescue_idx
+        ]
+        cell_coverage_cell_enrichment[rescue_rows] = cell_marker_enrichment[
+            rescue_rows, rescue_idx
+        ]
+        cell_coverage_cell_p[rescue_rows] = cell_marker_p[
+            rescue_rows, rescue_idx
+        ]
+
+    strict_labels = np.asarray(fallback.astype(str), dtype=object)
+    exploratory_labels = np.asarray(fallback.astype(str), dtype=object)
+    strict_labels[strict_supported] = candidate[strict_supported]
+    exploratory_labels[exploratory_supported] = candidate[
+        exploratory_supported
+    ]
+    exploratory_labels[labelwise_cell_coverage_rescued] = (
+        cell_coverage_rescue_labels[labelwise_cell_coverage_rescued]
+    )
+    exploratory_labels[hierarchical_cell_rescued] = (
+        hierarchical_rescue_labels[hierarchical_cell_rescued]
+    )
+    supported_after_hierarchical_rescue = exploratory_supported.copy()
+    first_locus_labels, first_locus_diagnostics = (
+        _select_metaspot_multistructure_first_loci(
+            rescue_cell_ids,
+            exploratory_labels,
+            exploratory_supported,
+            multistructure_presence,
+            multistructure_localization,
+            multistructure_evidence,
+            multistructure_spatial_coherence,
+            structure_geometry,
+            original_counts[:, fine_structure_indices],
+            original_distinct_genes[:, fine_structure_indices],
+            cell_marker_counts[:, fine_structure_indices],
+            cell_marker_genes[:, fine_structure_indices],
+            cell_marker_enrichment[:, fine_structure_indices],
+            cell_marker_p[:, fine_structure_indices],
+            dgi_available,
+            metaspot_total_transcripts,
+            structures=(fine_structure_labels if first_locus_enabled else []),
+            min_presence_score=first_locus_min_presence,
+            min_localization_score=first_locus_min_localization,
+            min_spatial_coherence=min_spatial_coherence,
+            min_evidence_score=first_locus_min_evidence,
+            min_local_marker_transcripts=np.asarray(
+                [1] * len(fine_structure_labels)
+            ),
+            min_local_marker_genes=np.asarray(
+                [1] * len(fine_structure_labels)
+            ),
+            min_cell_marker_transcripts=np.asarray(
+                [cell_coverage_min_transcripts] * 4
+                + [omm_cell_min_transcripts]
+            ),
+            min_cell_marker_genes=np.asarray(
+                [cell_coverage_min_genes] * 4 + [omm_cell_min_genes]
+            ),
+            min_cell_marker_enrichment=np.asarray(
+                [cell_coverage_min_enrichment] * 4 + [omm_cell_min_enrichment]
+            ),
+            max_cell_marker_p=np.asarray(
+                [cell_coverage_max_p] * 4 + [omm_cell_max_p]
+            ),
+            max_projected_burden=first_locus_max_projected_burden,
+        )
+    )
+    first_locus_selected = first_locus_labels != ""
+    exploratory_labels[first_locus_selected] = first_locus_labels[
+        first_locus_selected
+    ]
+    exploratory_supported[first_locus_selected] = True
+    final_labels = exploratory_labels.copy()
+    diminishing_return_labels_before = final_labels.copy()
+    _, diminishing_return_diagnostics = (
+        _apply_metaspot_diminishing_return_selection(
+            rescue_cell_ids,
+            final_labels,
+            strict_supported,
+            broad_values,
+            scores,
+            dgi_support,
+            metaspot_total_transcripts,
+            enabled_labels=(
+                diminishing_return_labels
+                if diminishing_return_enabled
+                else []
+            ),
+            all_labels=labels,
+            allowed=allowed,
+            min_local_enrichment=threshold_arrays[
+                "min_log2_enrichment"
+            ],
+            dgi_weight=dgi_consensus_weight,
+            min_dgi_support=diminishing_return_min_dgi_support,
+            log_penalty=diminishing_return_log_penalty,
+            burden_penalty=diminishing_return_burden_penalty,
+        )
+    )
+    diminishing_return_pruned = diminishing_return_diagnostics["pruned"]
+    exploratory_supported[diminishing_return_pruned] = False
+    exploratory_labels[diminishing_return_pruned] = np.asarray(
+        fallback.astype(str), dtype=object
+    )[diminishing_return_pruned]
+    final_labels[diminishing_return_pruned] = exploratory_labels[
+        diminishing_return_pruned
+    ]
+    omm_evidence_tier = np.full(n_obs, "Not selected", dtype=object)
+    omm_evidence_tier[omm_cell_exploratory_candidate] = "Exploratory"
+    omm_evidence_tier[final_labels == "OMM"] = "Supported"
+    omm_evidence_tier[
+        diminishing_return_pruned
+        & (diminishing_return_labels_before == "OMM")
+    ] = "Diminishing-return pruned"
+    tier = np.full(n_obs, "Broad-prior fallback", dtype=object)
+    tier[exploratory_supported] = "Exploratory local evidence"
+    tier[
+        dgi_exploratory_supported & exploratory_supported
+    ] = "DGI-supported exploratory evidence"
+    tier[strict_supported] = "Strict local evidence"
+    decision_provenance = np.full(
+        n_obs,
+        "broad_prior_fallback",
+        dtype=object,
+    )
+    decision_provenance[exploratory_supported] = "local_exploratory"
+    decision_provenance[
+        dgi_exploratory_supported & exploratory_supported
+    ] = "local_marker_plus_dgi_exploratory"
+    decision_provenance[strict_supported] = "local_strict"
+    tier[omm_cell_coherent_rescued] = "Cell-coherent OMM evidence"
+    decision_provenance[omm_cell_coherent_rescued] = (
+        "cell_multigene_plus_local_dgi_omm"
+    )
+    tier[cell_coverage_rescued] = "Cell-coherent fine-structure evidence"
+    decision_provenance[cell_coverage_rescued] = (
+        "cell_multigene_plus_local_marker_plus_dgi"
+    )
+    decision_provenance[labelwise_cell_coverage_rescued] = (
+        "labelwise_cell_multigene_plus_local_marker_plus_dgi"
+    )
+    tier[hierarchical_cell_rescued] = (
+        "Tier-B callable-cell multiscale evidence"
+    )
+    decision_provenance[hierarchical_cell_rescued] = (
+        "callable_cell_presence_plus_local_marker_plus_dgi"
+    )
+    tier[first_locus_selected] = "Multi-structure supported first locus"
+    decision_provenance[first_locus_selected] = (
+        "cell_presence_plus_multistructure_localization_first_locus"
+    )
+
+    omm_confirmation_status = np.full(
+        n_obs,
+        "not_applicable",
+        dtype=object,
+    )
+    omm_strict_local_candidate = np.zeros(n_obs, dtype=bool)
+    omm_strict_local_fallback = np.zeros(n_obs, dtype=bool)
+    if omm_confirmation_mode == "disabled":
+        omm_confirmation_status[is_omm] = "confirmation_disabled"
+    elif omm_confirmation_mode == "identifiable":
+        omm_confirmation_status[is_omm] = "not_confirmed"
+        omm_confirmation_status[is_omm & omm_confirmed] = "confirmed"
+        confirmed_supported = is_omm & exploratory_supported
+        decision_provenance[confirmed_supported] = (
+            "local_plus_omm_confirmation_exploratory"
+        )
+        decision_provenance[
+            confirmed_supported & dgi_exploratory_supported
+        ] = (
+            "local_marker_plus_dgi_plus_omm_confirmation_exploratory"
+        )
+        decision_provenance[is_omm & strict_supported] = (
+            "local_plus_omm_confirmation_strict"
+        )
+    else:
+        omm_strict_local_candidate = is_omm & local_strict_supported
+        omm_confirmation_status[is_omm] = (
+            f"{omm_confirmation_mode}_strict_local_required"
+        )
+        if omm_unidentifiable_policy == "strict_local":
+            omm_strict_local_fallback = omm_strict_local_candidate.copy()
+            omm_confirmation_status[omm_strict_local_fallback] = (
+                f"{omm_confirmation_mode}_strict_local_fallback"
+            )
+            tier[omm_strict_local_fallback] = (
+                "Strict local evidence "
+                f"(OMM confirmation {omm_confirmation_mode})"
+            )
+            decision_provenance[omm_strict_local_fallback] = (
+                "local_only_strict_omm_confirmation_"
+                f"{omm_confirmation_mode}"
+            )
+        else:
+            omm_confirmation_status[omm_strict_local_candidate] = (
+                f"{omm_confirmation_mode}_strict_local_unresolved"
+            )
+    omm_confirmation_status[omm_cell_coherent_rescued] = (
+        f"{omm_confirmation_mode}_cell_coherent_fallback"
+    )
+    omm_confirmation_status[omm_cell_exploratory_candidate] = (
+        f"{omm_confirmation_mode}_cell_coherent_exploratory"
+    )
+    omm_confirmation_status[
+        first_locus_selected & (first_locus_labels == "OMM")
+    ] = f"{omm_confirmation_mode}_multistructure_first_locus"
+    tier[diminishing_return_pruned] = "Diminishing-return pruned"
+    decision_provenance[diminishing_return_pruned] = (
+        "diminishing_return_pruned"
+    )
+
+    fallback_reason = np.full(n_obs, "broad_label_wins", dtype=object)
+    subtype_rows = candidate_is_subtype
+    fallback_reason[subtype_rows] = "q_above_exploratory_threshold"
+    fallback_reason[subtype_rows & ~candidate_spatial_coherence_pass] = (
+        "insufficient_spatial_coherence"
+    )
+    fallback_reason[subtype_rows & ~enough_dgi_support] = (
+        "insufficient_dgi_support"
+    )
+    fallback_reason[subtype_rows & ~enough_gap] = "ambiguous_local_scores"
+    fallback_reason[subtype_rows & ~enough_enrichment] = "weak_enrichment"
+    fallback_reason[subtype_rows & ~enough_genes] = (
+        "insufficient_marker_genes"
+    )
+    fallback_reason[subtype_rows & ~enough_counts] = (
+        "insufficient_marker_transcripts"
+    )
+    fallback_reason[subtype_rows & (local_totals <= 0)] = (
+        "no_measured_reference_markers"
+    )
+    if require_omm and omm_confirmation_mode == "identifiable":
+        confirmation_veto = (
+            is_omm & local_exploratory_supported & ~omm_confirmed
+        )
+        fallback_reason[confirmation_veto] = "omm_not_confirmed"
+    elif require_omm and omm_confirmation_mode in {
+        "unidentifiable",
+        "unavailable",
+    }:
+        if omm_unidentifiable_policy == "strict_local":
+            strict_required = (
+                is_omm
+                & local_exploratory_supported
+                & ~local_strict_supported
+            )
+            fallback_reason[strict_required] = (
+                f"omm_confirmation_{omm_confirmation_mode}_"
+                "requires_strict_local"
+            )
+        else:
+            unresolved_omm = is_omm & local_exploratory_supported
+            fallback_reason[unresolved_omm] = (
+                f"omm_confirmation_{omm_confirmation_mode}_unresolved"
+            )
+    fallback_reason[omm_cell_exploratory_candidate] = (
+        "omm_cell_evidence_exploratory_only"
+    )
+    fallback_reason[exploratory_supported] = "none"
+    fallback_reason[diminishing_return_pruned] = (
+        "diminishing_return_penalty"
+    )
+
+    # Production output must use evidence-gated labels.  Unsupported
+    # fine-structure candidates fall back to the broad Nucleus/Cytosol prior.
+    fallback_array = np.asarray(fallback.astype(str), dtype=object)
+    fine_labels = np.asarray(final_labels, dtype=object).copy()
+
+    invalid_fine_label = (
+        pd.isna(fine_labels)
+        | np.isin(
+            fine_labels.astype(str),
+            ["", "Unknown", "nan", "None"],
+        )
+    )
+    fine_labels[invalid_fine_label] = fallback_array[invalid_fine_label]
+
+    # This state records why a public label was emitted.  It does not alter
+    # the label itself.
+    fine_state = np.full(
+        n_obs,
+        "Broad-prior fallback",
+        dtype=object,
+    )
+    fine_state[
+        exploratory_supported
+    ] = "Exploratory-supported fine structure"
+    fine_state[
+        dgi_exploratory_supported & exploratory_supported
+    ] = "DGI-supported exploratory fine structure"
+    fine_state[
+        strict_supported
+    ] = "Strict-supported fine structure"
+    fine_state[cell_coverage_rescued] = (
+        "Cell-coherent multi-gene fine structure"
+    )
+    fine_state[hierarchical_cell_rescued] = (
+        "Tier-B callable-cell fine structure"
+    )
+    fine_state[first_locus_selected] = (
+        "Multi-structure evidence-supported first locus"
+    )
+    fine_state[omm_cell_coherent_rescued] = (
+        "Cell-coherent multi-gene OMM evidence"
+    )
+    fine_state[diminishing_return_pruned] = "Diminishing-return pruned"
+
+    dgi_branch_used = (
+        candidate_is_subtype
+        & dgi_available
+        & (dgi_consensus_weight > 0.0)
+    )
+
+    adata1.obs = adata1.obs.drop(
+        columns=[
+            "subcellular_annotation_compatibility",
+            "subcellular_annotation_metaspot_compatibility",
+        ],
+        errors="ignore",
+    )
+    # Public final label uses the same evidence-gated production decision as
+    # the MetaSpot production column. Build every public/audit field first and
+    # attach them in one operation so obs does not acquire one block per field.
+    _replace_obs_columns(
+        adata1,
+        {
+            "subcellular_annotation_metaspot_parent": pd.Categorical(fallback),
+            "subcellular_annotation_metaspot_candidate": pd.Categorical(candidate),
+            "subcellular_annotation_metaspot_strict": pd.Categorical(strict_labels),
+            "subcellular_annotation_metaspot_exploratory": pd.Categorical(exploratory_labels),
+            "subcellular_annotation_metaspot": pd.Categorical(final_labels),
+            "subcellular_annotation": pd.Categorical(fine_labels),
+            "subcellular_candidate": candidate,
+            "subcellular_broad_compartment": pd.Categorical(broad_values),
+            "subcellular_fine_annotation": pd.Categorical(fine_labels),
+            "subcellular_fine_state": pd.Categorical(fine_state),
+            "subcellular_fine_supported": exploratory_supported,
+            "subcellular_metaspot_marker_only_candidate": pd.Categorical(marker_only_candidate),
+            "subcellular_annotation_strict": pd.Categorical(strict_labels),
+            "subcellular_annotation_exploratory": pd.Categorical(exploratory_labels),
+            "subcellular_annotation_tier": pd.Categorical(tier),
+            "subcellular_metaspot_decision_provenance": pd.Categorical(decision_provenance),
+            "subcellular_metaspot_omm_confirmation_status": pd.Categorical(omm_confirmation_status),
+            "subcellular_metaspot_pool_size": pool_size,
+            "subcellular_metaspot_candidate_marker_transcripts": candidate_counts.astype(np.float32),
+            "subcellular_metaspot_candidate_marker_genes": candidate_genes,
+            "subcellular_metaspot_log2_enrichment": candidate_scores.astype(np.float32),
+            "subcellular_metaspot_spatial_coherence": candidate_spatial_coherence.astype(np.float32),
+            "subcellular_metaspot_spatial_coherence_pass": candidate_spatial_coherence_pass,
+            **(
+                {
+                    "subcellular_metaspot_candidate_neighbor_pooled_marker_transcripts": candidate_pooled_counts.astype(np.float32),
+                    "subcellular_metaspot_candidate_neighbor_pooled_marker_genes": candidate_pooled_genes,
+                    "subcellular_metaspot_neighbor_pooled_log2_enrichment": candidate_pooled_scores.astype(np.float32),
+                    "subcellular_metaspot_fused_score": candidate_fused_scores.astype(np.float32),
+                }
+                if build_score_table
+                else {}
+            ),
+            "subcellular_metaspot_marker_only_score_gap": marker_candidate_gap.astype(np.float32),
+            "subcellular_metaspot_score_gap": score_gap.astype(np.float32),
+            "subcellular_metaspot_dgi_support": candidate_dgi_support.astype(np.float32),
+            "subcellular_metaspot_dgi_margin": candidate_dgi_margin.astype(np.float32),
+            "subcellular_metaspot_dgi_informative_neighbors": dgi_informative_neighbors,
+            "subcellular_metaspot_dgi_branch_used": dgi_branch_used,
+            "subcellular_metaspot_dgi_exploratory_supported": dgi_exploratory_supported & exploratory_supported,
+            "subcellular_metaspot_cell_coverage_rescued": cell_coverage_rescued,
+            "subcellular_metaspot_labelwise_cell_coverage_rescued": labelwise_cell_coverage_rescued,
+            "subcellular_metaspot_hierarchical_cell_rescued": hierarchical_cell_rescued,
+            "subcellular_metaspot_cell_coverage_rescue_label": pd.Categorical(cell_coverage_rescue_labels),
+            "subcellular_metaspot_hierarchical_cell_callable": hierarchical_diagnostics["callable"],
+            "subcellular_metaspot_hierarchical_cell_eligible": hierarchical_diagnostics["eligible_cell"],
+            "subcellular_metaspot_hierarchical_cell_status": pd.Categorical(hierarchical_diagnostics["status"]),
+            "subcellular_metaspot_hierarchical_best_label": pd.Categorical(hierarchical_diagnostics["best_label"]),
+            "subcellular_metaspot_hierarchical_cell_total_transcripts": hierarchical_diagnostics["cell_total_transcripts"].astype(np.float32),
+            "subcellular_metaspot_hierarchical_cell_metaspots": hierarchical_diagnostics["cell_metaspots"].astype(np.float32),
+            "subcellular_metaspot_hierarchical_presence_score": hierarchical_diagnostics["presence_score"].astype(np.float32),
+            "subcellular_metaspot_hierarchical_localization_score": hierarchical_diagnostics["localization_score"].astype(np.float32),
+            "subcellular_metaspot_hierarchical_joint_score": hierarchical_diagnostics["joint_score"].astype(np.float32),
+            "subcellular_metaspot_hierarchical_best_presence_score": hierarchical_diagnostics["best_presence_score"].astype(np.float32),
+            "subcellular_metaspot_hierarchical_best_localization_score": hierarchical_diagnostics["best_localization_score"].astype(np.float32),
+            "subcellular_metaspot_hierarchical_best_joint_score": hierarchical_diagnostics["best_joint_score"].astype(np.float32),
+            "subcellular_metaspot_hierarchical_best_dgi_support": hierarchical_diagnostics["best_dgi_support"].astype(np.float32),
+            "subcellular_metaspot_hierarchical_best_dgi_margin": hierarchical_diagnostics["best_dgi_margin"].astype(np.float32),
+            "subcellular_metaspot_multistructure_first_locus_selected": first_locus_selected,
+            "subcellular_metaspot_multistructure_first_locus_label": pd.Categorical(first_locus_labels),
+            "subcellular_metaspot_multistructure_first_locus_eligible": first_locus_diagnostics["eligible"],
+            "subcellular_metaspot_multistructure_first_locus_burden_rejected": first_locus_diagnostics["burden_rejected"],
+            "subcellular_metaspot_multistructure_first_locus_presence_score": first_locus_diagnostics["presence_score"].astype(np.float32),
+            "subcellular_metaspot_multistructure_first_locus_localization_score": first_locus_diagnostics["localization_score"].astype(np.float32),
+            "subcellular_metaspot_multistructure_first_locus_evidence_score": first_locus_diagnostics["evidence_score"].astype(np.float32),
+            "subcellular_metaspot_multistructure_first_locus_spatial_coherence": first_locus_diagnostics["spatial_coherence"].astype(np.float32),
+            "subcellular_metaspot_multistructure_first_locus_projected_burden": first_locus_diagnostics["projected_burden"].astype(np.float32),
+            "subcellular_metaspot_diminishing_return_eligible": diminishing_return_diagnostics["eligible"],
+            "subcellular_metaspot_diminishing_return_pruned": diminishing_return_pruned,
+            "subcellular_metaspot_diminishing_return_original_label": pd.Categorical(diminishing_return_labels_before),
+            "subcellular_metaspot_diminishing_return_first_locus": diminishing_return_diagnostics["first_locus"],
+            "subcellular_metaspot_diminishing_return_rank": diminishing_return_diagnostics["rank"],
+            "subcellular_metaspot_diminishing_return_evidence_score": diminishing_return_diagnostics["evidence_score"].astype(np.float32),
+            "subcellular_metaspot_diminishing_return_required_score": diminishing_return_diagnostics["required_score"].astype(np.float32),
+            "subcellular_metaspot_diminishing_return_burden_before": diminishing_return_diagnostics["burden_before"].astype(np.float32),
+            "subcellular_metaspot_cell_coverage_local_marker_transcripts": cell_coverage_local_counts.astype(np.float32),
+            "subcellular_metaspot_cell_coverage_local_marker_genes": cell_coverage_local_genes,
+            "subcellular_metaspot_cell_coverage_local_log2_enrichment": cell_coverage_local_enrichment.astype(np.float32),
+            "subcellular_metaspot_cell_coverage_dgi_support": cell_coverage_dgi_support.astype(np.float32),
+            "subcellular_metaspot_cell_coverage_dgi_margin": cell_coverage_dgi_margin.astype(np.float32),
+            "subcellular_metaspot_cell_coverage_cell_marker_transcripts": cell_coverage_cell_counts.astype(np.float32),
+            "subcellular_metaspot_cell_coverage_cell_marker_genes": cell_coverage_cell_genes,
+            "subcellular_metaspot_cell_coverage_cell_log2_enrichment": cell_coverage_cell_enrichment.astype(np.float32),
+            "subcellular_metaspot_cell_coverage_cell_binomial_p": cell_coverage_cell_p,
+            "subcellular_metaspot_cell_marker_transcripts": candidate_cell_counts.astype(np.float32),
+            "subcellular_metaspot_cell_marker_genes": candidate_cell_genes,
+            "subcellular_metaspot_cell_log2_enrichment": candidate_cell_enrichment.astype(np.float32),
+            "subcellular_metaspot_cell_binomial_p": candidate_cell_p,
+            "subcellular_metaspot_cell_bh_q": candidate_cell_q,
+            "subcellular_metaspot_omm_cell_coherent_rescued": omm_cell_coherent_rescued,
+            "subcellular_metaspot_omm_exploratory_candidate": omm_cell_exploratory_candidate,
+            "subcellular_metaspot_omm_evidence_tier": pd.Categorical(omm_evidence_tier),
+            "subcellular_metaspot_omm_cell_marker_transcripts": omm_cell_counts.astype(np.float32),
+            "subcellular_metaspot_omm_cell_marker_genes": omm_cell_genes,
+            "subcellular_metaspot_omm_cell_log2_enrichment": omm_cell_enrichment.astype(np.float32),
+            "subcellular_metaspot_omm_cell_binomial_p": omm_cell_p,
+            "subcellular_metaspot_omm_cell_bh_q": omm_cell_q,
+            "subcellular_metaspot_binomial_p": candidate_p,
+            "subcellular_metaspot_bh_q": candidate_q,
+            "subcellular_metaspot_supported": exploratory_supported,
+            "subcellular_metaspot_candidate_min_marker_transcripts": candidate_min_transcripts,
+            "subcellular_metaspot_candidate_min_marker_genes": candidate_min_genes,
+            "subcellular_metaspot_candidate_min_log2_enrichment": candidate_min_enrichment.astype(np.float32),
+            "subcellular_metaspot_candidate_min_score_gap": candidate_min_gap.astype(np.float32),
+            "subcellular_metaspot_candidate_strict_fdr": candidate_strict_fdr.astype(np.float32),
+            "subcellular_metaspot_candidate_exploratory_max_q": candidate_exploratory_q.astype(np.float32),
+            "subcellular_metaspot_fallback_reason": pd.Categorical(fallback_reason),
+        },
+    )
+    obs = adata1.obs
+
+    score_table = (
+        pd.DataFrame(
+            {
+            "metaspot": obs.get(
+                "metaspot",
+                pd.Series(obs.index, index=obs.index),
+            ).astype(str).to_numpy(),
+            "cell_id": obs["cell_id"].astype(str).to_numpy(),
+            "broad_compartment": broad_values,
+            "broad_parent": fallback.astype(str).to_numpy(),
+            "fine_annotation": fine_labels,
+            "fine_state": fine_state,
+            "fine_supported": exploratory_supported,
+            "marker_only_candidate": marker_only_candidate,
+            "candidate": candidate,
+            "strict_annotation": strict_labels,
+            "exploratory_annotation": exploratory_labels,
+            "final_annotation": fine_labels,
+            "evidence_tier": tier,
+            "decision_provenance": decision_provenance,
+            "omm_confirmation_status": omm_confirmation_status,
+            "fallback_reason": fallback_reason,
+            "pool_size": pool_size,
+            "candidate_marker_transcripts": candidate_counts,
+            "candidate_marker_genes": candidate_genes,
+            "candidate_log2_enrichment": candidate_scores,
+            "candidate_spatial_coherence": candidate_spatial_coherence,
+            "candidate_spatial_coherence_pass": candidate_spatial_coherence_pass,
+            "candidate_neighbor_pooled_marker_transcripts": (
+                candidate_pooled_counts
+            ),
+            "candidate_neighbor_pooled_marker_genes": (
+                candidate_pooled_genes
+            ),
+            "candidate_neighbor_pooled_log2_enrichment": (
+                candidate_pooled_scores
+            ),
+            "candidate_fused_score": candidate_fused_scores,
+            "marker_only_score_gap": marker_candidate_gap,
+            "candidate_score_gap": score_gap,
+            "candidate_dgi_support": candidate_dgi_support,
+            "candidate_dgi_margin": candidate_dgi_margin,
+            "dgi_informative_neighbors": dgi_informative_neighbors,
+            "dgi_branch_used": dgi_branch_used,
+            "dgi_exploratory_supported": (
+                dgi_exploratory_supported & exploratory_supported
+            ),
+            "cell_coverage_rescued": cell_coverage_rescued,
+            "labelwise_cell_coverage_rescued": (
+                labelwise_cell_coverage_rescued
+            ),
+            "hierarchical_cell_rescued": hierarchical_cell_rescued,
+            "cell_coverage_rescue_label": cell_coverage_rescue_labels,
+            "hierarchical_cell_callable": hierarchical_diagnostics[
+                "callable"
+            ],
+            "hierarchical_cell_eligible": hierarchical_diagnostics[
+                "eligible_cell"
+            ],
+            "hierarchical_cell_status": hierarchical_diagnostics[
+                "status"
+            ],
+            "hierarchical_best_label": hierarchical_diagnostics[
+                "best_label"
+            ],
+            "hierarchical_cell_total_transcripts": hierarchical_diagnostics[
+                "cell_total_transcripts"
+            ],
+            "hierarchical_cell_metaspots": hierarchical_diagnostics[
+                "cell_metaspots"
+            ],
+            "hierarchical_presence_score": hierarchical_diagnostics[
+                "presence_score"
+            ],
+            "hierarchical_localization_score": hierarchical_diagnostics[
+                "localization_score"
+            ],
+            "hierarchical_joint_score": hierarchical_diagnostics[
+                "joint_score"
+            ],
+            "hierarchical_best_presence_score": hierarchical_diagnostics[
+                "best_presence_score"
+            ],
+            "hierarchical_best_localization_score": hierarchical_diagnostics[
+                "best_localization_score"
+            ],
+            "hierarchical_best_joint_score": hierarchical_diagnostics[
+                "best_joint_score"
+            ],
+            "hierarchical_best_dgi_support": hierarchical_diagnostics[
+                "best_dgi_support"
+            ],
+            "hierarchical_best_dgi_margin": hierarchical_diagnostics[
+                "best_dgi_margin"
+            ],
+            "multistructure_first_locus_selected": first_locus_selected,
+            "multistructure_first_locus_label": first_locus_labels,
+            "multistructure_first_locus_eligible": first_locus_diagnostics[
+                "eligible"
+            ],
+            "multistructure_first_locus_burden_rejected": (
+                first_locus_diagnostics["burden_rejected"]
+            ),
+            "multistructure_first_locus_presence_score": (
+                first_locus_diagnostics["presence_score"]
+            ),
+            "multistructure_first_locus_localization_score": (
+                first_locus_diagnostics["localization_score"]
+            ),
+            "multistructure_first_locus_evidence_score": (
+                first_locus_diagnostics["evidence_score"]
+            ),
+            "multistructure_first_locus_spatial_coherence": (
+                first_locus_diagnostics["spatial_coherence"]
+            ),
+            "multistructure_first_locus_projected_burden": (
+                first_locus_diagnostics["projected_burden"]
+            ),
+            "diminishing_return_eligible": diminishing_return_diagnostics[
+                "eligible"
+            ],
+            "diminishing_return_pruned": diminishing_return_pruned,
+            "diminishing_return_original_label": (
+                diminishing_return_labels_before
+            ),
+            "diminishing_return_first_locus": diminishing_return_diagnostics[
+                "first_locus"
+            ],
+            "diminishing_return_rank": diminishing_return_diagnostics[
+                "rank"
+            ],
+            "diminishing_return_evidence_score": diminishing_return_diagnostics[
+                "evidence_score"
+            ],
+            "diminishing_return_required_score": diminishing_return_diagnostics[
+                "required_score"
+            ],
+            "diminishing_return_burden_before": diminishing_return_diagnostics[
+                "burden_before"
+            ],
+            "cell_coverage_local_marker_transcripts": (
+                cell_coverage_local_counts
+            ),
+            "cell_coverage_local_marker_genes": cell_coverage_local_genes,
+            "cell_coverage_local_log2_enrichment": (
+                cell_coverage_local_enrichment
+            ),
+            "cell_coverage_dgi_support": cell_coverage_dgi_support,
+            "cell_coverage_dgi_margin": cell_coverage_dgi_margin,
+            "cell_coverage_cell_marker_transcripts": (
+                cell_coverage_cell_counts
+            ),
+            "cell_coverage_cell_marker_genes": cell_coverage_cell_genes,
+            "cell_coverage_cell_log2_enrichment": (
+                cell_coverage_cell_enrichment
+            ),
+            "cell_coverage_cell_binomial_p": cell_coverage_cell_p,
+            "candidate_cell_marker_transcripts": candidate_cell_counts,
+            "candidate_cell_marker_genes": candidate_cell_genes,
+            "candidate_cell_log2_enrichment": candidate_cell_enrichment,
+            "candidate_cell_binomial_p": candidate_cell_p,
+            "candidate_cell_bh_q": candidate_cell_q,
+            "omm_cell_coherent_rescued": omm_cell_coherent_rescued,
+            "omm_cell_exploratory_candidate": omm_cell_exploratory_candidate,
+            "omm_evidence_tier": omm_evidence_tier,
+            "omm_cell_marker_transcripts": omm_cell_counts,
+            "omm_cell_marker_genes": omm_cell_genes,
+            "omm_cell_log2_enrichment": omm_cell_enrichment,
+            "omm_cell_binomial_p": omm_cell_p,
+            "omm_cell_bh_q": omm_cell_q,
+            "candidate_binomial_p": candidate_p,
+            "candidate_bh_q": candidate_q,
+            "candidate_min_marker_transcripts": (
+                candidate_min_transcripts
+            ),
+            "candidate_min_marker_genes": candidate_min_genes,
+            "candidate_min_log2_enrichment": candidate_min_enrichment,
+            "candidate_min_score_gap": candidate_min_gap,
+            "candidate_strict_fdr": candidate_strict_fdr,
+            "candidate_exploratory_max_q": candidate_exploratory_q,
+            "candidate_min_dgi_support": candidate_min_dgi_support,
+            "candidate_min_dgi_margin": candidate_min_dgi_margin,
+            "subtype_supported": exploratory_supported,
+            }
+        )
+        if build_score_table
+        else None
+    )
+    for label_idx, label in enumerate(labels):
+        if score_table is None:
+            break
+        suffix = label.lower().replace(" ", "_")
+        score_table[f"marker_transcripts__{suffix}"] = original_counts[
+            :, label_idx
+        ]
+        score_table[f"marker_genes__{suffix}"] = original_distinct_genes[
+            :, label_idx
+        ]
+        score_table[f"log2_enrichment__{suffix}"] = scores[:, label_idx]
+        score_table[f"bh_q__{suffix}"] = q_values[:, label_idx]
+        score_table[
+            f"neighbor_pooled_marker_transcripts__{suffix}"
+        ] = pooled_counts[:, label_idx]
+        score_table[
+            f"neighbor_pooled_log2_enrichment__{suffix}"
+        ] = pooled_scores[:, label_idx]
+        score_table[f"dgi_support__{suffix}"] = dgi_support[:, label_idx]
+        score_table[f"fused_score__{suffix}"] = fused_scores[:, label_idx]
+        if label in fine_structure_labels:
+            fine_idx = fine_structure_labels.index(label)
+            score_table[f"presence_score__{suffix}"] = (
+                multistructure_presence[:, fine_idx]
+            )
+            score_table[f"localization_score__{suffix}"] = (
+                multistructure_localization[:, fine_idx]
+            )
+            score_table[f"structure_evidence__{suffix}"] = (
+                multistructure_evidence[:, fine_idx]
+            )
+            score_table[f"spatial_coherence__{suffix}"] = (
+                multistructure_spatial_coherence[:, fine_idx]
+            )
+
+    if cell_codes is None or unique_cells is None:
+        metadata_cell_codes, metadata_unique_cells = pd.factorize(
+            adata1.obs["cell_id"],
+            sort=False,
+        )
+    else:
+        metadata_cell_codes = cell_codes
+        metadata_unique_cells = unique_cells
+    if len(metadata_unique_cells) <= np.iinfo(np.int32).max:
+        metadata_cell_codes = metadata_cell_codes.astype(
+            np.int32,
+            copy=False,
+        )
+    metadata_valid_cells = metadata_cell_codes >= 0
+    metadata_n_cells = len(metadata_unique_cells)
+
+    def _cell_presence(mask: Sequence[bool]) -> np.ndarray:
+        mask_values = np.asarray(mask, dtype=bool)
+        selected = metadata_cell_codes[metadata_valid_cells & mask_values]
+        if selected.size == 0:
+            return np.zeros(metadata_n_cells, dtype=bool)
+        return np.bincount(
+            selected,
+            minlength=metadata_n_cells,
+        ).astype(bool, copy=False)
+
+    callable_cell_presence = _cell_presence(
+        hierarchical_diagnostics["callable"]
+    )
+    fine_cells_before_hierarchical = _cell_presence(
+        supported_before_hierarchical_rescue
+    )
+    fine_cells_after_hierarchical = _cell_presence(
+        supported_after_hierarchical_rescue
+    )
+    callable_cells_with_fine_before = int(
+        np.count_nonzero(
+            callable_cell_presence & fine_cells_before_hierarchical
+        )
+    )
+    callable_cells_with_fine_after = int(
+        np.count_nonzero(
+            callable_cell_presence & fine_cells_after_hierarchical
+        )
+    )
+    callable_cell_count = int(np.count_nonzero(callable_cell_presence))
+    cell_coverage_rescued_cell_count = int(
+        np.count_nonzero(_cell_presence(cell_coverage_rescued))
+    )
+    hierarchical_rescued_cell_count = int(
+        np.count_nonzero(_cell_presence(hierarchical_cell_rescued))
+    )
+    first_locus_selected_cell_count = int(
+        np.count_nonzero(_cell_presence(first_locus_selected))
+    )
+    omm_rescued_cell_count = int(
+        np.count_nonzero(_cell_presence(omm_cell_coherent_rescued))
+    )
+    omm_exploratory_cell_count = int(
+        np.count_nonzero(_cell_presence(omm_cell_exploratory_candidate))
+    )
+    cell_coverage_cells_before_by_label = {
+        label: int(
+            np.count_nonzero(
+                _cell_presence(
+                    supported_before_cell_coverage & (candidate == label)
+                )
+            )
+        )
+        for label in cell_coverage_labels
+    }
+    cell_coverage_cells_after_by_label = {
+        label: int(
+            np.count_nonzero(
+                _cell_presence(
+                    exploratory_supported & (exploratory_labels == label)
+                )
+            )
+        )
+        for label in cell_coverage_labels
+    }
+    valid_positions = np.flatnonzero(metadata_valid_cells)
+    _, first_valid_offsets = np.unique(
+        metadata_cell_codes[metadata_valid_cells],
+        return_index=True,
+    )
+    first_cell_rows = valid_positions[first_valid_offsets]
+    hierarchical_status_counts = {
+        str(key): int(value)
+        for key, value in pd.Series(
+            np.asarray(hierarchical_diagnostics["status"])[first_cell_rows]
+        ).value_counts().items()
+    }
+
+    metadata: Dict[str, Any] = {
+        "schema_version": 11,
+        "mode": (
+            "metadomain_broad_prior_plus_self_metaspot_marker_evidence_"
+            "plus_leave_one_out_dgi_consensus"
+        ),
+        "hard_evidence_source": "self_metaspot_only",
+        "neighbor_pooling_used_for_hard_evidence": False,
+        "neighbor_pooling_role": "dgi_consensus_and_diagnostics_only",
+        "candidate_selection_source": (
+            "primary_self_metaspot_log2_enrichment_plus_labelwise_"
+            "cell_coherent_rescue_plus_callable_cell_multiscale_rescue_"
+            "plus_multistructure_first_locus"
+        ),
+        "binomial_test_source": "self_metaspot_marker_counts",
+        "prior_unit": "metadomain",
+        "prior_label_column": prior_column,
+        "decision_unit": "metaspot",
+        "multi_structure_evidence": {
+            "schema_version": 3,
+            "structures": list(fine_structure_labels),
+            "interpretation": "bounded_evidence_score_not_probability",
+            "used_for_final_selection": first_locus_enabled,
+            "metaspot_obsm_keys": {
+                "presence": "X_subcellular_structure_presence",
+                "localization": "X_subcellular_structure_localization",
+                "joint": "X_subcellular_structure_evidence",
+                "spatial_coherence": "X_subcellular_structure_spatial_coherence",
+            },
+            "cell_uns_key": "cell_structure_evidence",
+            "presence_weights": {
+                "cell_marker_transcripts": 0.30,
+                "cell_marker_genes": 0.25,
+                "cell_log2_enrichment": 0.25,
+                "one_minus_cell_binomial_p": 0.20,
+            },
+            "localization_weights": {
+                "focal_marker": 0.25,
+                "metadomain_affinity": 0.20,
+                "leave_one_out_dgi_support": 0.20,
+                "geometry_compatibility": 0.10,
+                "competitor_separation": 0.15,
+                "rapx_calibrated_evidence": 0.10,
+            },
+            "joint": "geometric_mean",
+            "selection_role": "missing_cell_structure_first_locus_only",
+        },
+        "spatial_coherence": {
+            "threshold_by_structure": {
+                label: float(min_spatial_coherence[idx])
+                for idx, label in enumerate(fine_structure_labels)
+            },
+            "definition": (
+                "total_variation_between_structure_marker_and_all_transcript_"
+                "metaspot_distributions_within_cell_parent_compartment"
+            ),
+            "role": "shared_hard_gate_for_all_fine_structure_paths",
+        },
+        "pool_rep": rep_key,
+        "pool_k": int(annotation_cfg.get("metaspot_pool_k", 8)),
+        "dgi_consensus_weight": dgi_consensus_weight,
+        "dgi_seed_min_marker_transcripts": dgi_seed_min_transcripts,
+        "dgi_seed_min_marker_genes": dgi_seed_min_genes,
+        "dgi_seed_min_log2_enrichment": dgi_seed_min_enrichment,
+        "dgi_min_informative_neighbors": (
+            dgi_min_informative_neighbors
+        ),
+        "dgi_exploratory_enabled": dgi_exploratory_enabled,
+        "dgi_exploratory_min_support": dgi_exploratory_min_support,
+        "dgi_exploratory_min_margin": dgi_exploratory_min_margin,
+        "require_dgi_support": require_dgi_support,
+        "dgi_branch_used_metaspots": int(dgi_branch_used.sum()),
+        "dgi_exploratory_supported_metaspots": int(
+            (dgi_exploratory_supported & exploratory_supported).sum()
+        ),
+        "multistructure_first_locus_enabled": first_locus_enabled,
+        "multistructure_first_locus_thresholds": {
+            "min_presence_score": first_locus_min_presence,
+            "min_localization_score": first_locus_min_localization,
+            "min_spatial_coherence_by_structure": {
+                label: float(min_spatial_coherence[idx])
+                for idx, label in enumerate(fine_structure_labels)
+            },
+            "min_evidence_score_by_structure": {
+                label: float(first_locus_min_evidence[idx])
+                for idx, label in enumerate(fine_structure_labels)
+            },
+            "max_projected_burden": first_locus_max_projected_burden,
+        },
+        "multistructure_first_locus_selected_metaspots": int(
+            first_locus_selected.sum()
+        ),
+        "multistructure_first_locus_selected_cells": (
+            first_locus_selected_cell_count
+        ),
+        "multistructure_first_locus_burden_rejected_metaspots": int(
+            first_locus_diagnostics["burden_rejected"].sum()
+        ),
+        "multistructure_first_locus_selected_by_label": {
+            label: int(
+                (first_locus_selected & (first_locus_labels == label)).sum()
+            )
+            for label in fine_structure_labels
+        },
+        "diminishing_return_selection_enabled": (
+            diminishing_return_enabled
+        ),
+        "diminishing_return_labels": list(diminishing_return_labels),
+        "diminishing_return_log_penalty": (
+            diminishing_return_log_penalty
+        ),
+        "diminishing_return_burden_penalty": (
+            diminishing_return_burden_penalty
+        ),
+        "diminishing_return_min_dgi_support": (
+            diminishing_return_min_dgi_support
+        ),
+        "diminishing_return_evidence_formula": (
+            "local_log2_enrichment + dgi_consensus_weight * "
+            "leave_one_out_dgi_support"
+        ),
+        "diminishing_return_required_formula": (
+            "label_min_log2_enrichment + dgi_consensus_weight * "
+            "diminishing_return_min_dgi_support + log_penalty * log1p(k) + "
+            "burden_penalty * prior_compartment_fraction"
+        ),
+        "diminishing_return_first_locus_unconditionally_kept": True,
+        "diminishing_return_strict_loci_protected": True,
+        "diminishing_return_pruned_metaspots": int(
+            diminishing_return_pruned.sum()
+        ),
+        "diminishing_return_pruned_cells": int(
+            np.unique(
+                metadata_cell_codes[
+                    metadata_valid_cells & diminishing_return_pruned
+                ]
+            ).size
+        ),
+        "diminishing_return_pruned_metaspots_by_label": {
+            label: int(
+                (
+                    diminishing_return_pruned
+                    & (diminishing_return_labels_before == label)
+                ).sum()
+            )
+            for label in diminishing_return_labels
+        },
+        "cell_coverage_rescue_enabled": cell_coverage_rescue_enabled,
+        "cell_coverage_labels": list(cell_coverage_labels),
+        "cell_coverage_min_dgi_support": (
+            cell_coverage_min_dgi_support
+        ),
+        "cell_coverage_min_dgi_margin": cell_coverage_min_dgi_margin,
+        "cell_coverage_max_per_label": cell_coverage_max_per_label,
+        "cell_coverage_cell_evidence_thresholds": {
+            "min_marker_transcripts": cell_coverage_min_transcripts,
+            "min_marker_genes": cell_coverage_min_genes,
+            "min_log2_enrichment": cell_coverage_min_enrichment,
+            "max_binomial_p": cell_coverage_max_p,
+        },
+        "cell_coverage_rescued_metaspots": int(
+            cell_coverage_rescued.sum()
+        ),
+        "labelwise_cell_coverage_rescued_metaspots": int(
+            labelwise_cell_coverage_rescued.sum()
+        ),
+        "cell_coverage_rescued_cells": cell_coverage_rescued_cell_count,
+        "cell_coverage_rescued_metaspots_by_label": {
+            label: int(
+                (
+                    cell_coverage_rescued
+                    & (cell_coverage_rescue_labels == label)
+                ).sum()
+            )
+            for label in cell_coverage_labels
+        },
+        "hierarchical_cell_rescue_enabled": (
+            hierarchical_cell_rescue_enabled
+        ),
+        "hierarchical_cell_rescued_metaspots": int(
+            hierarchical_cell_rescued.sum()
+        ),
+        "hierarchical_cell_rescued_cells": (
+            hierarchical_rescued_cell_count
+        ),
+        "hierarchical_cell_rescued_metaspots_by_label": {
+            label: int(
+                (
+                    hierarchical_cell_rescued
+                    & (hierarchical_rescue_labels == label)
+                ).sum()
+            )
+            for label in cell_coverage_labels
+        },
+        "hierarchical_cell_status_counts": hierarchical_status_counts,
+        "hierarchical_cell_thresholds": {
+            "min_cell_transcripts": hierarchical_min_cell_transcripts,
+            "min_metaspots": hierarchical_min_metaspots,
+            "min_presence_score": hierarchical_min_presence_score,
+            "min_localization_score": (
+                hierarchical_min_localization_score
+            ),
+            "min_joint_score": hierarchical_min_joint_score,
+            "min_local_marker_transcripts": (
+                hierarchical_min_local_transcripts
+            ),
+            "min_local_marker_genes": hierarchical_min_local_genes,
+            "min_cell_marker_transcripts": (
+                hierarchical_min_cell_marker_transcripts
+            ),
+            "min_cell_marker_genes": (
+                hierarchical_min_cell_marker_genes
+            ),
+            "min_dgi_support": hierarchical_min_dgi_support,
+            "min_dgi_margin": hierarchical_min_dgi_margin,
+        },
+        "hierarchical_score_definition": {
+            "interpretation": "bounded_evidence_score_not_probability",
+            "presence_weights": {
+                "cell_marker_transcripts": 0.30,
+                "cell_marker_genes": 0.25,
+                "cell_log2_enrichment": 0.25,
+                "one_minus_cell_binomial_p": 0.20,
+            },
+            "localization_weights": {
+                "local_marker_transcripts": 0.15,
+                "local_marker_genes": 0.10,
+                "local_log2_enrichment": 0.20,
+                "leave_one_out_dgi_support": 0.45,
+                "leave_one_out_dgi_margin": 0.10,
+            },
+            "joint": "geometric_mean",
+        },
+        "callable_cells": callable_cell_count,
+        "callable_cells_with_fine_before_hierarchical": (
+            callable_cells_with_fine_before
+        ),
+        "callable_cells_with_fine_after_hierarchical": (
+            callable_cells_with_fine_after
+        ),
+        "callable_cell_fine_coverage_before_hierarchical": (
+            callable_cells_with_fine_before / callable_cell_count
+            if callable_cell_count
+            else None
+        ),
+        "callable_cell_fine_coverage_after_hierarchical": (
+            callable_cells_with_fine_after / callable_cell_count
+            if callable_cell_count
+            else None
+        ),
+        "callable_cells_without_fine_after_hierarchical": (
+            callable_cell_count - callable_cells_with_fine_after
+        ),
+        "omm_cell_coherent_rescue_enabled": omm_cell_rescue_enabled,
+        "omm_cell_coherent_rescued_metaspots": int(
+            omm_cell_coherent_rescued.sum()
+        ),
+        "omm_cell_coherent_rescued_cells": omm_rescued_cell_count,
+        "omm_cell_exploratory_candidate_metaspots": int(
+            omm_cell_exploratory_candidate.sum()
+        ),
+        "omm_cell_exploratory_candidate_cells": (
+            omm_exploratory_cell_count
+        ),
+        "omm_cell_coherent_thresholds": {
+            "min_cell_marker_transcripts": omm_cell_min_transcripts,
+            "min_cell_marker_genes": omm_cell_min_genes,
+            "min_cell_log2_enrichment": omm_cell_min_enrichment,
+            "max_cell_binomial_p": omm_cell_max_p,
+            "exploratory_max_cell_binomial_p": (
+                omm_cell_exploratory_max_p
+            ),
+            "min_local_marker_transcripts": omm_local_min_transcripts,
+            "min_local_marker_genes": omm_local_min_genes,
+            "min_local_log2_enrichment": omm_local_min_enrichment,
+            "min_local_score_gap": omm_local_min_gap,
+            "min_local_dgi_support": omm_local_min_dgi_support,
+            "min_local_dgi_margin": omm_local_min_dgi_margin,
+            "max_per_cell": omm_cell_max_per_cell,
+        },
+        "cell_coverage_cells_before_by_label": (
+            cell_coverage_cells_before_by_label
+        ),
+        "cell_coverage_cells_after_by_label": (
+            cell_coverage_cells_after_by_label
+        ),
+        "same_cell_only": True,
+        "same_broad_compartment_only": True,
+        "dgi_consensus_excludes_self": True,
+        "marker_genes_per_label": {
+            label: int(len(marker_sets[label])) for label in labels
+        },
+        "strict_fdr": strict_fdr,
+        "exploratory_max_q": exploratory_q,
+        "min_marker_transcripts": min_transcripts,
+        "min_marker_genes": min_genes,
+        "min_log2_enrichment": min_enrichment,
+        "min_score_gap": min_gap,
+        "background_prior_strength": prior_strength,
+        "label_thresholds": thresholds_by_label,
+        "require_omm_confirmation": require_omm,
+        "omm_confirmation_mode": omm_confirmation_mode,
+        "omm_unidentifiable_policy": omm_unidentifiable_policy,
+        "omm_confirmed_metaspots": int((is_omm & omm_confirmed).sum()),
+        "omm_strict_local_candidate_metaspots": int(
+            omm_strict_local_candidate.sum()
+        ),
+        "omm_strict_local_fallback_metaspots": int(
+            omm_strict_local_fallback.sum()
+        ),
+        "decision_provenance_counts": {
+            str(key): int(value)
+            for key, value in pd.Series(decision_provenance)
+            .value_counts()
+            .items()
+        },
+        "strict_supported_metaspots": int(strict_supported.sum()),
+        "exploratory_supported_metaspots": int(
+            exploratory_supported.sum()
+        ),
+        "final_label_counts": {
+            str(key): int(value)
+            for key, value in pd.Series(fine_labels).value_counts().items()
+        },
+        "fine_label_counts": {
+            str(key): int(value)
+            for key, value in pd.Series(fine_labels).value_counts().items()
+        },
+        "fine_state_counts": {
+            str(key): int(value)
+            for key, value in pd.Series(fine_state).value_counts().items()
+        },
+        "fallback_reason_counts": {
+            str(key): int(value)
+            for key, value in pd.Series(fallback_reason).value_counts().items()
+        },
+    }
+    if cell_codes is None or unique_cells is None:
+        raise RuntimeError(
+            "Multi-structure evidence requires cell-level marker aggregation"
+        )
+    valid_cell_rows = np.flatnonzero(cell_codes >= 0)
+    observed_codes, first_offsets = np.unique(
+        cell_codes[valid_cell_rows], return_index=True
+    )
+    if not np.array_equal(observed_codes, np.arange(len(unique_cells))):
+        raise RuntimeError("Cell structure evidence cell ordering is incomplete")
+    first_rows = valid_cell_rows[first_offsets]
+    adata1.uns["cell_structure_evidence"] = {
+        "schema_version": 2,
+        "interpretation": "assay_detectability_evidence_not_organelle_presence",
+        "cell_ids": np.asarray(unique_cells, dtype=str),
+        "structures": np.asarray(fine_structure_labels, dtype=str),
+        "presence_score": multistructure_presence[first_rows],
+        "spatial_coherence": multistructure_spatial_coherence[first_rows],
+    }
+    adata1.uns["metaspot_local_annotation"] = metadata
+    return adata1, score_table, metadata
+
+
 def _configure_annotation_unit(
     adata2: ad.AnnData,
     unit: str = "leiden",
@@ -9944,18 +22767,24 @@ def _configure_annotation_unit(
     """Choose the grain at which RAP-X makes independent decisions.
 
     ``metadomain`` preserves the embedding Leiden labels for visualization but
-    gives each adata2 row its own annotation group.  This prevents a single
-    cross-cell Leiden label from being broadcast over biologically different
-    MetaDomains.
+    gives each adata2 row its own annotation group.  ``metaspot`` deliberately
+    uses the same MetaDomain RAP-X groups here: those calls are only broad
+    priors, and a later same-cell DGI-neighborhood step makes the final
+    MetaSpot-level subtype decisions.
     """
     mode = str(unit).strip().lower().replace("_", "-")
     if mode in {"leiden", "cluster", "annotation-cluster"}:
         adata2.obs["annotation_group"] = adata2.obs["leiden"].astype(str)
         adata2.uns["annotation_unit"] = "leiden"
         return adata2
-    if mode not in {"metadomain", "meta-domain", "domain"}:
+    metaspot_mode = mode in {"metaspot", "meta-spot", "spot"}
+    if not metaspot_mode and mode not in {
+        "metadomain",
+        "meta-domain",
+        "domain",
+    }:
         raise ValueError(
-            "annotation.unit must be 'metadomain' or 'leiden', "
+            "annotation.unit must be 'metaspot', 'metadomain', or 'leiden', "
             f"got {unit!r}"
         )
     if not adata2.obs_names.is_unique:
@@ -9967,14 +22796,22 @@ def _configure_annotation_unit(
     groups = pd.Index(adata2.obs_names.astype(str), name="annotation_group")
     adata2.obs["annotation_group"] = pd.Categorical(groups)
     adata2.obs["leiden"] = pd.Categorical(groups)
-    adata2.uns["annotation_unit"] = "metadomain"
+    adata2.uns["annotation_unit"] = (
+        "metaspot" if metaspot_mode else "metadomain"
+    )
+    if metaspot_mode:
+        adata2.uns["annotation_prior_unit"] = "metadomain"
     return adata2
 
 
 def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_df: pd.DataFrame, show_internal_progress: bool = False, out_dir: Optional[str] = None,
                                 annotation_method: str = "rapx",
                                 rapx_two_stage: bool = False, rapx_spatial_channel: bool = False,
-                                gold_data: Optional[Union[str, pd.DataFrame]] = None):
+                                gold_data: Optional[Union[str, pd.DataFrame]] = None,
+                                cluster_rep_override: Optional[str] = None,
+                                rep_priority_override: Optional[Sequence[str]] = None,
+                                annotation_unit_override: Optional[str] = None,
+                                require_cluster_rep_override: Optional[bool] = None):
     # Step 0: choose annotation method (future-proof)
     _method = (annotation_method or "rapx").lower()
     if _method not in {"rapx", "rap-x"}:
@@ -9995,6 +22832,7 @@ def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_d
     umap_spread = None
     umap_neighbors_key = None
     cluster_rep = None
+    require_cluster_rep = False
     annotation_unit = "leiden"
     rnalocate_augment_er = False
     rnalocate_species: Optional[Tuple[str, ...]] = (
@@ -10006,28 +22844,31 @@ def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_d
     apex_omm_min_delta = 0.50
     omm_metaspot_refinement = True
     omm_metaspot_apply_to_primary = True
+    omm_policy = "balanced"
     omm_metaspot_ambiguous_policy = "competitor"
     omm_metaspot_min_informative_transcripts = 5
     omm_metaspot_shrinkage_count = 20.0
     omm_metaspot_posterior_high = 0.80
     omm_metaspot_posterior_low = 0.20
+    metaspot_compartment_correction = True
     try:
         _cfg = load_params_yaml()
         rep_priority = _cfg.get('module7', {}).get('rep_priority', None)
         if isinstance(rep_priority, str):
             rep_priority = [s.strip() for s in rep_priority.split(',') if s.strip()]
+        ann = resolve_annotation_configuration(_cfg)
         # Clustering neighbors for annotation stage (from annotation config)
-        n_neighbors = int(_cfg.get('annotation', {}).get('neighbors_k', 15))
+        n_neighbors = int(ann["neighbors_k"])
         # Use annotation's Leiden resolution (no legacy fallbacks)
-        leiden_resolution = float(_cfg.get('annotation', {}).get('leiden_resolution', 1.0))
+        leiden_resolution = float(ann["leiden_resolution"])
         # annotation-level params
-        ann = _cfg.get('annotation', {})
         hvg_n_top_genes = ann.get('hvg_n_top_genes', None)
         pca_n_comps = ann.get('pca_n_comps', None)
         umap_min_dist = ann.get('umap_min_dist', None)
         umap_spread = ann.get('umap_spread', None)
         umap_neighbors_key = ann.get('umap_neighbors_key', None)
         cluster_rep = ann.get('cluster_rep', None)
+        require_cluster_rep = bool(ann.get("require_cluster_rep", False))
         annotation_unit = str(ann.get("unit", annotation_unit))
         rnalocate_augment_er = bool(
             ann.get("rnalocate_augment_er", False)
@@ -10060,12 +22901,21 @@ def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_d
     except Exception:
         ann_fast = False
         ann_save_plots = False
+    if cluster_rep_override is not None:
+        cluster_rep = str(cluster_rep_override)
+    if rep_priority_override is not None:
+        rep_priority = [str(value) for value in rep_priority_override]
+    if annotation_unit_override is not None:
+        annotation_unit = str(annotation_unit_override)
+    if require_cluster_rep_override is not None:
+        require_cluster_rep = bool(require_cluster_rep_override)
     # Reference thresholds affect scientific identity and resume validity.
     # Parse them outside the broad optional-clustering fallback above so a
     # malformed value cannot be silently replaced by a default.
-    strict_annotation_cfg = (
-        (load_params_yaml() or {}).get("annotation", {}) or {}
+    strict_annotation_cfg = resolve_annotation_configuration(
+        load_params_yaml() or {}
     )
+    omm_policy = str(strict_annotation_cfg["omm_policy"])
     apex_omm_specificity_filter = bool(
         strict_annotation_cfg.get(
             "apex_omm_specificity_filter",
@@ -10084,6 +22934,12 @@ def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_d
             omm_metaspot_apply_to_primary,
         )
     )
+    metaspot_compartment_correction = bool(
+        strict_annotation_cfg.get(
+            "metaspot_compartment_correction",
+            metaspot_compartment_correction,
+        )
+    )
     omm_metaspot_ambiguous_policy = str(
         strict_annotation_cfg.get(
             "omm_metaspot_ambiguous_policy",
@@ -10098,6 +22954,29 @@ def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_d
             "annotation.omm_metaspot_ambiguous_policy must be one of "
             "{'competitor', 'explicit'}"
         )
+    annotation_mode_normalized = (
+        str(annotation_unit).strip().lower().replace("_", "-")
+    )
+    hybrid_metaspot_mode = annotation_mode_normalized in {
+        "metaspot",
+        "meta-spot",
+        "spot",
+    }
+    _logging.getLogger("cellscope").info(
+        "Annotation semantics | prior_unit=%s | production_unit=%s | "
+        "two_stage=%s | "
+        "spatial_channel=%s | metaspot_compartment_correction=%s | "
+        "omm_policy=%s | omm_metaspot_refinement=%s | "
+        "omm_apply_to_primary=%s",
+        "metadomain" if hybrid_metaspot_mode else annotation_unit,
+        "metaspot" if hybrid_metaspot_mode else annotation_unit,
+        bool(rapx_two_stage),
+        bool(rapx_spatial_channel),
+        metaspot_compartment_correction,
+        omm_policy,
+        omm_metaspot_refinement,
+        omm_metaspot_apply_to_primary,
+    )
     try:
         apex_omm_min_log2fc = float(
             strict_annotation_cfg.get(
@@ -10185,6 +23064,7 @@ def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_d
             umap_spread=umap_spread,
             umap_neighbors_key=umap_neighbors_key,
             cluster_rep=cluster_rep,
+            require_cluster_rep=require_cluster_rep,
         )
         # Type cast retained for analyzers
         rep_priority = cast(Optional[List[str]], rep_priority)
@@ -10263,15 +23143,14 @@ def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_d
                 apex_omm_audit,
                 out_dir,
                 "apex_omm_reference_audit",
+                diagnostic=True,
             )
 
     # Optional manual markers. Disabled by default because marker provenance and
     # compartment specificity must be curated explicitly.
     try:
         use_manual_markers = bool(
-            (load_params_yaml() or {}).get("annotation", {}).get(
-                "use_manual_markers", False
-            )
+            strict_annotation_cfg.get("use_manual_markers", False)
         )
     except Exception:
         use_manual_markers = False
@@ -10298,19 +23177,16 @@ def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_d
             "it is not a validated human-to-mouse ortholog conversion."
         )
     # Step 3: RAP-X annotation; write to adata2.obs
-    rapx_use_two_stage = False
-    rapx_use_spatial_channel = False
-    rapx_plot_umap = False
-    rapx_plot_diag = False
-    try:
-        _cfg2 = load_params_yaml()
-        ann_cfg = _cfg2.get('annotation', {}) if _cfg2 else {}
-        rapx_use_two_stage = bool(ann_cfg.get('two_stage', rapx_use_two_stage))
-        rapx_use_spatial_channel = bool(ann_cfg.get('spatial_channel', rapx_use_spatial_channel))
-        rapx_plot_umap = bool(ann_cfg.get('save_umap_plot', False) or ann_cfg.get('save_plots', False))
-        rapx_plot_diag = bool(ann_cfg.get('save_plots', False))
-    except Exception:
-        pass
+    # The caller resolves these execution switches once from the effective
+    # configuration. Do not silently replace explicit programmatic overrides by
+    # re-reading mutable process-global YAML here.
+    rapx_use_two_stage = bool(rapx_two_stage)
+    rapx_use_spatial_channel = bool(rapx_spatial_channel)
+    rapx_plot_umap = bool(
+        strict_annotation_cfg.get("save_umap_plot", False)
+        or strict_annotation_cfg.get("save_plots", False)
+    )
+    rapx_plot_diag = bool(strict_annotation_cfg.get("save_plots", False))
     t_rapx0 = __import__('time').perf_counter()
     annot_df = run_rapx(
         adata2,
@@ -10321,6 +23197,19 @@ def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_d
         use_two_stage=rapx_use_two_stage,
         use_spatial_channel=rapx_use_spatial_channel,
     )
+    if rapx_plot_umap:
+        try:
+            _plot_metadomain_subcellular_annotation(
+                adata2,
+                out_dir or os.getcwd(),
+                label_col="subcellular_annotation",
+            )
+        except Exception as exc:
+            _logging.getLogger("cellscope").warning(
+                "MetaDomain Subcellular Annotation UMAP generation failed: %s",
+                exc,
+                exc_info=True,
+            )
     try:
         annotation_meta = adata2.uns.setdefault(
             "subcellular_annotation_meta",
@@ -10329,6 +23218,9 @@ def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_d
         annotation_meta["annotation_unit"] = str(
             adata2.uns.get("annotation_unit", annotation_unit)
         )
+        if hybrid_metaspot_mode:
+            annotation_meta["annotation_prior_unit"] = "metadomain"
+            annotation_meta["annotation_decision_unit"] = "metaspot"
         apex_audit_summary: Dict[str, Any] = {
             "filter_applied": bool(
                 reference_source != "user_supplied"
@@ -10419,7 +23311,12 @@ def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_d
     # Save RAP-X diagnostics plots and annotation scores
     try:
         # _plot_rapx_enrichment_and_quality(annot_df, adata2, out_dir=out_dir)
-        _save_dataframe(annot_df.reset_index(), out_dir or os.getcwd(), "rapx_annotation_scores")
+        _save_dataframe(
+            annot_df.reset_index(),
+            out_dir or os.getcwd(),
+            "rapx_annotation_scores",
+            diagnostic=True,
+        )
         # Keep object labels separate from the Leiden-level majority label.
         try:
             if 'subcellular_annotation' in adata2.obs and 'leiden' in adata2.obs:
@@ -10429,67 +23326,25 @@ def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_d
                 )
         except Exception:
             pass
-        # Additional UMAP annotation visuals (optional; default off for speed)
-        if ann_save_plots:
-            try:
-                import scanpy as sc
-                import matplotlib.pyplot as plt
-                # Ensure UMAP exists (compute using an available neighbors graph)
-                if 'X_umap' not in adata2.obsm:
-                    cand = ['expr_nbrs','dgi_sage_nbrs','dgi_gcn_nbrs','pca_nbrs']
-                    used = None
-                    for k in cand:
-                        if f"{k}_connectivities" in adata2.obsp:
-                            try:
-                                sc.tl.umap(**dict(adata=adata2, neighbors_key=k))
-                                used = k
-                                break
-                            except Exception:
-                                continue
-                    if 'X_umap' not in adata2.obsm:
-                        try:
-                            sc.pp.neighbors(adata2, use_rep='X_pca', n_neighbors=32)
-                            sc.tl.umap(**dict(adata=adata2))
-                        except Exception:
-                            pass
-                # Plot and save
-                group_color = (
-                    "leiden_embedding"
-                    if "leiden_embedding" in adata2.obs.columns
-                    else "leiden"
-                )
-                umap_colors = [
-                    column
-                    for column in [
-                        'subcell_core_candidate_label',
-                        'subcellular_annotation_strict',
-                        'subcellular_annotation',
-                        'subcellular_annotation_tier',
-                        group_color,
-                    ]
-                    if column in adata2.obs.columns
-                ]
-                sc.pl.umap(
-                    adata2,
-                    color=umap_colors,
-                    legend_fontsize='small',
-                    wspace=0.5,
-                    show=False,
-                )
-                _save_fig(plt.gcf(), out_dir or os.getcwd(), "rapx_umap_cluster_annotation")
-                plt.close()
-            except Exception:
-                pass
+        # Preserve the confirmatory RAP-X track as exact audit tables only.
+        # A strict-label UMAP is intentionally not generated because
+        # strict ``Unknown`` means "not FDR-confirmed", not the final label.
+        _save_rapx_metadomain_evidence_audit_tables(
+            adata2,
+            out_dir or os.getcwd(),
+        )
     except Exception:
         pass
 
     omm_refinement_meta: Optional[Dict[str, Any]] = None
+    omm_refinement_columns: Tuple[str, ...] = ()
     if omm_metaspot_refinement:
         from .omm_refinement import (
             OMM_REFINEMENT_COLUMNS,
             build_omm_contrast_marker_weights,
             refine_omm_metaspots,
         )
+        omm_refinement_columns = tuple(OMM_REFINEMENT_COLUMNS)
 
         if apex_omm_audit is not None:
             omm_contrast_reference = apex_omm_audit[
@@ -10548,6 +23403,7 @@ def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_d
             posterior_low=omm_metaspot_posterior_low,
             random_state=0,
             copy_adata=False,
+            broadcast_to_final=not hybrid_metaspot_mode,
         )
         omm_refinement_meta["marker_builder"] = omm_marker_meta
         omm_refinement_meta["applied_to_primary_annotation"] = bool(
@@ -10557,6 +23413,7 @@ def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_d
         omm_refinement_meta["ambiguous_primary_label_policy"] = (
             omm_metaspot_ambiguous_policy
         )
+        omm_refinement_meta["primary_decision_policy"] = omm_policy
         if (
             omm_refinement_meta.get("identifiable", False)
             and "subcell_statistically_supported__OMM"
@@ -10666,7 +23523,7 @@ def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_d
         safe_omm_meta = _uns_safe(omm_refinement_meta)
         adata2.uns["omm_metaspot_refinement"] = safe_omm_meta
         adata1.uns["omm_metaspot_refinement"] = safe_omm_meta
-        if out_dir is not None:
+        if out_dir is not None and _full_metaspot_diagnostics_enabled(adata1):
             refinement_table = adata1.obs[
                 [
                     column
@@ -10689,6 +23546,7 @@ def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_d
                 refinement_table.reset_index(drop=True),
                 out_dir,
                 "omm_metaspot_refinement",
+                diagnostic=True,
             )
             prevalence_values = omm_refinement_meta.get(
                 "soft_prevalence",
@@ -10728,6 +23586,11 @@ def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_d
                 pd.DataFrame(prevalence_rows),
                 out_dir,
                 "omm_soft_prevalence_summary",
+                diagnostic=True,
+            )
+        elif out_dir is not None:
+            _logging.getLogger("cellscope").info(
+                "Skipping full OMM MetaSpot diagnostic table for scalable run"
             )
         prevalence = omm_refinement_meta.get("soft_prevalence", {})
         _logging.getLogger("cellscope").info(
@@ -10740,51 +23603,114 @@ def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_d
             ),
         )
 
+    broadcast_wide_transcript_audits = (
+        _broadcast_metaspot_diagnostics_enabled(adata1)
+    )
+
     # Step 4: map annotation back to final point table via meta-domain
     if 'meta-domain' in final_df.columns:
-        # Faster mapping vs merge for large final_df
-        m = adata2.obs['subcellular_annotation'].astype(str)
-        # Ensure key types align
-        final_df = final_df.copy()
-        final_df['meta-domain'] = final_df['meta-domain'].astype(str)
-        # Vectorized map
-        domain_labels = final_df['meta-domain'].map(m)
-        final_df['subcellular_annotation_domain'] = pd.Categorical(
-            domain_labels
+        transcript_domain_indexer = _key_row_indexer(
+            pd.Index(adata2.obs_names.astype(str)),
+            final_df["meta-domain"],
+            error_context="MetaDomain annotation",
         )
+        domain_labels = _take_obs_column_by_row_indexer(
+            adata2.obs['subcellular_annotation'].astype(str),
+            transcript_domain_indexer,
+            final_df.index,
+        )
+        transcript_domain_updates: Dict[str, Any] = {
+            "subcellular_annotation_domain": pd.Categorical(domain_labels)
+        }
         if "r_signed" in final_df.columns:
             (
                 guarded_labels,
-                final_df["subcellular_geometry_conflict"],
+                geometry_conflict,
             ) = _apply_local_compartment_guard(
                 domain_labels,
                 final_df["r_signed"],
             )
-            final_df["subcellular_annotation_geometry_guarded"] = (
+            transcript_domain_updates[
+                "subcellular_geometry_conflict"
+            ] = geometry_conflict
+            transcript_domain_updates[
+                "subcellular_annotation_geometry_guarded"
+            ] = (
                 pd.Categorical(guarded_labels)
             )
         else:
-            final_df["subcellular_annotation_geometry_guarded"] = (
+            transcript_domain_updates[
+                "subcellular_annotation_geometry_guarded"
+            ] = (
                 pd.Categorical(domain_labels)
             )
-            final_df["subcellular_geometry_conflict"] = False
-        final_df["subcellular_annotation"] = pd.Categorical(domain_labels)
-        for column in (
-            "subcellular_annotation_strict",
-            "subcellular_annotation_exploratory",
-            "subcellular_annotation_tier",
-        ):
-            if column in adata2.obs.columns:
-                final_df[column] = pd.Categorical(
-                    final_df["meta-domain"].map(
-                        adata2.obs[column].astype(str)
-                    )
+            transcript_domain_updates["subcellular_geometry_conflict"] = False
+            guarded_labels = domain_labels
+        selected_transcript_labels = (
+            guarded_labels
+            if metaspot_compartment_correction
+            else domain_labels
+        )
+        transcript_domain_updates["subcellular_annotation"] = pd.Categorical(
+            selected_transcript_labels
+        )
+        domain_evidence_columns = {
+            "subcellular_annotation_strict": (
+                "subcellular_annotation_domain_strict"
+            ),
+            "subcellular_annotation_exploratory": (
+                "subcellular_annotation_domain_exploratory"
+            ),
+            "subcellular_annotation_tier": (
+                "subcellular_annotation_domain_tier"
+            ),
+        }
+        for legacy_column, domain_column in domain_evidence_columns.items():
+            if legacy_column in adata2.obs.columns:
+                mapped_values = _take_obs_column_by_row_indexer(
+                    adata2.obs[legacy_column].astype(str),
+                    transcript_domain_indexer,
+                    final_df.index,
+                )
+                transcript_domain_updates[domain_column] = pd.Categorical(
+                    mapped_values
+                )
+                # Compatibility alias. New consumers should use the explicit
+                # ``*_domain_*`` name.
+                transcript_domain_updates[legacy_column] = pd.Categorical(
+                    mapped_values
                 )
         if "subcellular_candidate" in adata2.obs.columns:
             candidate_map = adata2.obs["subcellular_candidate"].astype(str)
-            final_df["subcellular_candidate"] = final_df["meta-domain"].map(
-                candidate_map
+            mapped_candidate = _take_obs_column_by_row_indexer(
+                candidate_map,
+                transcript_domain_indexer,
+                final_df.index,
             )
+            transcript_domain_updates[
+                "subcellular_candidate_domain"
+            ] = mapped_candidate
+            transcript_domain_updates["subcellular_candidate"] = (
+                mapped_candidate
+            )
+        expression_only_columns = {
+            "subcellular_annotation_expression_only": (
+                "subcellular_annotation_domain_expression_only"
+            ),
+            "subcellular_candidate_expression_only": (
+                "subcellular_candidate_domain_expression_only"
+            ),
+        }
+        for source, target in expression_only_columns.items():
+            if source in adata2.obs.columns:
+                mapped_values = _take_obs_column_by_row_indexer(
+                    adata2.obs[source].astype(str),
+                    transcript_domain_indexer,
+                    final_df.index,
+                )
+                transcript_domain_updates[target] = pd.Categorical(
+                    mapped_values
+                )
         evidence_output_map = {
             "subcell_primary_label": "subcellular_primary_label",
             "subcell_secondary_label": "subcellular_secondary_label",
@@ -10816,75 +23742,163 @@ def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_d
             ),
             "subcell_membrane_ambiguity": "membrane_ambiguity",
         }
-        for source, target in evidence_output_map.items():
-            if source in adata2.obs.columns:
-                final_df[target] = final_df["meta-domain"].map(
-                    adata2.obs[source]
-                )
+        if broadcast_wide_transcript_audits:
+            for source, target in evidence_output_map.items():
+                if source in adata2.obs.columns:
+                    transcript_domain_updates[
+                        target
+                    ] = _take_obs_column_by_row_indexer(
+                        adata2.obs[source],
+                        transcript_domain_indexer,
+                        final_df.index,
+                    )
+        else:
+            _logging.getLogger("cellscope").info(
+                "Keeping wide MetaDomain evidence in adata1/adata2 only; "
+                "transcript broadcast disabled for scalable run"
+            )
         for column in (
             "subcellular_annotation_conservative",
             "subcellular_confidence",
         ):
             if column in adata2.obs.columns:
-                final_df[column] = final_df["meta-domain"].map(
-                    adata2.obs[column].astype(str)
+                transcript_domain_updates[
+                    column
+                ] = _take_obs_column_by_row_indexer(
+                    adata2.obs[column],
+                    transcript_domain_indexer,
+                    final_df.index,
                 )
         if "subcell_low_conf" in adata2.obs.columns:
             confidence_map = _coerce_bool_series(
                 adata2.obs["subcell_low_conf"],
                 default=True,
             )
-            final_df["subcell_low_conf"] = final_df["meta-domain"].map(
-                confidence_map
+            transcript_domain_updates[
+                "subcell_low_conf"
+            ] = _take_obs_column_by_row_indexer(
+                confidence_map,
+                transcript_domain_indexer,
+                final_df.index,
             )
+        final_df = _replace_frame_columns(
+            final_df,
+            transcript_domain_updates,
+        )
+        del transcript_domain_indexer
 
     if "meta-domain" in adata1.obs.columns:
-        domain_key = adata1.obs["meta-domain"].astype(str)
-        domain_labels = domain_key.map(
-            adata2.obs["subcellular_annotation"].astype(str)
+        metaspot_domain_indexer = _key_row_indexer(
+            pd.Index(adata2.obs_names.astype(str)),
+            adata1.obs["meta-domain"],
+            error_context="MetaDomain evidence",
         )
-        adata1.obs["subcellular_annotation_domain"] = pd.Categorical(
-            domain_labels
+        domain_labels = _take_obs_column_by_row_indexer(
+            adata2.obs["subcellular_annotation"].astype(str),
+            metaspot_domain_indexer,
+            adata1.obs.index,
         )
-        if "r_mean" in adata1.obs.columns:
+        domain_obs_updates: Dict[str, Any] = {
+            "subcellular_annotation_domain": pd.Categorical(domain_labels)
+        }
+        metaspot_guard_values = _metaspot_compartment_guard_values(
+            adata1.obs
+        )
+        if metaspot_guard_values is not None:
             (
                 guarded_labels,
                 geometry_conflict,
             ) = _apply_local_compartment_guard(
                 domain_labels,
-                adata1.obs["r_mean"],
+                metaspot_guard_values,
             )
-            adata1.obs[
+            domain_obs_updates[
                 "subcellular_annotation_geometry_guarded"
             ] = pd.Categorical(
                 guarded_labels
             )
-            adata1.obs["subcellular_geometry_conflict"] = (
+            domain_obs_updates["subcellular_geometry_conflict"] = (
                 geometry_conflict.values
             )
         else:
-            adata1.obs[
+            domain_obs_updates[
                 "subcellular_annotation_geometry_guarded"
             ] = pd.Categorical(
                 domain_labels
             )
-            adata1.obs["subcellular_geometry_conflict"] = False
-        adata1.obs["subcellular_annotation"] = pd.Categorical(
-            domain_labels
+            domain_obs_updates["subcellular_geometry_conflict"] = False
+            guarded_labels = domain_labels
+        domain_obs_updates[
+            "subcellular_annotation_metaspot_corrected"
+        ] = pd.Categorical(guarded_labels)
+        domain_obs_updates[
+            "subcellular_annotation_metaspot_uncorrected"
+        ] = pd.Categorical(domain_labels)
+        selected_metaspot_labels = (
+            guarded_labels
+            if metaspot_compartment_correction
+            else domain_labels
         )
-        for column in (
-            "subcellular_annotation_strict",
-            "subcellular_annotation_exploratory",
-            "subcellular_annotation_tier",
-        ):
-            if column in adata2.obs.columns:
-                adata1.obs[column] = pd.Categorical(
-                    domain_key.map(adata2.obs[column].astype(str))
+        domain_obs_updates["subcellular_annotation"] = pd.Categorical(
+            selected_metaspot_labels
+        )
+        domain_obs_updates[
+            "subcellular_annotation_metaspot"
+        ] = pd.Categorical(
+            selected_metaspot_labels
+        )
+        domain_evidence_columns = {
+            "subcellular_annotation_strict": (
+                "subcellular_annotation_domain_strict"
+            ),
+            "subcellular_annotation_exploratory": (
+                "subcellular_annotation_domain_exploratory"
+            ),
+            "subcellular_annotation_tier": (
+                "subcellular_annotation_domain_tier"
+            ),
+        }
+        for legacy_column, domain_column in domain_evidence_columns.items():
+            if legacy_column in adata2.obs.columns:
+                mapped_values = _take_obs_column_by_row_indexer(
+                    adata2.obs[legacy_column].astype(str),
+                    metaspot_domain_indexer,
+                    adata1.obs.index,
+                )
+                domain_obs_updates[domain_column] = pd.Categorical(
+                    mapped_values
+                )
+                domain_obs_updates[legacy_column] = pd.Categorical(
+                    mapped_values
                 )
         if "subcellular_candidate" in adata2.obs.columns:
-            adata1.obs["subcellular_candidate"] = domain_key.map(
-                adata2.obs["subcellular_candidate"].astype(str)
-            ).values
+            mapped_candidate = _take_obs_column_by_row_indexer(
+                adata2.obs["subcellular_candidate"].astype(str),
+                metaspot_domain_indexer,
+                adata1.obs.index,
+            )
+            domain_obs_updates["subcellular_candidate_domain"] = (
+                mapped_candidate.values
+            )
+            domain_obs_updates["subcellular_candidate"] = (
+                mapped_candidate.values
+            )
+        expression_only_columns = {
+            "subcellular_annotation_expression_only": (
+                "subcellular_annotation_domain_expression_only"
+            ),
+            "subcellular_candidate_expression_only": (
+                "subcellular_candidate_domain_expression_only"
+            ),
+        }
+        for source, target in expression_only_columns.items():
+            if source in adata2.obs.columns:
+                mapped_values = _take_obs_column_by_row_indexer(
+                    adata2.obs[source].astype(str),
+                    metaspot_domain_indexer,
+                    adata1.obs.index,
+                )
+                domain_obs_updates[target] = pd.Categorical(mapped_values)
         evidence_output_map = {
             "subcell_primary_label": "subcellular_primary_label",
             "subcell_secondary_label": "subcellular_secondary_label",
@@ -10918,9 +23932,11 @@ def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_d
         }
         for source, target in evidence_output_map.items():
             if source in adata2.obs.columns:
-                adata1.obs[target] = domain_key.map(
-                    adata2.obs[source]
-                ).values
+                domain_obs_updates[target] = _take_obs_column_by_row_indexer(
+                    adata2.obs[source],
+                    metaspot_domain_indexer,
+                    adata1.obs.index,
+                )
         for source in adata2.obs.columns:
             if source.startswith(
                 (
@@ -10936,57 +23952,60 @@ def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_d
                     "subcell_subtype_calibrated_score__",
                 )
             ):
-                adata1.obs[source] = domain_key.map(
-                    adata2.obs[source]
-                ).values
+                domain_obs_updates[source] = _take_obs_column_by_row_indexer(
+                    adata2.obs[source],
+                    metaspot_domain_indexer,
+                    adata1.obs.index,
+                )
         for column in (
             "subcellular_annotation_conservative",
             "subcellular_confidence",
         ):
             if column in adata2.obs.columns:
-                adata1.obs[column] = domain_key.map(
-                    adata2.obs[column].astype(str)
-                ).values
+                domain_obs_updates[column] = _take_obs_column_by_row_indexer(
+                    adata2.obs[column],
+                    metaspot_domain_indexer,
+                    adata1.obs.index,
+                )
         if "subcell_low_conf" in adata2.obs.columns:
             confidence_map = _coerce_bool_series(
                 adata2.obs["subcell_low_conf"],
                 default=True,
             )
-            adata1.obs["subcell_low_conf"] = domain_key.map(
-                confidence_map
-            ).values
+            domain_obs_updates[
+                "subcell_low_conf"
+            ] = _take_obs_column_by_row_indexer(
+                confidence_map,
+                metaspot_domain_indexer,
+                adata1.obs.index,
+            )
+        _replace_obs_columns(adata1, domain_obs_updates)
+        del metaspot_domain_indexer
         if {
             "cell_id",
             "subcellular_annotation",
             "subcellular_confidence",
         }.issubset(adata1.obs.columns):
-            high = (
-                adata1.obs["subcellular_confidence"].astype(str) == "High"
+            total_cells, coverage = _high_confidence_cell_coverage(
+                adata1.obs["cell_id"],
+                adata1.obs["subcellular_annotation"],
+                adata1.obs["subcellular_confidence"],
             )
-            cell_labels = (
-                adata1.obs.loc[
-                    high,
-                    ["cell_id", "subcellular_annotation"],
-                ]
-                .astype(str)
-                .drop_duplicates()
-            )
-            total_cells = adata1.obs["cell_id"].nunique()
-            coverage = (
-                cell_labels.groupby(
-                    "subcellular_annotation",
-                    observed=True,
-                )["cell_id"]
-                .nunique()
-                .sort_values(ascending=False)
-            )
-            print(
-                "\nOriginal-cell coverage by high-confidence domains "
-                "(labels are not mutually exclusive):"
+            _coverage_logger = _logging.getLogger("cellscope")
+            _coverage_logger.info(
+                "High-confidence original-cell coverage "
+                "(labels are not mutually exclusive) | total_cells=%d",
+                total_cells,
             )
             for label, count in coverage.items():
                 pct = count / total_cells * 100 if total_cells else 0.0
-                print(f"  {label}: {count:,} cells ({pct:.1f}%)")
+                _coverage_logger.info(
+                    "High-confidence cell coverage | label=%s | cells=%d | "
+                    "fraction=%.4f",
+                    label,
+                    int(count),
+                    pct / 100.0,
+                )
 
     if (
         omm_refinement_meta is not None
@@ -10994,16 +24013,42 @@ def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_d
         and "omm_refined_state" in adata1.obs.columns
         and "omm_domain_gate" in adata1.obs.columns
     ):
-        metaspot_labels = _compose_omm_metaspot_labels(
+        metaspot_uncorrected_labels = _compose_omm_metaspot_labels(
             adata1.obs["subcellular_annotation_domain"],
             adata1.obs["omm_refined_state"],
             adata1.obs["omm_domain_gate"],
             adata1.obs.get("omm_raw_competitor_label"),
+            adata1.obs.get("omm_reference_posterior"),
             identifiable=bool(
                 omm_refinement_meta.get("identifiable", False)
             ),
             ambiguous_policy=omm_metaspot_ambiguous_policy,
+            decision_policy=(
+                "balanced" if omm_policy == "balanced" else "strict"
+            ),
+            posterior_high=omm_metaspot_posterior_high,
         )
+        metaspot_guard_values = _metaspot_compartment_guard_values(
+            adata1.obs
+        )
+        if metaspot_guard_values is not None:
+            metaspot_corrected_labels, _ = _apply_local_compartment_guard(
+                metaspot_uncorrected_labels,
+                metaspot_guard_values,
+            )
+        else:
+            metaspot_corrected_labels = metaspot_uncorrected_labels
+        metaspot_labels = (
+            metaspot_corrected_labels
+            if metaspot_compartment_correction
+            else metaspot_uncorrected_labels
+        )
+        adata1.obs[
+            "subcellular_annotation_metaspot_uncorrected"
+        ] = pd.Categorical(metaspot_uncorrected_labels)
+        adata1.obs[
+            "subcellular_annotation_metaspot_corrected"
+        ] = pd.Categorical(metaspot_corrected_labels)
         adata1.obs["subcellular_annotation_metaspot"] = pd.Categorical(
             metaspot_labels
         )
@@ -11015,39 +24060,382 @@ def  _maybe_cluster_and_annotate(adata1: ad.AnnData, adata2: ad.AnnData, final_d
                 metaspot_labels
             )
 
-        if "metaspot" in adata1.obs.columns:
-            adata1_metaspot_ids = adata1.obs["metaspot"].astype(str)
-        else:
-            adata1_metaspot_ids = pd.Series(
-                adata1.obs_names.astype(str),
-                index=adata1.obs_names,
-            )
-        label_by_metaspot = pd.Series(
-            metaspot_labels.to_numpy(),
-            index=pd.Index(adata1_metaspot_ids.to_numpy(), dtype=str),
-            dtype="object",
+    metaspot_local_annotation_meta: Optional[Dict[str, Any]] = None
+    if hybrid_metaspot_mode:
+        build_full_score_table = _full_metaspot_diagnostics_enabled(adata1)
+        (
+            adata1,
+            metaspot_local_scores,
+            metaspot_local_annotation_meta,
+        ) = _refine_metaspot_annotations_with_local_dgi(
+            adata1,
+            gold_aug,
+            strict_annotation_cfg,
+            build_score_table=build_full_score_table,
         )
-        if not label_by_metaspot.index.is_unique:
-            raise ValueError(
-                "MetaSpot annotation refinement requires unique MetaSpot IDs"
-            )
-        final_refined_labels = final_df["metaspot"].astype(str).map(
-            label_by_metaspot
+        adata2.uns["metaspot_local_annotation"] = (
+            metaspot_local_annotation_meta
         )
-        if final_refined_labels.isna().any():
-            raise ValueError(
-                "Failed to map OMM-refined MetaSpot labels back to every "
-                "transcript"
+        if out_dir is not None and metaspot_local_scores is not None:
+            _save_dataframe(
+                metaspot_local_scores,
+                out_dir,
+                "metaspot_local_annotation_scores",
+                diagnostic=True,
             )
-        final_df["subcellular_annotation_metaspot"] = pd.Categorical(
-            final_refined_labels
+            supported_omm = (
+                metaspot_local_scores["final_annotation"].astype(str)
+                == "OMM"
+            )
+            exploratory_omm = metaspot_local_scores[
+                "omm_cell_exploratory_candidate"
+            ].astype(bool)
+            tier_masks = (
+                supported_omm,
+                exploratory_omm,
+                supported_omm | exploratory_omm,
+            )
+            total_cells, tier_cell_counts = _unique_cell_counts_for_masks(
+                metaspot_local_scores["cell_id"],
+                tier_masks,
+            )
+            omm_tier_rows = []
+            for tier_name, tier_mask, tier_cells in zip(
+                (
+                    "Supported",
+                    "Exploratory only",
+                    "Supported or exploratory",
+                ),
+                tier_masks,
+                tier_cell_counts,
+            ):
+                omm_tier_rows.append(
+                    {
+                        "omm_evidence_tier": tier_name,
+                        "n_metaspots": int(tier_mask.sum()),
+                        "n_cells": tier_cells,
+                        "n_cells_total": total_cells,
+                        "cell_detection_fraction": (
+                            tier_cells / total_cells if total_cells else np.nan
+                        ),
+                        "writes_public_omm_label": tier_name == "Supported",
+                    }
+                )
+            _save_dataframe(
+                pd.DataFrame(omm_tier_rows),
+                out_dir,
+                "omm_cell_detection_tiers",
+                diagnostic=True,
+            )
+        elif out_dir is not None:
+            supported_omm = (
+                adata1.obs["subcellular_annotation"].astype(str) == "OMM"
+            )
+            exploratory_omm = adata1.obs[
+                "subcellular_metaspot_omm_exploratory_candidate"
+            ].astype(bool)
+            tier_masks = (
+                supported_omm,
+                exploratory_omm,
+                supported_omm | exploratory_omm,
+            )
+            total_cells, tier_cell_counts = _unique_cell_counts_for_masks(
+                adata1.obs["cell_id"],
+                tier_masks,
+            )
+            omm_tier_rows = []
+            for tier_name, tier_mask, tier_cells in zip(
+                (
+                    "Supported",
+                    "Exploratory only",
+                    "Supported or exploratory",
+                ),
+                tier_masks,
+                tier_cell_counts,
+            ):
+                omm_tier_rows.append(
+                    {
+                        "omm_evidence_tier": tier_name,
+                        "n_metaspots": int(tier_mask.sum()),
+                        "n_cells": tier_cells,
+                        "n_cells_total": total_cells,
+                        "cell_detection_fraction": (
+                            tier_cells / total_cells if total_cells else np.nan
+                        ),
+                        "writes_public_omm_label": tier_name == "Supported",
+                    }
+                )
+            _save_dataframe(
+                pd.DataFrame(omm_tier_rows),
+                out_dir,
+                "omm_cell_detection_tiers",
+                diagnostic=True,
+            )
+            _logging.getLogger("cellscope").info(
+                "Skipping 138-column MetaSpot score table | metaspots=%d",
+                int(adata1.n_obs),
+            )
+        _logging.getLogger("cellscope").info(
+            "Hybrid MetaSpot annotation | strict_supported=%d | "
+            "exploratory_supported=%d | dgi_exploratory=%d | "
+            "omm_confirmation=%s | "
+            "omm_strict_local_fallback=%d | final_counts=%s | "
+            "fallbacks=%s",
+            metaspot_local_annotation_meta[
+                "strict_supported_metaspots"
+            ],
+            metaspot_local_annotation_meta[
+                "exploratory_supported_metaspots"
+            ],
+            metaspot_local_annotation_meta[
+                "dgi_exploratory_supported_metaspots"
+            ],
+            metaspot_local_annotation_meta["omm_confirmation_mode"],
+            metaspot_local_annotation_meta[
+                "omm_strict_local_fallback_metaspots"
+            ],
+            metaspot_local_annotation_meta["final_label_counts"],
+            metaspot_local_annotation_meta["fallback_reason_counts"],
         )
-        if (
-            omm_metaspot_apply_to_primary
-            and bool(omm_refinement_meta.get("identifiable", False))
+
+    # Provenance is constant within each MetaSpot. Compute it once at the
+    # production decision grain and broadcast compact codes with the labels,
+    # instead of repeating string comparisons over every transcript.
+    adata1.obs = _attach_annotation_provenance_columns(adata1.obs)
+
+    # ``subcellular_annotation`` remains the established public seven-class
+    # result. Broadcast it and its evidence-state audits from MetaSpots so
+    # transcripts in one MetaSpot cannot disagree.
+    if (
+        "subcellular_annotation" in adata1.obs.columns
+        and "metaspot" in final_df.columns
+    ):
+        final_df = final_df.drop(
+            columns=[
+                "subcellular_annotation_compatibility",
+                "subcellular_annotation_metaspot_compatibility",
+            ],
+            errors="ignore",
+        )
+        metaspot_row_indexer = _metaspot_transcript_row_indexer(
+            adata1,
+            final_df,
+        )
+        final_primary_labels = _take_obs_column_by_row_indexer(
+            adata1.obs["subcellular_annotation"],
+            metaspot_row_indexer,
+            final_df.index,
+        )
+        transcript_annotation_updates: Dict[str, Any] = {
+            "subcellular_annotation": pd.Categorical(final_primary_labels)
+        }
+        for label_column in (
+            "subcellular_annotation_metaspot",
+            "subcellular_annotation_metaspot_uncorrected",
+            "subcellular_annotation_metaspot_corrected",
+            "subcellular_annotation_geometry_guarded",
+            "subcellular_annotation_metaspot_parent",
+            "subcellular_annotation_metaspot_candidate",
+            "subcellular_annotation_metaspot_strict",
+            "subcellular_annotation_metaspot_exploratory",
+            "subcellular_annotation_strict",
+            "subcellular_annotation_exploratory",
+            "subcellular_annotation_tier",
+            "subcellular_candidate",
+            "subcellular_broad_compartment",
+            "subcellular_fine_annotation",
+            "subcellular_fine_state",
+            "subcellular_metaspot_marker_only_candidate",
+            "subcellular_metaspot_decision_provenance",
+            "subcellular_metaspot_omm_confirmation_status",
+            "subcellular_metaspot_cell_coverage_rescue_label",
+            "subcellular_metaspot_hierarchical_cell_status",
+            "subcellular_metaspot_hierarchical_best_label",
+            "subcellular_metaspot_diminishing_return_original_label",
+            "subcellular_annotation_provenance",
         ):
-            final_df["subcellular_annotation"] = pd.Categorical(
-                final_refined_labels
+            if label_column in adata1.obs.columns:
+                transcript_annotation_updates[label_column] = pd.Categorical(
+                    _take_obs_column_by_row_indexer(
+                        adata1.obs[label_column],
+                        metaspot_row_indexer,
+                        final_df.index,
+                    )
+                )
+        for provenance_column in (
+            "final_label_matches_domain_annotation",
+            "final_label_supported_by_domain_evidence",
+        ):
+            if provenance_column in adata1.obs.columns:
+                transcript_annotation_updates[provenance_column] = (
+                    _take_obs_column_by_row_indexer(
+                        adata1.obs[provenance_column],
+                        metaspot_row_indexer,
+                        final_df.index,
+                    )
+                )
+        broadcast_metaspot_diagnostics = (
+            hybrid_metaspot_mode and broadcast_wide_transcript_audits
+        )
+        if broadcast_metaspot_diagnostics:
+            for column in (
+                "subcellular_metaspot_pool_size",
+                "subcellular_metaspot_candidate_marker_transcripts",
+                "subcellular_metaspot_candidate_marker_genes",
+                "subcellular_metaspot_log2_enrichment",
+                "subcellular_metaspot_fused_score",
+                "subcellular_metaspot_marker_only_score_gap",
+                "subcellular_metaspot_score_gap",
+                "subcellular_metaspot_dgi_support",
+                "subcellular_metaspot_dgi_margin",
+                "subcellular_metaspot_dgi_informative_neighbors",
+                "subcellular_metaspot_dgi_branch_used",
+                "subcellular_metaspot_dgi_exploratory_supported",
+                "subcellular_metaspot_cell_coverage_rescued",
+                "subcellular_metaspot_labelwise_cell_coverage_rescued",
+                "subcellular_metaspot_hierarchical_cell_rescued",
+                "subcellular_metaspot_hierarchical_cell_callable",
+                "subcellular_metaspot_hierarchical_cell_eligible",
+                "subcellular_metaspot_hierarchical_cell_total_transcripts",
+                "subcellular_metaspot_hierarchical_cell_metaspots",
+                "subcellular_metaspot_hierarchical_presence_score",
+                "subcellular_metaspot_hierarchical_localization_score",
+                "subcellular_metaspot_hierarchical_joint_score",
+                "subcellular_metaspot_hierarchical_best_presence_score",
+                "subcellular_metaspot_hierarchical_best_localization_score",
+                "subcellular_metaspot_hierarchical_best_joint_score",
+                "subcellular_metaspot_hierarchical_best_dgi_support",
+                "subcellular_metaspot_hierarchical_best_dgi_margin",
+                "subcellular_metaspot_diminishing_return_eligible",
+                "subcellular_metaspot_diminishing_return_pruned",
+                "subcellular_metaspot_diminishing_return_first_locus",
+                "subcellular_metaspot_diminishing_return_rank",
+                "subcellular_metaspot_diminishing_return_evidence_score",
+                "subcellular_metaspot_diminishing_return_required_score",
+                "subcellular_metaspot_diminishing_return_burden_before",
+                "subcellular_metaspot_cell_coverage_local_marker_transcripts",
+                "subcellular_metaspot_cell_coverage_local_marker_genes",
+                "subcellular_metaspot_cell_coverage_local_log2_enrichment",
+                "subcellular_metaspot_cell_coverage_dgi_support",
+                "subcellular_metaspot_cell_coverage_dgi_margin",
+                "subcellular_metaspot_cell_coverage_cell_marker_transcripts",
+                "subcellular_metaspot_cell_coverage_cell_marker_genes",
+                "subcellular_metaspot_cell_coverage_cell_log2_enrichment",
+                "subcellular_metaspot_cell_coverage_cell_binomial_p",
+                "subcellular_metaspot_omm_cell_coherent_rescued",
+                "subcellular_metaspot_omm_exploratory_candidate",
+                "subcellular_metaspot_omm_evidence_tier",
+                "subcellular_metaspot_omm_cell_marker_transcripts",
+                "subcellular_metaspot_omm_cell_marker_genes",
+                "subcellular_metaspot_omm_cell_log2_enrichment",
+                "subcellular_metaspot_omm_cell_binomial_p",
+                "subcellular_metaspot_omm_cell_bh_q",
+                "subcellular_metaspot_binomial_p",
+                "subcellular_metaspot_bh_q",
+                "subcellular_metaspot_supported",
+                "subcellular_fine_supported",
+                "subcellular_metaspot_candidate_min_marker_transcripts",
+                "subcellular_metaspot_candidate_min_marker_genes",
+                "subcellular_metaspot_candidate_min_log2_enrichment",
+                "subcellular_metaspot_candidate_min_score_gap",
+                "subcellular_metaspot_candidate_strict_fdr",
+                "subcellular_metaspot_candidate_exploratory_max_q",
+                "subcellular_metaspot_fallback_reason",
+                *omm_refinement_columns,
+            ):
+                if column not in adata1.obs.columns:
+                    continue
+                mapped_values = _take_obs_column_by_row_indexer(
+                    adata1.obs[column],
+                    metaspot_row_indexer,
+                    final_df.index,
+                )
+                if mapped_values.isna().any() and not pd.api.types.is_float_dtype(
+                    adata1.obs[column]
+                ):
+                    raise ValueError(
+                        f"Failed to map MetaSpot diagnostic {column!r} to "
+                        "every transcript"
+                    )
+                transcript_annotation_updates[column] = mapped_values
+        elif hybrid_metaspot_mode:
+            _logging.getLogger("cellscope").info(
+                "Keeping wide MetaSpot diagnostics in adata1 only; "
+                "transcript broadcast disabled for scalable run"
             )
+
+        final_df = _replace_frame_columns(
+            final_df,
+            transcript_annotation_updates,
+        )
+
+    annotation_provenance = {
+        "schema_version": 3,
+        "domain_evidence_unit": (
+            "metadomain" if hybrid_metaspot_mode else str(annotation_unit)
+        ),
+        "production_unit": "metaspot",
+        "fine_label_column": "subcellular_annotation",
+        "fine_label_alias": "subcellular_fine_annotation",
+        "hybrid_metaspot_annotation": bool(hybrid_metaspot_mode),
+        "metaspot_compartment_correction": bool(
+            metaspot_compartment_correction
+        ),
+        "omm_policy": omm_policy,
+        "omm_metaspot_refinement": bool(omm_metaspot_refinement),
+        "omm_metaspot_apply_to_primary": bool(
+            omm_metaspot_apply_to_primary
+        ),
+        "transcript_diagnostic_broadcast": bool(
+            broadcast_wide_transcript_audits
+        ),
+        "legacy_evidence_aliases": {
+            "subcellular_annotation_strict": (
+                "subcellular_annotation_domain_strict"
+            ),
+            "subcellular_annotation_exploratory": (
+                "subcellular_annotation_domain_exploratory"
+            ),
+            "subcellular_annotation_tier": (
+                "subcellular_annotation_domain_tier"
+            ),
+        },
+    }
+    if metaspot_local_annotation_meta is not None:
+        annotation_provenance["metaspot_local_annotation"] = (
+            metaspot_local_annotation_meta
+        )
+    adata1.uns["subcellular_annotation_provenance"] = (
+        annotation_provenance
+    )
+    adata2.uns["subcellular_annotation_provenance"] = (
+        annotation_provenance
+    )
+    provenance_counts = (
+        adata1.obs["subcellular_annotation_provenance"]
+        .value_counts()
+        .to_dict()
+    )
+    _logging.getLogger("cellscope").info(
+        "Production annotation provenance | correction_enabled=%s | "
+        "metaspot_counts=%s",
+        metaspot_compartment_correction,
+        provenance_counts,
+    )
+
+    # Keep the compact MetaDomain UMAP for orientation.  Add both a
+    # quantitative aggregation/label-transfer audit and the final
+    # user-facing MetaSpot result view after all local refinements.
+    if (
+        ann_save_plots
+        and out_dir is not None
+        and _io_should_write_figures()
+    ):
+        _plot_metadomain_annotation_quality(adata1, out_dir)
+        _plot_metaspot_annotation_result(adata1, out_dir)
+        _save_transcript_annotation_proportion_diagnostics(
+            final_df,
+            out_dir,
+        )
 
     return adata1, adata2, final_df

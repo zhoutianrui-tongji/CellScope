@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import math
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -565,6 +565,556 @@ def run_rapx_annotation_tracks(
     return tracks, metadata
 
 
+def run_shared_metadomain_rapx_track(
+    adata_metaspot,
+    final_data: pd.DataFrame,
+    *,
+    embedding_key: str,
+    metadomain_embedding_key: str,
+    method_name: str,
+    out_dir: str | None = None,
+    gold_df: pd.DataFrame | None = None,
+    module5_config_override: Mapping[str, Any] | None = None,
+    enable_metaspot_refinement: bool = False,
+    crossfitted_compartment_score: pd.Series | None = None,
+    crossfitted_score_source: str | None = None,
+) -> dict[str, object]:
+    """Run a method embedding through the shared CellScope MetaDomain protocol.
+
+    The input remains a MetaSpot-by-gene object with raw counts. Only the
+    method-specific embedding is used to build MetaDomains; CellScope DGI keys
+    are neither aliased nor used as a fallback. The active Module 5, Module 6,
+    annotation-unit, and RAP-X settings are otherwise reused.
+    """
+
+    from .pipeline import (
+        _apply_local_compartment_guard,
+        _maybe_cluster_and_annotate,
+        build_adata2_from_adata1_and_pointdf,
+        run_module5_simple,
+    )
+
+    population = validate_benchmark_population(
+        final_data,
+        adata_metaspot.obs_names,
+    )
+    embedding_key = str(embedding_key)
+    metadomain_embedding_key = str(metadomain_embedding_key)
+    if embedding_key not in adata_metaspot.obsm:
+        raise KeyError(
+            f"{method_name}: missing MetaSpot embedding {embedding_key!r}"
+        )
+
+    embedding = np.asarray(
+        adata_metaspot.obsm[embedding_key],
+        dtype=np.float32,
+    )
+    if (
+        embedding.ndim != 2
+        or embedding.shape[0] != adata_metaspot.n_obs
+        or embedding.shape[1] == 0
+        or not np.isfinite(embedding).all()
+    ):
+        raise ValueError(
+            f"{method_name}: {embedding_key!r} must be a finite "
+            "(n_metaspots, n_features) matrix"
+        )
+
+    compartment_gate_enabled = crossfitted_compartment_score is not None
+    if compartment_gate_enabled and not enable_metaspot_refinement:
+        raise ValueError(
+            f"{method_name}: cross-fitted compartment gating requires "
+            "MetaSpot refinement"
+        )
+    if compartment_gate_enabled != bool(crossfitted_score_source):
+        raise ValueError(
+            f"{method_name}: cross-fitted compartment score and source "
+            "must be provided together"
+        )
+
+    metaspot_adata = adata_metaspot.copy()
+    metaspot_adata.obs_names = metaspot_adata.obs_names.astype(str)
+    metaspot_adata.obs = metaspot_adata.obs.copy()
+    metaspot_adata.obs["metaspot"] = metaspot_adata.obs_names.astype(str)
+
+    boundary_guard_values = None
+    metaspot_pool_alias = None
+    removed_boundary_columns: list[str] = []
+    if enable_metaspot_refinement:
+        if "r_signed" not in final_data.columns:
+            raise KeyError(
+                f"{method_name}: shared MetaSpot refinement requires "
+                "frozen transcript r_signed values for boundary sensitivity"
+            )
+        boundary_guard_values = (
+            final_data.assign(
+                _metaspot=final_data["metaspot"].astype(str),
+                _r_signed=pd.to_numeric(
+                    final_data["r_signed"], errors="coerce"
+                ),
+            )
+            .groupby("_metaspot", observed=True)["_r_signed"]
+            .median()
+            .reindex(metaspot_adata.obs_names)
+        )
+        if boundary_guard_values.isna().any():
+            raise ValueError(
+                f"{method_name}: frozen r_signed values do not define every "
+                "MetaSpot boundary median"
+            )
+
+        # The production refiner reads this established slot.  Overwrite it
+        # in-memory with the current method embedding so no CellScoper DGI
+        # representation can leak into an adapted baseline.
+        metaspot_pool_alias = "X_dgi_gcn_metaspot"
+        metaspot_adata.obsm[metaspot_pool_alias] = embedding.copy()
+
+        # Boundary-derived geometry is removed from the primary shared track.
+        # It is applied once, post hoc, only in the explicit sensitivity track.
+        boundary_columns = {
+            "r_mean",
+            "r_std",
+            "r_p50",
+            "d_nuc_norm_mean",
+        }
+        removed_boundary_columns = sorted(
+            boundary_columns.intersection(metaspot_adata.obs.columns)
+        )
+        metaspot_adata.obs = metaspot_adata.obs.drop(
+            columns=removed_boundary_columns
+        )
+
+    owner_table = (
+        final_data[["metaspot", "cell_id"]]
+        .assign(
+            metaspot=lambda frame: frame["metaspot"].astype(str),
+            cell_id=lambda frame: frame["cell_id"].astype(str),
+        )
+        .drop_duplicates()
+    )
+    if owner_table["metaspot"].duplicated().any():
+        duplicated = (
+            owner_table.loc[
+                owner_table["metaspot"].duplicated(keep=False),
+                "metaspot",
+            ]
+            .drop_duplicates()
+            .head(10)
+            .tolist()
+        )
+        raise ValueError(
+            f"{method_name}: MetaSpots have multiple cell owners: {duplicated}"
+        )
+    owners = owner_table.set_index("metaspot")["cell_id"]
+    aligned_owners = owners.reindex(metaspot_adata.obs_names)
+    if aligned_owners.isna().any():
+        missing = aligned_owners.index[aligned_owners.isna()][:10].tolist()
+        raise ValueError(
+            f"{method_name}: missing cell owners for MetaSpots {missing}"
+        )
+    metaspot_adata.obs["cell_id"] = aligned_owners.to_numpy()
+
+    shared_module5_config = {
+        **(
+            dict(module5_config_override)
+            if module5_config_override is not None
+            else {}
+        ),
+        "cluster_rep": embedding_key,
+        "cluster_rep_decell": False,
+    }
+    metaspot_adata, module5_stats = run_module5_simple(
+        metaspot_adata,
+        final_data,
+        show_internal_progress=False,
+        module5_config_override=shared_module5_config,
+    )
+    if compartment_gate_enabled:
+        scores = pd.to_numeric(
+            pd.Series(crossfitted_compartment_score).rename_axis("metaspot"),
+            errors="coerce",
+        )
+        scores.index = scores.index.astype(str)
+        if not scores.index.is_unique:
+            raise ValueError(
+                f"{method_name}: cross-fitted compartment scores must have "
+                "unique MetaSpot IDs"
+            )
+        scores = scores.reindex(metaspot_adata.obs_names)
+        if scores.isna().any() or not scores.between(0.0, 1.0).all():
+            raise ValueError(
+                f"{method_name}: cross-fitted compartment scores must be "
+                "finite, cover every MetaSpot, and lie in [0, 1]"
+            )
+        # Inject only after Module 5: clustering remains geometry-free. RAP-X
+        # and the local MetaSpot refiner reuse their established signed slots;
+        # negative means nuclear and positive means cytoplasmic.
+        signed_gate = 0.5 - scores
+        metaspot_adata.obs["r_mean"] = signed_gate.to_numpy(dtype=np.float32)
+        metaspot_adata.obs["r_p50"] = signed_gate.to_numpy(dtype=np.float32)
+    metadomain_adata = build_adata2_from_adata1_and_pointdf(
+        metaspot_adata,
+        final_data,
+        show_internal_progress=False,
+        module6_config_override={
+            "pool_reps": [embedding_key],
+        },
+        graph_unit_override="benchmark_method_embedding",
+        pool_output_key_map={
+            embedding_key: metadomain_embedding_key,
+        },
+    )
+    if metadomain_embedding_key not in metadomain_adata.obsm:
+        raise RuntimeError(
+            f"{method_name}: Module 6 did not create "
+            f"{metadomain_embedding_key!r}"
+        )
+
+    membership = pd.DataFrame(
+        {
+            "metaspot": metaspot_adata.obs_names.astype(str),
+            "meta-domain": (
+                metaspot_adata.obs["meta-domain"].astype(str).to_numpy()
+            ),
+        }
+    )
+    membership_sha256 = _sha256_frame(membership)
+    representation_provenance = {
+        "method": str(method_name),
+        "source_unit": "metaspot",
+        "source_embedding_key": embedding_key,
+        "target_unit": "metadomain",
+        "target_embedding_key": metadomain_embedding_key,
+        "metadomain_membership_sha256": membership_sha256,
+        "uses_cellscope_dgi_embedding": False,
+        "metaspot_refinement_enabled": bool(enable_metaspot_refinement),
+        "metaspot_pool_source_embedding_key": (
+            embedding_key if enable_metaspot_refinement else None
+        ),
+        "metaspot_pool_internal_alias": metaspot_pool_alias,
+        "boundary_columns_removed_from_primary": removed_boundary_columns,
+        "boundary_sensitivity_source": (
+            "median_frozen_transcript_r_signed"
+            if enable_metaspot_refinement
+            else None
+        ),
+        "crossfitted_compartment_gate": {
+            "enabled": compartment_gate_enabled,
+            "score_source": (
+                str(crossfitted_score_source)
+                if compartment_gate_enabled
+                else None
+            ),
+            "score_semantics": (
+                "probability_nuclear; signed_internal_alias=0.5-score"
+                if compartment_gate_enabled
+                else None
+            ),
+            "injected_after_module5_clustering": compartment_gate_enabled,
+            "uses_test_fov_boundary_geometry": False,
+        },
+    }
+    metaspot_adata.uns["benchmark_representation"] = (
+        representation_provenance.copy()
+    )
+    metadomain_adata.uns["benchmark_representation"] = (
+        representation_provenance.copy()
+    )
+
+    annotation_input = final_data.copy()
+    if enable_metaspot_refinement:
+        annotation_input = annotation_input.drop(
+            columns=["r_signed"],
+            errors="ignore",
+        )
+    domain_by_metaspot = pd.Series(
+        metaspot_adata.obs["meta-domain"].astype(str).to_numpy(),
+        index=metaspot_adata.obs_names.astype(str),
+    )
+    annotation_input["meta-domain"] = (
+        annotation_input["metaspot"].astype(str).map(domain_by_metaspot)
+    )
+    if annotation_input["meta-domain"].isna().any():
+        missing = (
+            annotation_input.loc[
+                annotation_input["meta-domain"].isna(),
+                "metaspot",
+            ]
+            .astype(str)
+            .drop_duplicates()
+            .head(10)
+            .tolist()
+        )
+        raise ValueError(
+            f"{method_name}: failed to map method MetaDomains to {missing}"
+        )
+
+    annotation_out_dir = None
+    if out_dir is not None:
+        annotation_out_dir = os.path.join(
+            os.path.abspath(out_dir),
+            "shared_metadomain",
+        )
+        os.makedirs(annotation_out_dir, exist_ok=True)
+
+    (
+        metaspot_adata,
+        metadomain_adata,
+        annotated_final_data,
+    ) = _maybe_cluster_and_annotate(
+        metaspot_adata,
+        metadomain_adata,
+        annotation_input,
+        show_internal_progress=False,
+        out_dir=annotation_out_dir,
+        annotation_method="rapx",
+        gold_data=gold_df,
+        cluster_rep_override=metadomain_embedding_key,
+        rep_priority_override=[metadomain_embedding_key],
+        annotation_unit_override=(
+            "metaspot" if enable_metaspot_refinement else "metadomain"
+        ),
+        require_cluster_rep_override=True,
+        rapx_two_stage=compartment_gate_enabled,
+    )
+
+    source_columns = {
+        "production": "subcellular_annotation",
+        "candidate": "subcellular_candidate",
+        "exploratory": "subcellular_annotation_exploratory",
+        "strict": "subcellular_annotation_strict",
+        "tier": "subcellular_annotation_tier",
+    }
+    missing_columns = [
+        source
+        for source in source_columns.values()
+        if source not in metaspot_adata.obs.columns
+    ]
+    if missing_columns:
+        raise RuntimeError(
+            f"{method_name}: shared MetaDomain RAP-X did not emit "
+            f"{missing_columns}"
+        )
+    geometry_guarded_tracks = pd.DataFrame(
+        index=metaspot_adata.obs_names.astype(str)
+    )
+    for target, source in source_columns.items():
+        geometry_guarded_tracks[target] = (
+            metaspot_adata.obs[source].astype(str).to_numpy()
+        )
+
+    shared_metaspot_refinement_tracks = None
+    shared_metaspot_refinement_geometry_guarded_tracks = None
+    if enable_metaspot_refinement:
+        shared_metaspot_refinement_tracks = geometry_guarded_tracks.copy()
+        shared_metaspot_refinement_geometry_guarded_tracks = (
+            shared_metaspot_refinement_tracks.copy()
+        )
+        assert boundary_guard_values is not None
+        aligned_boundary = boundary_guard_values.reindex(
+            shared_metaspot_refinement_tracks.index
+        )
+        if aligned_boundary.isna().any():
+            raise RuntimeError(
+                f"{method_name}: failed to align r_p50 to shared refinement"
+            )
+        for track in RAPX_BENCHMARK_TRACKS:
+            guarded, _ = _apply_local_compartment_guard(
+                shared_metaspot_refinement_tracks[track],
+                aligned_boundary,
+            )
+            shared_metaspot_refinement_geometry_guarded_tracks[track] = (
+                guarded.to_numpy()
+            )
+
+    missing_domain_columns = [
+        source
+        for source in source_columns.values()
+        if source not in metadomain_adata.obs.columns
+    ]
+    if missing_domain_columns:
+        raise RuntimeError(
+            f"{method_name}: shared MetaDomain RAP-X did not retain raw "
+            f"MetaDomain columns {missing_domain_columns}"
+        )
+    raw_metadomain_tracks = pd.DataFrame(
+        index=metaspot_adata.obs_names.astype(str)
+    )
+    metadomain_by_metaspot = (
+        metaspot_adata.obs["meta-domain"].astype(str)
+    )
+    for target, source in source_columns.items():
+        raw_by_domain = pd.Series(
+            metadomain_adata.obs[source].astype(str).to_numpy(),
+            index=metadomain_adata.obs_names.astype(str),
+        )
+        mapped = metadomain_by_metaspot.map(raw_by_domain)
+        if mapped.isna().any():
+            missing_domains = (
+                metadomain_by_metaspot.loc[mapped.isna()]
+                .drop_duplicates()
+                .head(10)
+                .tolist()
+            )
+            raise RuntimeError(
+                f"{method_name}: failed to map raw RAP-X labels from "
+                f"MetaDomains {missing_domains}"
+            )
+        raw_metadomain_tracks[target] = mapped.to_numpy()
+
+    module5_row = (
+        module5_stats.iloc[0].to_dict()
+        if len(module5_stats)
+        else {}
+    )
+    leiden_column = (
+        "leiden_embedding"
+        if "leiden_embedding" in metadomain_adata.obs.columns
+        else "leiden"
+    )
+    rapx_meta = dict(
+        metadomain_adata.uns.get("subcellular_annotation_meta", {})
+    )
+    primary_tracks = (
+        shared_metaspot_refinement_tracks
+        if enable_metaspot_refinement
+        else raw_metadomain_tracks
+    )
+    guarded_tracks = (
+        shared_metaspot_refinement_geometry_guarded_tracks
+        if enable_metaspot_refinement
+        else geometry_guarded_tracks
+    )
+    assert primary_tracks is not None and guarded_tracks is not None
+
+    metadata: dict[str, object] = {
+        "protocol": "shared_metadomain",
+        "method": str(method_name),
+        "annotation_group_unit": str(
+            metadomain_adata.uns.get("annotation_unit", "metadomain")
+        ),
+        "n_annotation_groups": int(
+            metadomain_adata.obs.get(
+                "annotation_group",
+                pd.Series(index=metadomain_adata.obs_names, dtype="object"),
+            ).nunique()
+        ),
+        "n_metaspots": int(metaspot_adata.n_obs),
+        "n_metadomains": int(metadomain_adata.n_obs),
+        "n_embedding_clusters": int(
+            metadomain_adata.obs[leiden_column].astype(str).nunique()
+        ),
+        "module5": module5_row,
+        "representation": representation_provenance,
+        "population_provenance": population,
+        "rapx_params": rapx_meta.get("params", {}),
+        "primary_track_semantics": (
+            "crossfitted_compartment_gated_shared_metaspot_refinement"
+            if compartment_gate_enabled
+            else "shared_metaspot_refinement_without_boundary_geometry"
+            if enable_metaspot_refinement
+            else "raw_metadomain_rapx_without_metaspot_geometry_correction"
+        ),
+        "geometry_guarded_track_semantics": (
+            "auxiliary_posthoc_boundary_sensitivity_track"
+        ),
+        "n_production_labels_changed_by_geometry_guard": int(
+            primary_tracks["production"]
+            .astype(str)
+            .ne(guarded_tracks["production"].astype(str))
+            .sum()
+        ),
+    }
+    return {
+        "adata_metaspot": metaspot_adata,
+        "adata_metadomain": metadomain_adata,
+        "final_data": annotated_final_data,
+        # Canonical fair-comparison result: the MetaDomain-level RAP-X call
+        # before any per-MetaSpot nucleus-boundary correction.
+        "tracks": primary_tracks,
+        "raw_metadomain_tracks": raw_metadomain_tracks,
+        # Sensitivity analysis only.  All methods share this downstream guard,
+        # so it must not be used as the primary representation benchmark.
+        "geometry_guarded_tracks": geometry_guarded_tracks,
+        "shared_metaspot_refinement_tracks": (
+            shared_metaspot_refinement_tracks
+        ),
+        "shared_metaspot_refinement_geometry_guarded_tracks": (
+            shared_metaspot_refinement_geometry_guarded_tracks
+        ),
+        "metadata": metadata,
+    }
+
+
+def write_benchmark_h5ad(
+    adata_source,
+    obs_columns: Mapping[str, object],
+    output_path: str,
+    *,
+    obsm_keys: Sequence[str] = (),
+    layer_keys: Sequence[str] = (),
+    metadata: Mapping[str, Any] | None = None,
+) -> None:
+    """Write an explicitly scoped benchmark AnnData without inherited reps."""
+
+    import anndata as ad
+
+    obs_names = pd.Index(adata_source.obs_names.astype(str))
+    obs_clean = pd.DataFrame(index=obs_names)
+    for column_name, values in obs_columns.items():
+        if isinstance(values, pd.Series):
+            aligned = values.copy()
+            aligned.index = aligned.index.astype(str)
+            aligned = aligned.reindex(obs_names)
+        else:
+            array = np.asarray(values)
+            if len(array) != len(obs_names):
+                raise ValueError(
+                    f"{column_name}: expected {len(obs_names)} values, "
+                    f"got {len(array)}"
+                )
+            aligned = pd.Series(array, index=obs_names)
+        if (
+            pd.api.types.is_numeric_dtype(aligned.dtype)
+            or pd.api.types.is_bool_dtype(aligned.dtype)
+        ):
+            obs_clean[str(column_name)] = aligned.to_numpy()
+        else:
+            obs_clean[str(column_name)] = pd.Categorical(
+                aligned.astype("string").to_numpy()
+            )
+
+    output = ad.AnnData(
+        X=adata_source.X.copy(),
+        obs=obs_clean,
+        var=adata_source.var.copy(),
+    )
+    for key in obsm_keys:
+        if key not in adata_source.obsm:
+            raise KeyError(f"Missing requested benchmark embedding {key!r}")
+        output.obsm[str(key)] = np.asarray(
+            adata_source.obsm[key]
+        ).copy()
+    for key in layer_keys:
+        if key not in adata_source.layers:
+            raise KeyError(f"Missing requested benchmark layer {key!r}")
+        output.layers[str(key)] = adata_source.layers[key].copy()
+    output.uns["benchmark_output"] = {
+        "schema_version": 1,
+        "observation_unit": (
+            "metadomain"
+            if "meta-domain" not in obs_clean.columns
+            and "n_metaspots" in obs_clean.columns
+            else "metaspot"
+        ),
+        "included_obsm_keys": [str(key) for key in obsm_keys],
+        "excluded_inherited_representations": True,
+        **(dict(metadata) if metadata else {}),
+    }
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    output.write_h5ad(output_path, compression="gzip")
+
+
 def validate_benchmark_population(
     final_data: pd.DataFrame,
     obs_names: Sequence[object],
@@ -581,6 +1131,7 @@ def validate_benchmark_population(
         raise ValueError(
             f"Benchmark final_data is missing columns: {sorted(missing)}"
         )
+    _validated_binary_geometry_truth(final_data["overlaps_nucleus"])
 
     metaspot = final_data["metaspot"].astype(str)
     observed = pd.Index(pd.unique(metaspot))
@@ -623,6 +1174,27 @@ def validate_benchmark_population(
     }
 
 
+def _validated_binary_geometry_truth(values: pd.Series) -> pd.Series:
+    """Return 0/1 geometry truth or fail on null and non-binary values."""
+    numeric = pd.to_numeric(values, errors="coerce")
+    valid = numeric.isin([0, 1])
+    if not bool(valid.all()):
+        invalid_examples = (
+            values.loc[~valid]
+            .astype("string")
+            .fillna("<NA>")
+            .value_counts(dropna=False)
+            .head(10)
+            .to_dict()
+        )
+        raise ValueError(
+            "overlaps_nucleus must contain only binary 0/1 values; "
+            f"invalid_rows={int((~valid).sum())}, "
+            f"examples={invalid_examples}"
+        )
+    return numeric.astype(np.int8)
+
+
 def evaluate_rapx_annotation_tracks(
     final_data: pd.DataFrame,
     tracks: pd.DataFrame,
@@ -642,10 +1214,9 @@ def evaluate_rapx_annotation_tracks(
             "cell_id": final_data["cell_id"].astype(str),
             "metaspot": metaspot,
             "True_Class": np.where(
-                pd.to_numeric(
-                    final_data["overlaps_nucleus"],
-                    errors="coerce",
-                ).fillna(0).astype(int).eq(1),
+                _validated_binary_geometry_truth(
+                    final_data["overlaps_nucleus"]
+                ).eq(1),
                 "Nuclear",
                 "Cytoplasmic",
             ),
@@ -694,15 +1265,40 @@ def extract_rapx_tracks_from_final_data(
     """Recover one evidence-aware RAP-X call per MetaSpot from final output."""
 
     frame = normalize_benchmark_metaspot_column(final_data)
+    source_candidates = {
+        "production": ("subcellular_annotation",),
+        "candidate": (
+            "subcellular_candidate_domain",
+            "subcellular_candidate",
+        ),
+        "exploratory": (
+            "subcellular_annotation_domain_exploratory",
+            "subcellular_annotation_exploratory",
+        ),
+        "strict": (
+            "subcellular_annotation_domain_strict",
+            "subcellular_annotation_strict",
+        ),
+        "tier": (
+            "subcellular_annotation_domain_tier",
+            "subcellular_annotation_tier",
+        ),
+    }
     sources = {
-        "production": "subcellular_annotation",
-        "candidate": "subcellular_candidate",
-        "exploratory": "subcellular_annotation_exploratory",
-        "strict": "subcellular_annotation_strict",
-        "tier": "subcellular_annotation_tier",
+        target: next(
+            (
+                source
+                for source in candidates
+                if source in frame.columns
+            ),
+            None,
+        )
+        for target, candidates in source_candidates.items()
     }
     missing = [
-        source for source in sources.values() if source not in frame.columns
+        source_candidates[target]
+        for target, source in sources.items()
+        if source is None
     ]
     if missing:
         raise KeyError(
@@ -713,6 +1309,7 @@ def extract_rapx_tracks_from_final_data(
     metaspot = frame["metaspot"].astype(str)
     tracks = pd.DataFrame()
     for target, source in sources.items():
+        assert source is not None
         values = frame[source].astype(str)
         unique_count = (
             pd.DataFrame({"metaspot": metaspot, "value": values})
@@ -743,10 +1340,9 @@ def evaluate_geometry_clustering_diagnostic(
     metaspot = final_data["metaspot"].astype(str)
     clusters = metaspot.map(cluster_labels.astype(str))
     truth = np.where(
-        pd.to_numeric(
-            final_data["overlaps_nucleus"],
-            errors="coerce",
-        ).fillna(0).astype(int).eq(1),
+        _validated_binary_geometry_truth(
+            final_data["overlaps_nucleus"]
+        ).eq(1),
         "Nuclear",
         "Cytoplasmic",
     )

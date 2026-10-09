@@ -389,6 +389,7 @@ def refine_omm_metaspots(
     gmm_n_init: int = 10,
     gmm_reg_covar: float = 1e-4,
     copy_adata: bool = False,
+    broadcast_to_final: bool = True,
 ) -> Tuple[ad.AnnData, pd.DataFrame, Dict[str, Any]]:
     """Refine OMM evidence at MetaSpot resolution.
 
@@ -410,7 +411,8 @@ def refine_omm_metaspots(
     -------
     updated_adata1, updated_final_df, metadata
         The production annotation is never overwritten.  New columns listed
-        in :data:`OMM_REFINEMENT_COLUMNS` are added to both outputs.
+        in :data:`OMM_REFINEMENT_COLUMNS` are added to ``adata1`` and, when
+        ``broadcast_to_final`` is true, to the transcript table as well.
 
     Notes
     -----
@@ -440,7 +442,10 @@ def refine_omm_metaspots(
         raise ValueError("bootstrap_iterations must be non-negative")
 
     output_adata = adata1.copy() if copy_adata else adata1
-    output_final = final_df.copy()
+    # Large production runs broadcast MetaSpot columns once at the end of the
+    # annotation stage.  Keeping this opt-out here avoids copying and hashing
+    # the full transcript table once per OMM audit column.
+    output_final = final_df.copy() if broadcast_to_final else final_df
     n_spots = output_adata.n_obs
 
     if metaspot_col in output_adata.obs.columns:
@@ -460,15 +465,19 @@ def refine_omm_metaspots(
     if not spot_ids.is_unique:
         raise ValueError("MetaSpot identifiers in adata1 must be unique")
 
-    if output_final[metaspot_col].isna().any():
-        raise ValueError("MetaSpot identifiers in final_df contain missing values")
-    final_spot_ids = output_final[metaspot_col].astype(str)
-    missing_spots = pd.Index(pd.unique(final_spot_ids)).difference(spot_ids)
-    if len(missing_spots):
-        raise ValueError(
-            "final_df contains MetaSpots absent from adata1; "
-            f"examples={missing_spots[:5].tolist()}"
-        )
+    final_spot_ids: Optional[pd.Series] = None
+    if broadcast_to_final:
+        if output_final[metaspot_col].isna().any():
+            raise ValueError(
+                "MetaSpot identifiers in final_df contain missing values"
+            )
+        final_spot_ids = output_final[metaspot_col].astype(str)
+        missing_spots = pd.Index(pd.unique(final_spot_ids)).difference(spot_ids)
+        if len(missing_spots):
+            raise ValueError(
+                "final_df contains MetaSpots absent from adata1; "
+                f"examples={missing_spots[:5].tolist()}"
+            )
 
     domain_gate = _resolve_domain_gates(
         output_adata,
@@ -874,12 +883,14 @@ def refine_omm_metaspots(
         "omm_confirmed_or_shared_soft_weight"
     ] = possible_soft.astype(np.float32)
 
-    for column in OMM_REFINEMENT_COLUMNS:
-        mapping = pd.Series(
-            output_adata.obs[column].to_numpy(),
-            index=spot_ids,
-        )
-        output_final[column] = final_spot_ids.map(mapping).to_numpy()
+    if broadcast_to_final:
+        assert final_spot_ids is not None
+        for column in OMM_REFINEMENT_COLUMNS:
+            mapping = pd.Series(
+                output_adata.obs[column].to_numpy(),
+                index=spot_ids,
+            )
+            output_final[column] = final_spot_ids.map(mapping).to_numpy()
 
     if identifiable:
         confirmed_values = np.nan_to_num(confirmed_soft, nan=0.0)
@@ -997,6 +1008,7 @@ def refine_omm_metaspots(
         ),
         "n_metaspots": int(n_spots),
         "n_transcripts_from_count_matrix": int(round(float(total_counts.sum()))),
+        "broadcast_to_final": bool(broadcast_to_final),
         "marker_reference": {
             "positive_input_genes": len(positive_canonical),
             "alternative_input_genes": len(alternative_canonical),

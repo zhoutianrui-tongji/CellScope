@@ -1,31 +1,41 @@
-import sys
 import os
 import copy
 import functools
-import re
+import json
+import subprocess
 try:
     import warnings as _warnings
-    _warnings.simplefilter("ignore")
-    _warnings.filterwarnings("ignore", category=FutureWarning)
-    _warnings.filterwarnings("ignore", category=UserWarning)
-    _warnings.filterwarnings("ignore", category=RuntimeWarning)
-    _warnings.filterwarnings("ignore", category=DeprecationWarning)
-    # Silence noisy modules early
+    # Keep only known third-party compatibility notices quiet. Runtime and
+    # scientific warnings remain visible to users and logs.
     _warnings.filterwarnings("ignore", category=FutureWarning, module=r"anndata.*")
     _warnings.filterwarnings("ignore", category=FutureWarning, module=r"sklearn.utils.deprecation")
-    os.environ.setdefault("PYTHONWARNINGS", "ignore")
 except Exception:
     pass
 import click
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
-import pandas as pd
 import yaml
 
-from .pipeline import run_pipeline
-from .config import load_params_yaml, get_default_params_path
+from .io import read_table_preview
+from .config import (
+    LEGACY_OMM_REFINEMENT_KEYS,
+    get_default_params_path,
+    load_params_yaml,
+    resolve_dgi_configuration,
+)
 from . import __version__
+from .provenance import (
+    atomic_write_json,
+    atomic_write_yaml,
+    build_input_provenance,
+    bundled_reference_provenance,
+    file_provenance,
+    git_provenance,
+    sha256_mapping,
+    source_tree_provenance,
+    utc_now,
+)
 from .run_lock import OutputDirectoryLockError, OutputDirectoryRunLock
 
 
@@ -33,7 +43,7 @@ console = Console()
 
 
 def _safe_load_yaml(path: str) -> dict:
-    """Directly load YAML dict from path; return {} on any failure."""
+    """Load a YAML mapping for a missing-default fallback only."""
     if not path or not os.path.exists(path):
         console.print(f"[red]YAML load skipped (not exists): {path}[/red]") if path else None
         return {}
@@ -48,27 +58,32 @@ def _safe_load_yaml(path: str) -> dict:
             console.print(f"[red]YAML parsed but not dict, type={type(data)}[/red]")
             return {}
         return data
-    except Exception as e:
-        console.print(f"[yellow]YAML load error at {path}: {e}; try sanitize and reload[/yellow]")
-        try:
-            sanitized = content.replace("\t", "  ")
-            sanitized = re.sub(r"[\x00-\x08\x0b-\x0c\x0e-\x1f]", "", sanitized)
-            sanitized = re.sub(r":([^\s\[{])", r": \1", sanitized)
-            data = yaml.safe_load(sanitized) or {}
-            if isinstance(data, dict) and data:
-                console.print(f"[green]YAML sanitized and loaded successfully[/green]")
-                return data
-            console.print("[red]YAML sanitize reload parsed but empty or non-dict[/red]")
-            return {}
-        except Exception as e2:
-            console.print(f"[red]YAML sanitize reload failed: {e2}[/red]")
-            return {}
+    except Exception as exc:
+        console.print(f"[red]YAML load error at {path}: {exc}[/red]")
+        return {}
 
 
-def _load_params_with_fallback(path: str, allow_fallback: bool = False):
+def _load_params_with_fallback(
+    path: str,
+    allow_fallback: bool = False,
+    *,
+    resolve_config: bool = True,
+):
     """Load YAML; optionally fall back to repo config/params.yaml if empty or missing."""
     path_norm = os.path.normpath(os.path.abspath(path)) if path else None
-    cfg = load_params_yaml(path=path_norm) if path_norm else {}
+    try:
+        cfg = (
+            load_params_yaml(
+                path=path_norm,
+                resolve_config=resolve_config,
+            )
+            if path_norm
+            else {}
+        )
+    except ValueError as exc:
+        raise click.ClickException(
+            f"Invalid configuration at {path_norm}: {exc}"
+        ) from exc
     if not cfg:
         cfg = _safe_load_yaml(path_norm)
     if cfg:
@@ -76,7 +91,10 @@ def _load_params_with_fallback(path: str, allow_fallback: bool = False):
     if allow_fallback:
         fallback = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "config", "params.yaml"))
         if (not path_norm) or (fallback != path_norm):
-            cfg = load_params_yaml(path=fallback) or _safe_load_yaml(fallback)
+            cfg = load_params_yaml(
+                path=fallback,
+                resolve_config=resolve_config,
+            ) or _safe_load_yaml(fallback)
             if cfg:
                 return cfg, fallback
     if path_norm:
@@ -99,6 +117,28 @@ def _merge_with_defaults(default_cfg: dict, user_cfg: dict) -> dict:
     return d
 
 
+def _preserve_legacy_omm_policy(
+    merged_cfg: dict,
+    user_cfg: dict,
+) -> dict:
+    """Keep pre-policy user YAML from inheriting the new balanced default."""
+    user_annotation = (
+        user_cfg.get("annotation", {})
+        if isinstance(user_cfg, dict)
+        else {}
+    )
+    if (
+        isinstance(user_annotation, dict)
+        and "omm_policy" not in user_annotation
+        and any(
+            key in user_annotation
+            for key in LEGACY_OMM_REFINEMENT_KEYS
+        )
+    ):
+        merged_cfg.setdefault("annotation", {}).pop("omm_policy", None)
+    return merged_cfg
+
+
 def _with_output_directory_lock(func):
     """Serialize CLI runs that target the same output directory."""
 
@@ -107,9 +147,24 @@ def _with_output_directory_lock(func):
         out_dir = kwargs.get("out_dir")
         if not out_dir:
             raise click.ClickException("Missing required --out-dir for run locking.")
+        lock = OutputDirectoryRunLock(out_dir)
         try:
-            with OutputDirectoryRunLock(out_dir):
-                return func(*args, **kwargs)
+            with lock:
+                try:
+                    return func(*args, **kwargs)
+                finally:
+                    try:
+                        subprocess.run(
+                            ["chmod", "-R", "g+rX", lock.out_dir],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                        )
+                    except (OSError, subprocess.CalledProcessError) as exc:
+                        console.print(
+                            "[yellow]Could not make outputs group-readable: "
+                            f"{exc}[/yellow]"
+                        )
         except OutputDirectoryLockError as exc:
             raise click.ClickException(str(exc)) from exc
 
@@ -118,9 +173,9 @@ def _with_output_directory_lock(func):
 
 @click.command(context_settings={"help_option_names": ["-h", "--help"]})
 @click.version_option(version=__version__, prog_name="cellscoper", message="%(prog)s %(version)s")
-@click.option("--spatial", required=True, type=click.Path(exists=True), help="Spatial Omics CSV file.")
-@click.option("--cell-boundaries", required=True, type=click.Path(exists=True), help="Cell boundaries CSV file.")
-@click.option("--nucleus-boundaries", required=True, type=click.Path(exists=True), help="Nucleus boundaries CSV file.")
+@click.option("--spatial", required=True, type=click.Path(exists=True), help="Spatial Omics CSV/Parquet file.")
+@click.option("--cell-boundaries", required=True, type=click.Path(exists=True), help="Cell boundaries CSV/Parquet file.")
+@click.option("--nucleus-boundaries", required=True, type=click.Path(exists=True), help="Nucleus boundaries CSV/Parquet file.")
 @click.option("--out-dir", required=True, type=click.Path(), help="Output directory.")
 @click.option("--gold-data", type=click.Path(exists=True), help="Optional gold table CSV/Parquet to use for annotation (overrides default).")
 @click.option("--no-resume", is_flag=True, help="Disable resume from checkpoints.")
@@ -133,37 +188,209 @@ def _with_output_directory_lock(func):
     help="Path to params.yaml (replaces built-in default).",
 )
 @click.option("--internal-progress/--no-internal-progress", default=False, show_default=True, help="Show internal step prints and per-step timing.")
-@click.option("--resume-policy", type=click.Choice(["auto","minimal","force"], case_sensitive=False), default="auto", show_default=True, help="Resume behavior: auto (continue from last completed), minimal (diff-based), force (start from scratch).")
+@click.option(
+    "--resume-policy",
+    type=click.Choice(["auto", "minimal", "force"], case_sensitive=False),
+    default=None,
+    help=(
+        "Resume behavior. If omitted, use io.resume_policy from the effective "
+        "configuration (default: minimal)."
+    ),
+)
+@click.option(
+    "--resume-from",
+    type=click.Choice(
+        [
+            "load_inputs",
+            "preprocess",
+            "build_anndata",
+            "annotate",
+            "write_outputs",
+        ],
+        case_sensitive=False,
+    ),
+    default=None,
+    help=(
+        "Explicit stage to rerun from. Overrides io.resume_from for this "
+        "invocation; use 'annotate' to reuse upstream checkpoints."
+    ),
+)
 @click.option("--dry-run-diff", is_flag=True, help="Only show which stage would rerun based on config changes; do not execute.")
-# 'resume_from' is configured via YAML (not via CLI)
 
 # Module parameters are read from the unified YAML config (no per-module CLI overrides)
 # matmul precision is auto-detected on GPU; option removed for simplicity
 @_with_output_directory_lock
-def main(spatial, cell_boundaries, nucleus_boundaries, out_dir, gold_data, no_resume, no_save_intermediate, no_show_sample, config, internal_progress, resume_policy, dry_run_diff):
+def main(spatial, cell_boundaries, nucleus_boundaries, out_dir, gold_data, no_resume, no_save_intermediate, no_show_sample, config, internal_progress, resume_policy, resume_from, dry_run_diff):
     """CellScoper CLI: run pipeline and write outputs."""
     os.makedirs(out_dir, exist_ok=True)
+    out_dir = os.path.realpath(os.path.abspath(out_dir))
 
     # Load unified YAML config (params.yaml); allow overriding with --config
     cfg_path = config or os.environ.get("CELLSCOPE_CONFIG") or None
-    default_cfg, default_used_path = _load_params_with_fallback(get_default_params_path(), allow_fallback=True)
+    default_cfg, default_used_path = _load_params_with_fallback(
+        get_default_params_path(),
+        allow_fallback=True,
+        resolve_config=False,
+    )
     if not default_cfg:
         console.print("[red]Warning: default params.yaml could not be loaded or is empty[/red]")
-    user_cfg, user_used_path = _load_params_with_fallback(cfg_path, allow_fallback=False) if cfg_path else ({}, None)
-    cfg = _merge_with_defaults(default_cfg, user_cfg)
-    # 新增调试输出，确认配置读取与合并结果
-    console.print(f"[cyan]default_cfg loaded from:[/cyan] {default_used_path} (empty={not bool(default_cfg)})")
-    console.print(f"[cyan]user_cfg loaded from:[/cyan] {user_used_path or 'N/A'} (empty={not bool(user_cfg)})")
-    console.print(f"[cyan]merged cfg keys:[/cyan] {list(cfg.keys())}")
-    if user_used_path:
-        console.print(f"[cyan]Loaded params from:[/cyan] {user_used_path} (merged with defaults)")
-    else:
-        console.print(f"[cyan]Loaded params from default:[/cyan] {default_used_path}")
-    # Ensure downstream pipeline internals load the same effective config file.
-    if user_used_path:
-        os.environ["CELLSCOPE_CONFIG"] = os.path.abspath(user_used_path)
-    elif default_used_path:
-        os.environ.setdefault("CELLSCOPE_CONFIG", os.path.abspath(default_used_path))
+    user_cfg, user_used_path = (
+        _load_params_with_fallback(
+            cfg_path,
+            allow_fallback=False,
+            resolve_config=False,
+        )
+        if cfg_path
+        else ({}, None)
+    )
+    try:
+        cfg = resolve_dgi_configuration(
+            _preserve_legacy_omm_policy(
+                _merge_with_defaults(default_cfg, user_cfg),
+                user_cfg,
+            )
+        )
+    except ValueError as exc:
+        raise click.ClickException(
+            f"Invalid effective configuration: {exc}"
+        ) from exc
+    if no_show_sample:
+        cfg["show_sample"] = False
+    io_cfg = cfg.setdefault("io", {})
+    if no_save_intermediate:
+        io_cfg["write_intermediate"] = False
+    if resume_policy is not None:
+        io_cfg["resume_policy"] = str(resume_policy).lower()
+    if resume_from is not None:
+        io_cfg["resume_from"] = str(resume_from).lower()
+    effective_resume_policy = str(
+        io_cfg.get("resume_policy", "minimal")
+    ).lower()
+    if effective_resume_policy not in {"auto", "minimal", "force"}:
+        raise click.ClickException(
+            "io.resume_policy must be one of: auto, minimal, force"
+        )
+    cfg["run"] = {
+        "resume": not no_resume,
+        "resume_policy": effective_resume_policy,
+        "resume_from": io_cfg.get("resume_from"),
+        "save_intermediate": bool(
+            io_cfg.get("write_intermediate", True)
+        ),
+        "show_sample": bool(cfg.get("show_sample", True)),
+        "dry_run_diff": bool(dry_run_diff),
+    }
+
+    effective_config_path = os.path.join(out_dir, "effective_params.yaml")
+    params_used_path = os.path.join(out_dir, "params_used.yaml")
+    manifest_path = os.path.join(out_dir, "run_manifest.json")
+    previous_invocation = None
+    # A SIGKILL/OOM/segmentation fault cannot execute the normal error handler,
+    # so an older manifest may remain marked ``running``. The output-directory
+    # lock is held by this invocation at this point, which proves no previous
+    # writer is active; preserve that stale status as diagnostic history before
+    # replacing the manifest for the new run.
+    if os.path.isfile(manifest_path):
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as handle:
+                previous_manifest = json.load(handle)
+            if previous_manifest.get("status") == "running":
+                previous_manifest["status"] = "interrupted"
+                previous_manifest["interrupted_at"] = utc_now()
+                previous_manifest["interrupted_reason"] = (
+                    "Previous invocation did not finalize its manifest; "
+                    "check cellscoper.error.log and kernel logs."
+                )
+                atomic_write_json(manifest_path, previous_manifest)
+                previous_invocation = {
+                    key: previous_manifest.get(key)
+                    for key in (
+                        "status",
+                        "started_at",
+                        "interrupted_at",
+                        "interrupted_reason",
+                    )
+                }
+        except Exception:
+            # A malformed/stale manifest must not prevent a new run from
+            # starting; the new manifest below will replace it atomically.
+            pass
+    try:
+        atomic_write_yaml(effective_config_path, cfg)
+    except Exception as exc:
+        raise click.ClickException(
+            f"Could not write effective configuration: {exc}"
+        ) from exc
+
+    previous_config_env = os.environ.get("CELLSCOPE_CONFIG")
+    os.environ["CELLSCOPE_CONFIG"] = effective_config_path
+    # Numeric thread pools initialize while importing the pipeline, so defer
+    # that import until the effective configuration is available.
+    from .pipeline import run_pipeline
+
+    config_sha256 = sha256_mapping(cfg)
+    console.print(
+        "[cyan]Configuration[/cyan] "
+        f"default={default_used_path} "
+        f"user={user_used_path or 'none'} "
+        f"effective={effective_config_path} "
+        f"sha256={config_sha256[:12]}"
+    )
+    console.print(
+        "[cyan]Runtime[/cyan] "
+        f"resume={not no_resume} "
+        f"resume_policy={effective_resume_policy} "
+        f"resume_from={io_cfg.get('resume_from') or 'auto'} "
+        f"write_intermediate={io_cfg.get('write_intermediate', True)} "
+        f"dry_run={bool(dry_run_diff)}"
+    )
+
+    hash_inputs = bool(io_cfg.get("provenance_hash_inputs", True))
+    console.print(
+        "[cyan]Provenance[/cyan] "
+        f"fingerprinting inputs (sha256={hash_inputs})"
+    )
+    try:
+        input_provenance = build_input_provenance(
+            spatial_path=spatial,
+            cell_boundaries_path=cell_boundaries,
+            nucleus_boundaries_path=nucleus_boundaries,
+            gold_data=gold_data,
+            hash_inputs=hash_inputs,
+        )
+        package_dir = os.path.dirname(__file__)
+        manifest = {
+            "schema_version": 1,
+            "status": "running",
+            "started_at": utc_now(),
+            "previous_invocation": previous_invocation,
+            "cellscoper_version": __version__,
+            "configuration": {
+                "default_path": default_used_path,
+                "user_path": user_used_path,
+                "effective_path": effective_config_path,
+                "effective_sha256": config_sha256,
+            },
+            "invocation": dict(cfg["run"]),
+            "inputs": input_provenance,
+            "references": bundled_reference_provenance(
+                package_dir,
+                hash_content=hash_inputs,
+            ),
+            "code": {
+                **git_provenance(package_dir),
+                **source_tree_provenance(package_dir),
+            },
+        }
+        atomic_write_json(manifest_path, manifest)
+    except Exception as exc:
+        if previous_config_env is None:
+            os.environ.pop("CELLSCOPE_CONFIG", None)
+        else:
+            os.environ["CELLSCOPE_CONFIG"] = previous_config_env
+        raise click.ClickException(
+            f"Could not build run provenance: {exc}"
+        ) from exc
     try:
         m3 = cfg.get("module3", {})
         target_sites = m3.get("target_sites_per_metaspot")
@@ -205,33 +432,27 @@ def main(spatial, cell_boundaries, nucleus_boundaries, out_dir, gold_data, no_re
             preview = {"segmentation_mode": "legacy_hdbscan_kmeans"}
         preview.update({key: m3.get(key) for key in active_keys})
         console.print("[cyan]module3 active config:[/cyan] " + str(preview))
-    except Exception:
-        pass
-    # Persist the effective config for reproducibility
-    try:
-        with open(os.path.join(out_dir, "params_used.yaml"), "w", encoding="utf-8") as f:
-            yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
-    except Exception:
-        pass
-    # Compression, formats, and module parameters are controlled by the YAML config
-    if no_show_sample:
-        cfg["show_sample"] = False
+    except Exception as exc:
+        console.print(
+            f"[yellow]Could not summarize Module 3 settings: {exc}[/yellow]"
+        )
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[bold blue]{task.description}"),
-        BarColumn(),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
-        t = progress.add_task("Starting pipeline", total=None)
-        try:
+    outputs = {}
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            t = progress.add_task("Starting pipeline", total=None)
             # Show input samples by default unless disabled via config/flag
             if cfg.get("show_sample", True):
                 # Read only a small preview to avoid long startup delays on large files
-                s_df = pd.read_csv(spatial, nrows=5)
-                c_df = pd.read_csv(cell_boundaries, nrows=5)
-                n_df = pd.read_csv(nucleus_boundaries, nrows=5)
+                s_df = read_table_preview(spatial, nrows=5)
+                c_df = read_table_preview(cell_boundaries, nrows=5)
+                n_df = read_table_preview(nucleus_boundaries, nrows=5)
                 def show_table(df, title):
                     table = Table(title=title, show_lines=False)
                     for col in df.columns:
@@ -269,7 +490,9 @@ def main(spatial, cell_boundaries, nucleus_boundaries, out_dir, gold_data, no_re
                 gold_data=gold_data,
                 out_dir=out_dir,
                 resume=not no_resume,
-                save_intermediate=not no_save_intermediate,
+                save_intermediate=bool(
+                    io_cfg.get("write_intermediate", True)
+                ),
                 lite_intermediate=bool(cfg.get("io", {}).get("lite_intermediate", False)),
                 compression=cfg.get("io", {}).get("h5ad_compression", "lzf"),
                 resume_from=cfg.get("io", {}).get("resume_from"),
@@ -279,22 +502,72 @@ def main(spatial, cell_boundaries, nucleus_boundaries, out_dir, gold_data, no_re
                 scvi_epochs=_scvi_epochs_cfg,
                 dgi_epochs=_dgi_epochs_cfg,
                 enable_dgi_sage=bool(cfg.get("module8", {}).get("enable_dgi_sage", False)),
-                resume_policy=str(resume_policy).lower(),
+                resume_policy=effective_resume_policy,
                 dry_run_diff=bool(dry_run_diff),
                 progress_callback=_cb,
+                input_provenance=input_provenance,
             )
-            console.print("[cyan]run_pipeline kwargs preview:[/cyan]")
-            for k, v in _run_kwargs.items():
-                console.print(f"  - {k}: {v}")
+            console.print(
+                "[cyan]Pipeline[/cyan] "
+                f"annotation={_enable_annotation} "
+                f"final_format={_run_kwargs['final_format']} "
+                f"config={effective_config_path}"
+            )
 
             outputs = run_pipeline(**_run_kwargs)
             progress.update(t, description="Finished")
-        except Exception as e:
-            progress.update(t, description="Error")
-            console.print(f"[red]Error: {e}")
-            sys.exit(1)
+        if dry_run_diff:
+            manifest["status"] = "dry_run_completed"
+        else:
+            atomic_write_yaml(params_used_path, cfg)
+            manifest["status"] = "completed"
+        manifest["finished_at"] = utc_now()
+        manifest["outputs"] = {
+            key: (
+                file_provenance(value, hash_content=False)
+                if isinstance(value, str) and os.path.isfile(value)
+                else value
+            )
+            for key, value in outputs.items()
+        }
+        atomic_write_json(manifest_path, manifest)
+    except Exception as exc:
+        manifest["status"] = "failed"
+        manifest["finished_at"] = utc_now()
+        manifest["error"] = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+        }
+        try:
+            atomic_write_json(manifest_path, manifest)
+        except Exception as manifest_exc:
+            console.print(
+                "[yellow]Failed to update run manifest after error: "
+                f"{manifest_exc}[/yellow]"
+            )
+        console.print(
+            f"[red]Pipeline failed ({type(exc).__name__}): {exc}[/red]"
+        )
+        console.print(
+            f"[yellow]See {os.path.join(out_dir, 'cellscoper.error.log')} "
+            f"and {manifest_path}[/yellow]"
+        )
+        raise click.ClickException(str(exc)) from exc
+    finally:
+        if previous_config_env is None:
+            os.environ.pop("CELLSCOPE_CONFIG", None)
+        else:
+            os.environ["CELLSCOPE_CONFIG"] = previous_config_env
 
-    console.print("[green]Done.")
+    if dry_run_diff:
+        console.print(
+            f"[green]Dry-run complete.[/green] Manifest: {manifest_path}"
+        )
+        return
+    console.print(
+        "[green]Done.[/green] "
+        f"params={params_used_path} manifest={manifest_path}"
+    )
     # Summarize outputs (filter None) and enrich with shapes/stats
     try:
         import anndata as _ad
@@ -337,9 +610,13 @@ def main(spatial, cell_boundaries, nucleus_boundaries, out_dir, gold_data, no_re
                         # subtract header line
                         rows = sum(1 for _ in f) - 1
                 else:
-                    df_tmp = _pd.read_parquet(final_table_path, columns=[c for c in _pd.read_parquet(final_table_path).columns[:1]])
-                    # Fallback to full read if minimal slice fails
-                    rows = len(df_tmp)
+                    try:
+                        import pyarrow.parquet as _pq
+                        rows = int(
+                            _pq.ParquetFile(final_table_path).metadata.num_rows
+                        )
+                    except Exception:
+                        rows = len(_pd.read_parquet(final_table_path))
                 meta_info.append(f"- final_data: {final_table_path} (rows={rows})")
             else:
                 meta_info.append(f"- final_data: {final_table_path}")

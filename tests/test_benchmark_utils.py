@@ -1,5 +1,8 @@
 import numpy as np
 import pandas as pd
+import anndata as ad
+import pytest
+import yaml
 from scipy import sparse
 
 from cellscope.benchmark_utils import (
@@ -12,7 +15,9 @@ from cellscope.benchmark_utils import (
     extract_rapx_tracks_from_final_data,
     normalize_benchmark_metaspot_column,
     restore_bento_transcript_population,
+    run_shared_metadomain_rapx_track,
     validate_benchmark_population,
+    write_benchmark_h5ad,
 )
 
 
@@ -98,6 +103,55 @@ def test_bento_population_restoration_keeps_missing_rows_as_unknown():
         "dropped_by_bento_prep_or_raster",
         "invalid_gene_symbol",
     ]
+
+
+@pytest.mark.parametrize("invalid_truth", [np.nan, "not-binary", 2])
+def test_benchmark_population_rejects_invalid_geometry_truth(invalid_truth):
+    final_data = pd.DataFrame(
+        {
+            "cell_id": ["c1", "c1"],
+            "metaspot": ["m1", "m2"],
+            "overlaps_nucleus": [1, invalid_truth],
+        }
+    )
+
+    with pytest.raises(ValueError, match="only binary 0/1"):
+        validate_benchmark_population(final_data, ["m1", "m2"])
+
+
+def test_extract_tracks_prefers_explicit_domain_evidence_columns():
+    final_data = pd.DataFrame(
+        {
+            "cell_id": ["c1", "c1"],
+            "metaspot": ["m1", "m2"],
+            "overlaps_nucleus": [1, 0],
+            "subcellular_annotation": ["Nucleus", "Cytosol"],
+            "subcellular_candidate_domain": ["Nucleus", "ER"],
+            "subcellular_candidate": ["OMM", "OMM"],
+            "subcellular_annotation_domain_exploratory": [
+                "Nucleus",
+                "ER",
+            ],
+            "subcellular_annotation_exploratory": ["OMM", "OMM"],
+            "subcellular_annotation_domain_strict": [
+                "Nucleus",
+                "Unknown",
+            ],
+            "subcellular_annotation_strict": ["OMM", "OMM"],
+            "subcellular_annotation_domain_tier": [
+                "Strict",
+                "Candidate",
+            ],
+            "subcellular_annotation_tier": ["Candidate", "Candidate"],
+        }
+    )
+
+    tracks = extract_rapx_tracks_from_final_data(final_data)
+
+    assert tracks["candidate"].tolist() == ["Nucleus", "ER"]
+    assert tracks["exploratory"].tolist() == ["Nucleus", "ER"]
+    assert tracks["strict"].tolist() == ["Nucleus", "Unknown"]
+    assert tracks["tier"].tolist() == ["Strict", "Candidate"]
 
 
 def test_analytic_wsum_matches_exact_permutation_moments():
@@ -345,6 +399,252 @@ def test_population_validation_rejects_stale_metaspot_ids():
 
     with np.testing.assert_raises(ValueError):
         validate_benchmark_population(final_data, ["stale"])
+
+
+def test_benchmark_h5ad_writer_keeps_only_explicit_method_embedding(tmp_path):
+    source = ad.AnnData(
+        X=sparse.csr_matrix(np.eye(2, dtype=np.float32)),
+        obs=pd.DataFrame(index=["m1", "m2"]),
+        var=pd.DataFrame(index=["G1", "G2"]),
+    )
+    source.obsm["X_method_metaspot"] = np.ones((2, 3), dtype=np.float32)
+    source.obsm["X_dgi_gcn_metaspot"] = np.zeros((2, 4), dtype=np.float32)
+    output_path = tmp_path / "adata_metaspot.h5ad"
+
+    write_benchmark_h5ad(
+        source,
+        {
+            "method_cluster": pd.Series(
+                ["0", "1"],
+                index=["m1", "m2"],
+            ),
+        },
+        str(output_path),
+        obsm_keys=["X_method_metaspot"],
+        metadata={"observation_unit": "metaspot"},
+    )
+
+    output = ad.read_h5ad(output_path)
+    assert list(output.obsm.keys()) == ["X_method_metaspot"]
+    assert "X_dgi_gcn_metaspot" not in output.obsm
+    assert output.uns["benchmark_output"]["observation_unit"] == "metaspot"
+    assert output.uns["benchmark_output"][
+        "excluded_inherited_representations"
+    ] is True
+
+
+def test_shared_metadomain_adapter_uses_named_method_representation(
+    tmp_path,
+    monkeypatch,
+):
+    obs_names = [f"m{i}" for i in range(8)]
+    cells = ["c1"] * 4 + ["c2"] * 4
+    obs = pd.DataFrame(
+        {
+            "cell_id": cells,
+            "r_mean": np.linspace(-0.8, 0.8, 8),
+            "r_std": np.full(8, 0.1),
+            "r_p50": np.linspace(-0.8, 0.8, 8),
+            "d_cell_norm_mean": np.full(8, 0.4),
+            "d_nuc_norm_mean": np.full(8, 0.5),
+            "elongation": np.full(8, 1.0),
+            "spread": np.full(8, 0.3),
+            "log_n": np.full(8, 1.2),
+        },
+        index=obs_names,
+    )
+    adata = ad.AnnData(
+        X=sparse.csr_matrix(
+            np.tile([[3, 1], [1, 3]], (4, 1)),
+            dtype=np.float32,
+        ),
+        obs=obs,
+        var=pd.DataFrame(index=["G1", "G2"]),
+    )
+    adata.obsm["X_method_metaspot"] = np.column_stack(
+        [
+            np.linspace(-2, 2, 8),
+            np.zeros(8),
+        ]
+    ).astype(np.float32)
+    adata.obsm["X_dgi_gcn_metaspot"] = np.full(
+        (8, 3),
+        99.0,
+        dtype=np.float32,
+    )
+    final_data = pd.DataFrame(
+        {
+            "cell_id": cells,
+            "metaspot": obs_names,
+            "overlaps_nucleus": [0, 0, 0, 0, 1, 1, 1, 1],
+            "r_signed": [-1, -1, -1, -1, 1, 1, 1, 1],
+        }
+    )
+
+    config_path = tmp_path / "params.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "module5": {
+                    "estimate_k": "fixed",
+                    "fixed_k": 2,
+                    "min_domain_size": 1,
+                    "enable_cap": False,
+                    "split_by_nucleus": False,
+                },
+                "module6": {"pool_normalize": True},
+                "module7": {"graph_unit": "metaspot"},
+            }
+        )
+    )
+    monkeypatch.setenv("CELLSCOPE_CONFIG", str(config_path))
+
+    captured = {}
+
+    def fake_annotate(
+        adata1,
+        adata2,
+        final_df,
+        **kwargs,
+    ):
+        if kwargs.get("annotation_unit_override") == "metaspot":
+            captured["pool"] = np.asarray(
+                adata1.obsm["X_dgi_gcn_metaspot"]
+            ).copy()
+            captured["boundary_columns"] = {
+                column
+                for column in ("r_mean", "r_std", "r_p50", "d_nuc_norm_mean")
+                if column in adata1.obs.columns
+            }
+        adata2.obs["leiden"] = pd.Categorical(
+            np.arange(adata2.n_obs).astype(str)
+        )
+        adata2.obs["leiden_embedding"] = adata2.obs["leiden"].copy()
+        adata2.obs["annotation_group"] = pd.Categorical(
+            adata2.obs_names.astype(str)
+        )
+        adata2.uns["annotation_unit"] = "metadomain"
+        labels = pd.Series(
+            np.where(
+                np.arange(adata2.n_obs) % 2 == 0,
+                "Cytosol",
+                "Nucleus",
+            ),
+            index=adata2.obs_names.astype(str),
+        )
+        domain = adata1.obs["meta-domain"].astype(str)
+        sources = {
+            "subcellular_annotation": labels,
+            "subcellular_candidate": labels,
+            "subcellular_annotation_exploratory": labels,
+            "subcellular_annotation_strict": labels,
+        }
+        for column, values in sources.items():
+            adata2.obs[column] = values.reindex(
+                adata2.obs_names.astype(str)
+            ).to_numpy()
+            adata1.obs[column] = domain.map(values).to_numpy()
+        tiers = pd.Series(
+            "Strict",
+            index=adata2.obs_names.astype(str),
+        )
+        adata2.obs["subcellular_annotation_tier"] = tiers.to_numpy()
+        adata1.obs["subcellular_annotation_tier"] = (
+            domain.map(tiers).to_numpy()
+        )
+        # Simulate the downstream local geometry guard changing the MetaSpot
+        # production labels while leaving raw MetaDomain evidence untouched.
+        adata1.obs["subcellular_annotation"] = "Nucleus"
+        return adata1, adata2, final_df
+
+    monkeypatch.setattr(
+        "cellscope.pipeline._maybe_cluster_and_annotate",
+        fake_annotate,
+    )
+    result = run_shared_metadomain_rapx_track(
+        adata,
+        final_data,
+        embedding_key="X_method_metaspot",
+        metadomain_embedding_key="X_method_metadomain",
+        method_name="Method",
+        module5_config_override={"random_seed": 7},
+    )
+
+    assert "X_method_metadomain" in result["adata_metadomain"].obsm
+    assert "X_dgi_gcn_metadomain" not in result["adata_metadomain"].obsm
+    assert result["metadata"]["representation"][
+        "uses_cellscope_dgi_embedding"
+    ] is False
+    assert result["metadata"]["n_metaspots"] == 8
+    assert result["metadata"]["n_metadomains"] == 2
+    assert list(result["tracks"].index) == obs_names
+    assert result["tracks"].equals(result["raw_metadomain_tracks"])
+    assert not result["tracks"]["production"].equals(
+        result["geometry_guarded_tracks"]["production"]
+    )
+    assert result["metadata"]["primary_track_semantics"] == (
+        "raw_metadomain_rapx_without_metaspot_geometry_correction"
+    )
+    assert result["metadata"][
+        "n_production_labels_changed_by_geometry_guard"
+    ] > 0
+    assert result["adata_metaspot"].uns[
+        "module5_metadomain_clustering"
+    ]["random_seed"] == 7
+
+    refined = run_shared_metadomain_rapx_track(
+        adata,
+        final_data,
+        embedding_key="X_method_metaspot",
+        metadomain_embedding_key="X_method_metadomain",
+        method_name="Method",
+        module5_config_override={"random_seed": 7},
+        enable_metaspot_refinement=True,
+    )
+
+    np.testing.assert_array_equal(
+        captured["pool"],
+        adata.obsm["X_method_metaspot"],
+    )
+    assert captured["boundary_columns"] == set()
+    assert refined["metadata"]["primary_track_semantics"] == (
+        "shared_metaspot_refinement_without_boundary_geometry"
+    )
+    assert refined["shared_metaspot_refinement_tracks"] is not None
+    assert refined[
+        "shared_metaspot_refinement_geometry_guarded_tracks"
+    ] is not None
+    assert refined["metadata"][
+        "n_production_labels_changed_by_geometry_guard"
+    ] == 4
+
+    gate = pd.Series(
+        np.linspace(0.1, 0.9, 8),
+        index=obs_names,
+    )
+    gated = run_shared_metadomain_rapx_track(
+        adata,
+        final_data,
+        embedding_key="X_method_metaspot",
+        metadomain_embedding_key="X_method_metadomain",
+        method_name="Method",
+        module5_config_override={"random_seed": 7},
+        enable_metaspot_refinement=True,
+        crossfitted_compartment_score=gate,
+        crossfitted_score_source="toy_leave_one_group_out",
+    )
+
+    assert captured["boundary_columns"] == {"r_mean", "r_p50"}
+    np.testing.assert_allclose(
+        gated["adata_metaspot"].obs["r_p50"],
+        0.5 - gate,
+    )
+    assert gated["metadata"]["primary_track_semantics"] == (
+        "crossfitted_compartment_gated_shared_metaspot_refinement"
+    )
+    assert gated["metadata"]["representation"][
+        "crossfitted_compartment_gate"
+    ]["injected_after_module5_clustering"] is True
 
 
 def test_geometry_clustering_metrics_are_explicit_oracle_diagnostics():

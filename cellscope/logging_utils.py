@@ -4,10 +4,29 @@ from logging.handlers import RotatingFileHandler
 
 
 def setup_logger(out_dir: str, level: str = "INFO") -> logging.Logger:
+    out_dir = os.path.realpath(os.path.abspath(out_dir))
     os.makedirs(out_dir, exist_ok=True)
     logger = logging.getLogger("cellscope")
-    if logger.handlers:
+    current_out_dir = getattr(logger, "_cellscope_out_dir", None)
+    if logger.handlers and current_out_dir == out_dir:
+        logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+        for handler in logger.handlers:
+            if isinstance(handler, RotatingFileHandler):
+                handler.setLevel(
+                    logging.ERROR
+                    if handler.baseFilename.endswith("cellscoper.error.log")
+                    else getattr(logging, level.upper(), logging.INFO)
+                )
+            elif isinstance(handler, logging.StreamHandler):
+                handler.setLevel(getattr(logging, level.upper(), logging.INFO))
         return logger
+    if logger.handlers:
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            try:
+                handler.close()
+            except OSError:
+                pass
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
 
     log_path = os.path.join(out_dir, "cellscoper.log")
@@ -31,5 +50,10 @@ def setup_logger(out_dir: str, level: str = "INFO") -> logging.Logger:
     logger.addHandler(ch)
 
     logger.propagate = False
-    logger.info("Logger initialized. Logs at %s; errors at %s", log_path, err_path)
+    logger._cellscope_out_dir = out_dir
+    logger.info(
+        "Run logging initialized | log=%s | error_log=%s",
+        log_path,
+        err_path,
+    )
     return logger

@@ -1,254 +1,1075 @@
-# CellScoper balanced defaults: prioritize spatial continuity and annotation
-# quality while keeping transcript-level memory bounded for large datasets.
-io:
-  final_format: csv
-  h5ad_compression: lzf
-  resume_policy: minimal
-  resume_from: null
-  intermediate_dirname: intermediate_results
-  write_csv_copy: true
-  write_intermediate: true
-  lite_intermediate: true
-  write_intermediate_csv: false
-  write_intermediate_parquet: false
-  write_intermediate_figures: true
-  drop_embeddings: true
+# CellScoper 通用生产配置 v4
+# ============================================================
+# 设计目标：
+# 1. 保持 Nuclear / Cytoplasmic broad compartment 的稳定性
+# 2. 提高 Nucleolus / Lamina / Nuclear Pore / ER 的 fine-label 保留率
+# 3. OMM 单独采用更严格的证据门槛，避免再次出现 OMM 过度膨胀
+# 4. 不使用 overlaps_nucleus 作为模型输入，避免 benchmark 信息泄漏
+# 5. 适合作为 SeqFISH / MERFISH / Xenium / CosMx 等平台的通用起点
+#
+# 注意：
+# - YAML 中以 "#" 开头的内容均为注释，不参与程序解析
+# - 当前 annotation 参数偏向“fine-label sensitive”
+# - 如果换数据平台，优先微调 annotation，而不要先动 geometry / MetaSpot / DGI
 
-# This key is read directly by the CLI and therefore belongs at the top level.
+
+# ============================================================
+# I/O 与运行输出
+# ============================================================
+
+io:
+  # 最终 transcript-level 输出格式
+  final_format: parquet
+
+  # h5ad 压缩方式
+  h5ad_compression: lzf
+
+  # 默认恢复策略
+  # minimal：尽可能复用已有 checkpoint
+  resume_policy: minimal
+
+  # null 表示由程序自动判断恢复位置
+  resume_from: null
+
+  # 中间结果目录名称
+  intermediate_dirname: intermediate_results
+
+  # 是否额外保存 CSV 版本
+  write_csv_copy: false
+
+  # 是否保存中间结果
+  write_intermediate: true
+
+  # 使用轻量化中间结果，减少磁盘占用
+  lite_intermediate: true
+
+  # 中间结果是否保存 CSV
+  write_intermediate_csv: false
+
+  # 中间结果是否保存 Parquet
+  write_intermediate_parquet: false
+
+  # 是否保存诊断图
+  write_intermediate_figures: true
+
+  # 是否保存诊断表
+  write_diagnostic_tables: false
+
+  # 诊断表保存 CSV
+  write_diagnostic_csv: false
+
+  # 诊断表保存 Parquet
+  write_diagnostic_parquet: false
+
+  # 超大数据仅在 adata1.obs 保留宽诊断列，避免复制到每条 transcript
+  broadcast_metaspot_diagnostics_to_transcripts: false
+
+  # 是否在 final_data.parquet 之外额外写一套分区 Parquet 数据集
+  write_partitioned_dataset: false
+
+  # 是否计算输入文件 hash，用于可复现性追踪
+  provenance_hash_inputs: true
+
+  # 最终输出前是否丢弃 transcript embedding 列，并把 adata1.h5ad 压缩为
+  # annotation 审计列 + canonical X_dgi_gcn_metaspot（不保留图和辅助 embedding）
+  drop_embeddings: false
+
+
+# CLI 启动时是否展示输入样例
 show_sample: true
 
+
+# ============================================================
+# Automatic scale-aware execution
+# ============================================================
+
+execution:
+  # exact <= 200k MetaSpots; sampled <= 2M; streaming above 2M.
+  profile: auto
+  exact_max_metaspots: 200000
+  sampled_max_metaspots: 2000000
+  memory_budget_gb: 64
+  scratch_dir: null
+  partition_rows: 1000000
+  # Never replace a missing ANN/sampling backend with an unbounded exact job.
+  fail_on_backend_fallback: true
+
+
+# ============================================================
+# Module 1
+# Transcript-level 几何特征
+# ============================================================
+
 module1:
+  # 是否计算方向性几何特征
   include_directional: true
+
+  # 重要：
+  # false 表示不直接使用输入中的 overlaps_nucleus 作为预测依据
+  # 而是根据 nucleus boundary 自己推断核内外位置
+  # benchmark 时必须保持 false，避免使用真值造成信息泄漏
+  use_input_nucleus_flags: false
+
+  # 几何特征 winsorization 下界百分位
   winsor_perc_low: 1
+
+  # 几何特征 winsorization 上界百分位
   winsor_perc_high: 99
 
+
+# ============================================================
+# Module 2
+# 局部表达组成 embedding
+# ============================================================
+
 module2:
-  # Streaming keeps these richer local-composition features memory bounded.
+  # 用于构建局部表达词袋的高频基因数量
   top_g: 1024
+
+  # 每个 transcript 的局部 kNN 邻居数
   bow_knn_k: 12
+
+  # 每个细胞最多用于 SVD 训练的局部观测数
   max_rows_per_cell_for_svd: 256
+
+  # 全局最多用于训练 SVD 的行数
   max_svd_rows: 100000
+
+  # 局部表达 SVD 维度
   svd_n_components: 24
+
+  # 最多抽样多少细胞训练 SVD
   svd_sample_cells: 5000
+
+  # 并行处理时每个任务包含的细胞数
   parallel_chunk_cells: 8
+
+  # false：使用标准局部表达来源
   source_from_point_df: false
+
+  # 流式生成局部 embedding，降低内存占用
   stream_local_embeddings: true
+
+  # 是否使用 TF-IDF
   use_tfidf: true
+
+  # 是否进行 TF normalization
   tf_norm: true
-  idf_mode: log1p             # log1p | log | none
-  bow_weight_mode: gaussian   # gaussian | uniform
+
+  # IDF 计算方式
+  idf_mode: log1p
+
+  # 空间邻域中的权重模式
+  bow_weight_mode: gaussian
+
+
+# ============================================================
+# Module 3
+# MetaSpot 分割
+# ============================================================
 
 module3:
-  # Canonical MetaSpot mode. K is derived from unique XY sites, and Ward
-  # clustering is constrained to the local spatial graph.
+  # Module 3 uses a persistent executor.  A larger batch avoids scheduler and
+  # garbage-collection overhead on hundreds of thousands of cells.
+  parallel_chunk_cells: 256
+
+  # Validated on the 1W workload; still bounded by runtime.n_jobs and affinity.
+  parallel_n_jobs: 12
+
+  # 强制 MetaSpot 空间连通
   enforce_spatial_connectivity: true
-  target_sites_per_metaspot: 100
-  min_metaspots_per_cell: 1
-  max_metaspots_per_cell: 100
+
+  # 不预先按 nucleus / cytoplasm 硬切 MetaSpot
+  # 保留局部结构发现能力
+  partition_by_nucleus: false
+
+  # 核心 MetaSpot 粒度参数
+  # 平均约每 10 个 unique transcript sites 形成一个 MetaSpot。
+  # 该尺度提高局部结构分辨率；max_metaspots_per_cell 和 DGI 节点保护
+  # 仍限制图规模。过粗的 MetaSpot 会把细结构与核/质背景混在一起。
+  target_sites_per_metaspot: 15
+
+  # 每个细胞最少 MetaSpot 数
+  min_metaspots_per_cell: 20
+
+  # 每个细胞最多 MetaSpot 数
+  max_metaspots_per_cell: 1000
+
+  # 空间连通图 kNN
   spatial_connectivity_k: 8
+
+  # 用于估计空间连通半径的距离分位数
   spatial_radius_quantile: 0.9
+
+  # 连通半径放大系数
   spatial_radius_factor: 1.5
+
+  # MetaSpot 标签空间平滑次数
   spatial_smoothing_iterations: 1
+
+  # 空间平滑时邻域最小一致比例
   spatial_smoothing_min_fraction: 0.6
-  spatial_min_component_size: 20
+
+  # 太小的空间 component 会被合并
+  spatial_min_component_size: 5
+
+  # 空间紧致度权重
   spatial_compactness: 1.0
 
-  # Feature budget used by canonical Ward clustering and the legacy fallback.
+  # 用于 MetaSpot 分割的表达/几何特征维数
   n_feat_hdb: 24
 
-  # HDBSCAN/KMeans are retained only as a fallback when the canonical target
-  # above is null or spatial connectivity is disabled.
+  # 以下 HDBSCAN 参数主要用于兼容或备用路径
   hdbscan_min_cluster_size: 30
   hdbscan_allow_single_cluster: true
   hdbscan_min_samples_frac: 0.2
+
+  # 目标局部区域大小
   target_sub_size: 30
+
+  # KMeans 最小 K
   kmeans_min_k: 2
+
+  # KMeans 最大 K
   kmeans_max_k: 50
+
+  # 是否启用 K 上限控制
   use_k_cap: true
+
+  # 小 MetaSpot 合并阈值
   merge_min_size: 20
+
+  # HDBSCAN 最大采样点
   hdbscan_max_points: 1000
+
+  # KMeans 训练采样量
   kmeans_train_size: 512
+
+  # KMeans batch size
   kmeans_batch_size: 1024
+
+  # 小数据后端切换阈值
   small_backend_cells: 1000
+
+  # 顺序处理细胞阈值
   sequential_cells: 1000
 
+
+# ============================================================
+# Module 5
+# MetaDomain 聚类
+# ============================================================
+
 module5:
+  # 分块聚类规模
   block_size: 50000
-  # SimpleK feature weights and options
+
+  # auto 由 execution profile 决定：exact 保持全局 consensus Leiden；
+  # sampled/streaming 使用 cell 对齐的局部原型 -> 全局原型聚类。
+  large_scale_method: auto
+  hierarchical_block_nodes: 100000
+  hierarchical_local_target_size: 100
+  hierarchical_global_target_size: 400
+  hierarchical_max_local_clusters: 2000
+  hierarchical_min_global_clusters: 2
+  hierarchical_max_global_clusters: 8000
+  hierarchical_batch_size: 8192
+  hierarchical_max_iter: 60
+
+  # 在 CA-DMGI 共识 embedding 上运行多 resolution、多随机种子 Leiden，
+  # 再用稀疏边级 co-association 得到最终 MetaDomains。minibatch_kmeans
+  # 保留为旧自动 K 路径和论文消融。
+  clustering_method: consensus_leiden
+
+  # auto：自动选择可用 representation
+  cluster_rep: auto
+
+  # 是否使用去细胞效应后的 representation
+  cluster_rep_decell: false
+
+  # 最小 MetaDomain 大小
+  min_domain_size: 5
+
+  # Consensus Leiden：mutual-kNN 只保留相互近邻，减少 hub 边。
+  consensus_neighbors: 20
+  consensus_resolutions:
+    - 1.0
+    - 2.0
+    - 4.0
+    - 6.0
+    - 8.0
+  consensus_seeds:
+    - 17
+    - 42
+    - 89
+  consensus_leiden_iterations: 2
+
+  # 避免“一个大簇”仅因稳定而获胜，也避免极细碎聚类。若没有候选满足
+  # 约束，使用带 small/nonrecurrent 惩罚的最佳稳定性候选并明确审计。
+  consensus_min_average_size: 100
+  consensus_max_average_size: 800
+  consensus_min_recurrence_cells: 2
+  consensus_max_small_cluster_fraction: 0.10
+  consensus_max_nonrecurrent_fraction: 0.10
+
+  # 三个随机种子中至少两个同意该 mutual-kNN 边，才进入最终 consensus 图。
+  consensus_edge_agreement: 0.6666667
+
+  # 先要求跨 seed ARI 至少达到 0.55；在距离最佳稳定性不超过 0.10 的
+  # 可行候选中选择结构最细者，避免微小 ARI 优势系统性偏向过粗分区。
+  consensus_min_stability: 0.55
+  consensus_stability_tolerance: 0.10
+
+  # 随机种子
+  random_seed: 42
+
+  # 图结构、表达、空间三类信息权重
   w_gc: 0.4
   w_expr: 0.4
   w_sp: 0.2
+
   use_gc: true
   use_expr: true
+
+  # 聚类速度预设
   speed_preset: ultra
+
+  # 是否加入空间特征
   use_spatial_feats: true
+
+  # 是否考虑 cell effect correction
   use_decell: true
+
+  # 是否使用 cosine 相似度
   use_cosine: true
+
+  # 是否启用 cluster 数量上限控制
   enable_cap: true
-  # K estimation
-  estimate_k: auto        # auto | fixed
-  fixed_k: 1024           # used when estimate_k=fixed
+
+  # auto：自动选择 MetaDomain 数量 K
+  estimate_k: auto
+
+  # estimate_k=fixed 时使用
+  fixed_k: 1024
+
+  # 自动 K 搜索范围
+  auto_k_min: 20
+  auto_k_max: 8000
+
+  # 自动 K 对平均 cluster size 的合理范围约束
+  auto_k_min_average_size: 20
+  auto_k_max_average_size: 500
+
+  # K 候选数量
+  auto_k_n_candidates: 8
+
+  # 自动 K 训练采样量
+  auto_k_train_sample: 50000
+
+  # 自动 K 验证采样量
+  auto_k_validation_sample: 3000
+
+  # 自动 K 采样随机种子
+  auto_k_sample_seed: 2026
+
+  # 多随机种子检查聚类稳定性
+  auto_k_seeds:
+    - 42
+    - 43
+
+  # 最低聚类稳定性要求
+  auto_k_stability_min: 0.4
+
+  # 允许的小 cluster 最大比例
+  auto_k_max_small_cluster_fraction: 0.01
+
+  # 每个 cluster 至少需要的训练样本数
+  auto_k_min_train_per_cluster: 10
+
+  # 自动 K MiniBatchKMeans batch size
+  auto_k_batch_size: 2048
+
+  # 自动 K 最大迭代次数
+  auto_k_max_iter: 30
+
+  # 小于该规模时允许完整评估
+  auto_k_full_eval_max: 100000
+
+  # 每个 cluster 目标 MetaSpot 数
   target_sub_per_cluster: 800
+
+  # cluster / cell 的经验目标
   target_cluster_per_cell: 1.0
+
+  # 允许的 K 范围
   K_min: 200
   K_max: 8000
-  # Nucleus/cytoplasm split
+
+  # 重要：
+  # MetaDomain 聚类时核内、核外分开聚类
+  # 避免 broad compartment 被聚类混合
   split_by_nucleus: true
+
+  # nucleus split 阈值
   nucleus_threshold: 0.0
-  # Per-cell cap parameters
+
+  # cluster cap 参数
   cap_ratio_base: 0.015
   cap_min_keep: 3
   cap_margin_tau: 0.015
   cap_max_frac_soft: 0.05
-  # Two-stage MiniBatchKMeans (fit on sample, predict all)
+
+  # 每个 block 的训练采样
   train_sample_per_block: 20000
+
+  # assignment 分块大小
   assign_chunk_size: 5000
+
+  # MiniBatchKMeans 参数
   mbk_batch_size: 512
   mbk_max_iter: 60
 
+
+# ============================================================
+# Module 6
+# MetaDomain 聚合
+# ============================================================
+
 module6:
+  # 是否覆盖 h5ad compression 设置
   h5ad_compression_override: true
+
+  # 是否保存 MetaDomain 几何形状摘要
   save_shape_summary: true
-  preserve_raw_counts: true
+
+  # MetaDomain representation pooling 方式
+  pool_reps: auto
+
+  # pooling 后是否归一化
+  pool_normalize: true
+
+
+# ============================================================
+# Module 7
+# MetaSpot graph
+# ============================================================
 
 module7:
-  scvi_epochs: 150
+  # auto：根据当前 pipeline 自动决定 graph unit
+  graph_unit: auto
+
+  # auto resolves to exact / FAISS / PyNNDescent from the execution profile.
+  knn_backend: auto
+  ann_candidate_multiplier: 4
+  ann_query_chunk_nodes: 100000
+  ann_train_sample: 1000000
+  faiss_hnsw_m: 32
+  faiss_nprobe: 32
+  faiss_pq_subvectors: 8
+  faiss_pq_bits: 8
+  # IVFPQ streaming mode uses CUDA automatically when a GPU-enabled FAISS
+  # build is present. Set true to require GPU and fail if it is unavailable.
+  faiss_use_gpu: auto
+  faiss_gpu_device: 0
+
+  # scVI 备用 representation 参数
+  scvi_epochs: 100
   scvi_n_latent: 32
   scvi_lr: 0.001
   scvi_batch_size: 256
-  # Optional: priority representations for annotation stage (default prefers X_dgi_gcn)
-  rep_priority: ["X_dgi_gcn", "X_dgi_sage", "X_expr", "X_pca"]
+
+  # representation 优先级
+  rep_priority:
+    - X_dgi_gcn
+    - X_dgi_sage
+    - X_expr
+    - X_pca
+
+  # 不同图通道的邻居数量
   neighbors:
     k_expr: 15
     k_geom: 15
+    k_spatial: 6
+
+  # MetaSpot 表达 PCA/SVD 维数
+  metaspot_expr_n_components: 32
+
+  # MetaSpot 融合图：
+  # 80% expression similarity
+  metaspot_alpha_expr: 0.8
+
+  # 20% within-cell spatial adjacency
+  metaspot_alpha_spatial: 0.2
+
+  # GCN edge normalization
+  metaspot_edge_norm: gcn
+
+  # 是否将 geometry features 加入 MetaSpot node features
+  metaspot_use_geometry_features: true
+
+  # 表达关系只连接来自不同细胞的 MetaSpots，使该分支专门学习可跨细胞
+  # 复现的亚细胞表达模式；同细胞局部连续性由独立 spatial relation 建模。
+  metaspot_expr_cross_cell_only: true
+
+  # full-batch MetaSpot DGI 的安全上限；超过时改用 metadomain
+  # 提高此数值只会关闭保护，并不会降低显存/内存复杂度
+  max_full_batch_nodes: 200000
+
+  # 通用图融合参数
   alpha_expr: 0.5
   alpha_geom: 0.5
+
+  # 同一细胞边权增强
   same_cell_beta: 0.5
+
+  # 每个节点最多保留多少边
   topk_prune: 32
-  edge_norm: rw              # rw | gcn | none
-  feature_scale: standard    # standard | none
+
+  # random-walk normalization
+  edge_norm: rw
+
+  # 输入特征标准化
+  feature_scale: standard
+
+
+# ============================================================
+# Module 8
+# DGI-GCN MetaSpot embedding
+# ============================================================
 
 module8:
-  dgi_epochs: 150
+  # 当前推荐以 MetaSpot 为 DGI 节点 (metaspot or metadomain)
+  dgi_unit: metaspot
+
+  # cell_aware_dmgi：分别编码跨细胞表达图和细胞内空间图，再学习逐 MetaSpot
+  # 共识 gate。standard_dgi 保留为原单图 DGI 消融/兼容路径。
+  dgi_framework: cell_aware_dmgi
+
+  # auto uses full-batch below the exact threshold and neighbor sampling above.
+  training_mode: auto
+  sampled_dgi_epochs: 100
+  sampled_batch_size: 4096
+  sampled_expression_fanout:
+    - 15
+    - 10
+  sampled_spatial_fanout:
+    - 6
+    - 6
+  sampled_nodes_per_epoch: 500000
+  sampled_inference_batch_size: 8192
+  sampled_validation_nodes: 50000
+  sampled_num_workers: 0
+  # auto selects CUDA when visible; sampled CA-DMGI then uses mixed precision.
+  dgi_device: auto
+  amp: true
+
+  # 最大训练 epoch。真实 2k-cell 审计中 expression 分支在约 60 epoch 已
+  # 接近饱和；200 epoch 保留 spatial 分支继续学习，同时减少不必要计算。
+  dgi_epochs: 200
+
+  # 当前关闭 GraphSAGE DGI
   enable_dgi_sage: false
+
+  # residual：输入投影 + 初始特征回注 + 残差 GCN + LayerNorm；
+  # plain：兼容原来的顺序堆叠 GCN
+  dgi_encoder: residual
+
+  # 图消息传播层数；默认保持两跳感受野，避免全局表达图过平滑
+  dgi_layers: 2
+
+  # GCN hidden dimension
   dgi_hidden: 64
-  dgi_out: 64
+
+  # 最终 embedding dimension；当前真实数据中 32 维已覆盖绝大多数
+  # 64 维 embedding 方差，降低弱维度被 M5 标准化后放大的风险
+  dgi_out: 32
+
+  # 残差块 dropout
+  dgi_dropout: 0.1
+
+  # 每层重新注入初始投影的比例
+  dgi_residual_alpha: 0.1
+
+  # 残差块后使用 LayerNorm
+  dgi_layer_norm: true
+
+  # standard_dgi 回退路径的 corruption 配置；CA-DMGI 固定在同细胞内
+  # 扰动特征，从而不把任何真实 MetaSpot 当作负类。
+  dgi_corruption_mode: auto
+
+  # 以下三项仅用于 standard_dgi 旧局部排序消融。生产 CA-DMGI 中关闭，
+  # 因为“同细胞非邻居”可能属于同一真实结构，会产生 false negatives。
+  dgi_local_loss_weight: 0.0
+  dgi_local_temperature: 0.2
+  dgi_local_samples: 65536
+
+  # auto 优先使用纯 MetaSpot 空间图；若不存在则使用当前 DGI 融合图。
+  dgi_local_graph_key: auto
+
+  # CA-DMGI 的两个显式关系图。
+  dmgi_expression_graph_key: metaspot_expr_connectivities
+  dmgi_spatial_graph_key: metaspot_spatial_connectivities
+
+  # 两个 relation-specific local Infomax 目标等权；consensus 项只负责让
+  # 两个分支形成可聚类的公共空间，不强迫它们完全相同。
+  dmgi_expression_weight: 1.0
+  dmgi_spatial_weight: 1.0
+  dmgi_consensus_weight: 0.1
+
+  # gate 限制在 [0.1, 0.9]，防止任一关系在训练中被彻底关闭。
+  dmgi_gate_floor: 0.1
+
+  # 以总损失 EMA 进行早停；200 是最大 epoch，不保证每次都跑满。
+  dmgi_early_stopping: true
+  dmgi_min_epochs: 40
+  dmgi_patience: 15
+  dmgi_min_delta: 0.0001
+
+  # CPU 自动使用 PyTorch CSR 稀疏矩阵乘法，避免 PyG COO scatter 在大图上
+  # 的高开销；GPU 仍使用原生 PyG 路径。设为 pyg 可复现旧 CPU 后端。
+  dgi_cpu_backend: auto
+
+  # learning rate
   dgi_lr: 0.001
+
+  # weight decay
   dgi_weight_decay: 0.0001
+
+  # gradient clipping
   dgi_clip_grad: 1.0
 
+  # 随机种子
+  random_seed: 42
+
+
+# ============================================================
+# Annotation
+# RAP-X + local MetaSpot refinement
+# ============================================================
+
 annotation:
+  # 开启亚细胞注释
   enable: true
+
+  # 使用 RAP-X 注释方法
   method: rapx
-  unit: metadomain
+
+  # 最终细粒度注释单位是 MetaSpot
+  unit: metaspot
+
+  # independent：每个 annotation unit 独立评分
   decision_mode: independent
-  independent_mixed_score_delta: 0.75
-  independent_unknown_label: Unknown
-  independent_geometry_min_abs_r: 0.05
-  # Multi-track output: subcellular_candidate keeps the raw best label,
-  # subcellular_annotation uses hierarchical evidence-aware fallback, and
-  # subcellular_annotation_strict retains q<=subtype_fdr calls.
-  # hierarchical keeps ER/OMM/nuclear subtypes only when at least exploratory
-  # evidence exists; unsupported subtype candidates fall back to Cytosol or
-  # Nucleus while the raw choice remains in subcellular_candidate.
-  independent_assignment_mode: hierarchical  # strict | tiered | hierarchical
-  independent_exploratory_max_q: 0.30
-  independent_exploratory_min_channel_support: 2
-  independent_exploratory_min_score_gap: 0.50
-  independent_subtype_parent_margin: 0.0
-  independent_omm_competitor_margin: 0.0
+
+  # 当前关闭 two-stage annotation
   two_stage: false
+
+  # 启用空间通道
   spatial_channel: true
-  # Legacy confidence fields remain for compatibility; independent mode also
-  # emits Strict/Exploratory/Candidate evidence tiers.
-  low_conf_policy: supported  # supported | adaptive | broad | keep
-  low_conf_relaxed_z: 1.25
-  low_conf_relaxed_q: 0.30
-  marker_set_target: 600
-  marker_min_weight: 0.05
-  marker_min_margin: 0.05
-  gold_column_normalize: false
-  min_channel_support: 2
-  enforce_geometry_consistency: false
-  geometry_quantile: 0.4
-  geometry_channel_weight: 0.0
-  # Adaptive calibration matches random marker sets by size, weights, detection
-  # rate, and mean expression to avoid marker-abundance-driven significance.
-  guard_mode: adaptive       # adaptive | fixed
-  subtype_fdr: 0.05
-  min_effective_markers: 10
-  null_permutations: 500
-  null_seed: 0
-  # Legacy single-argmax compatibility knobs; disabled in independent mode.
-  single_stage_compartment_score_weight: 0.0
-  single_stage_compartment_score_tau: 0.2
-  single_stage_compartment_guard: false
-  single_stage_compartment_min_abs_r: 0.05
-  single_stage_compartment_max_score_gap: 8.5
-  single_stage_compartment_min_z: 1.0
-  single_stage_compartment_max_q: 0.35
-  single_stage_compartment_min_channel_support: 1
-  # The fixed thresholds below are used only when guard_mode: fixed.
-  nuclear_pore_guard: false
-  nuclear_pore_min_margin: 0.75
-  nuclear_pore_non_nuclear_top2_min_margin: 5.0
-  nuclear_pore_max_q: 0.10
-  nuclear_pore_min_channel_support: 3
-  nuclear_pore_fallback_label: Nucleus
-  # Legacy fallback guards are disabled; unsupported labels become Unknown.
-  lamina_guard: false
-  lamina_min_margin: 1.0
-  lamina_non_nuclear_top2_min_margin: 3.0
-  lamina_max_q: 0.05
-  lamina_min_channel_support: 2
-  lamina_boundary_quantile: 0.5
-  lamina_fallback_label: Nucleus
-  # Retained only for legacy decision_mode.
-  omm_guard: false
-  omm_min_margin: 2.0
-  omm_max_q: 0.01
-  omm_min_channel_support: 3
-  omm_fallback_label: Cytosol
-  # Applies only to the bundled human Cell-2019 APEX raw log2FC table.
-  # ERM/Cytosol-shared genes keep their other reference scores but cannot act
-  # as OMM-specific markers.
-  apex_omm_specificity_filter: true
-  apex_omm_min_log2fc: 0.75
-  apex_omm_min_delta: 0.50
-  omm_metaspot_refinement: true
-  omm_metaspot_apply_to_primary: true
-  # Keep membrane ambiguity in audit columns, but make the primary annotation
-  # fall back to the strongest ER/Cytosol alternative instead of emitting an
-  # eighth "ER-OMM shared" prediction class.
-  omm_metaspot_ambiguous_policy: competitor  # competitor | explicit
-  omm_metaspot_min_informative_transcripts: 5
-  omm_metaspot_shrinkage_count: 20.0
-  omm_metaspot_posterior_high: 0.80
-  omm_metaspot_posterior_low: 0.20
-  omm_refinement_schema_version: 6
-  # RNALocate ER associations are broad and include many trafficking/membrane
-  # genes. Keep ER anchored to the APEX localization reference by default.
-  rnalocate_augment_er: false
-  rnalocate_species: ["Homo sapiens", "Mus musculus"]
-  use_manual_markers: false
-  # Build dedicated, finer annotation groups instead of reusing the coarse
-  # upstream Leiden partition. On the 388-domain test this yields about 30
-  # annotation groups rather than about 12.
-  fast: false
-  leiden_resolution: 5.0
-  hvg_n_top_genes: 2000
-  pca_n_comps: 32
-  neighbors_k: 20
-  umap_min_dist: 0.3
-  umap_spread: 1.0
-  compute_umap: true
-  save_umap_plot: true
+
+  # 重要：
+  # 先确保 MetaSpot 的 fine label 不违反 Nuclear/Cytoplasmic broad compartment
+  metaspot_compartment_correction: true
+
+
+  # ----------------------------------------------------------
+  # DGI 邻域共识
+  # ----------------------------------------------------------
+
+  # DGI neighborhood 在审计 fused score 与显式 DGI 证据分支中的权重
+  # 不改变 focal MetaSpot 的 local candidate，也不进入 strict marker gate
+  metaspot_dgi_consensus_weight: 0.6
+
+  # 是否允许 DGI 对 exploratory label 提供支持
+  metaspot_dgi_exploratory: true
+
+  # exploratory DGI 最低支持比例
+  metaspot_dgi_exploratory_min_support: 0.55
+
+  # 第一标签与第二标签的 DGI 支持差值
+  metaspot_dgi_exploratory_min_margin: 0.05
+
+  # 形成 DGI seed label 时最低 marker transcript 数
+  metaspot_dgi_seed_min_marker_transcripts: 1
+
+  # 形成 DGI seed label 时最低 marker gene 数
+  metaspot_dgi_seed_min_marker_genes: 1
+
+  # DGI seed 最低 log2 enrichment
+  metaspot_dgi_seed_min_log2_enrichment: 0.05
+
+  # 至少需要多少 informative DGI neighbors
+  metaspot_dgi_min_informative_neighbors: 2
+
+
+  # ----------------------------------------------------------
+  # 逐细胞 fine-structure coherent rescue
+  # ----------------------------------------------------------
+  # 仅当某个细胞缺少该结构，且整个细胞在对应 broad compartment 内
+  # 出现多转录本、多基因的一致 marker 证据时，才从细胞内定位最强的
+  # 一个 MetaSpot。局部候选仍须通过自身多基因 marker gate，且必须有
+  # 可计算的 leave-one-out DGI 邻域；不会无条件补齐七类。
+  metaspot_cell_coverage_rescue: true
+  metaspot_cell_coverage_labels:
+    - Nucleolus
+    - Lamina
+    - Nuclear Pore
+    - ER
+
+  # 细胞整体 presence gate：至少两个不同 marker gene，因此不会被单个
+  # marker + DGI 平票触发。低深度细胞中 two-gene evidence 比要求第三条
+  # transcript 更稳健，后续仍必须有局部多基因 marker 锚点。
+  metaspot_cell_coverage_min_marker_transcripts: 2
+  metaspot_cell_coverage_min_marker_genes: 2
+  metaspot_cell_coverage_min_log2_enrichment: -0.5
+
+  # 小 MetaSpot/低深度细胞的 binomial test 功效不足；这里保留有限值审计
+  # 但不再把未达显著性当作否定证据。多基因、enrichment、局部 marker
+  # 和 DGI 仍共同作为硬门槛。
+  metaspot_cell_coverage_max_binomial_p: 1.0
+
+  # DGI seed 是 winner-based，非 winner 的次级结构经常没有同标签 vote。
+  # 因此局部定位本身要求两个实测 marker gene，避免依赖循环的 winner vote。
+  metaspot_cell_coverage_min_local_marker_transcripts: 2
+  metaspot_cell_coverage_min_local_marker_genes: 2
+  metaspot_cell_coverage_min_local_log2_enrichment: 0.0
+
+  # DGI 在该分支只作“邻域可计算”QC，不再要求 secondary label 赢过由
+  # winner seed 产生的票数；每个缺失结构仍最多补一个 MetaSpot，OMM
+  # 不参与该分支并继续使用独立严格门槛。
+  metaspot_cell_coverage_min_dgi_support: 0.0
+  metaspot_cell_coverage_min_dgi_margin: -1.0
+
+  # 每个缺失 label 在每个细胞中最多补一个 MetaSpot，避免过度改写。
+  metaspot_cell_coverage_max_per_label: 1
+
+
+  # ----------------------------------------------------------
+  # 统一 multi-structure 首位点选择
+  # ----------------------------------------------------------
+  # 仅为细胞当前缺失的结构选择一个证据最强 MetaSpot。五种 fine structure
+  # 共用 presence + localization + joint evidence 机制；OMM 只保留更严格的
+  # marker 数量和分数参数，不再依赖不同的选择算法。
+  metaspot_multistructure_first_locus: true
+  metaspot_multistructure_first_locus_min_presence: 0.55
+  metaspot_multistructure_first_locus_min_localization: 0.55
+  metaspot_fine_min_spatial_coherence:
+    Nucleolus: 0.52
+    Lamina: 0.52
+    Nuclear Pore: 0.52
+    ER: 0.40
+    OMM: 0.40
+  metaspot_multistructure_first_locus_min_evidence:
+    Nucleolus: 0.6652
+    Lamina: 0.6339
+    Nuclear Pore: 0.6350
+    ER: 0.6860
+    OMM: 0.8081
+
+  # 候选 locus 及同一细胞本轮新增 loci 的总 transcript burden 均不得超过
+  # 细胞总转录本的 20%；这是 safety guard，不是结构 prevalence quota。
+  metaspot_multistructure_first_locus_max_projected_burden: 0.20
+
+
+  # ----------------------------------------------------------
+  # 同一 cell × structure 的递减收益选择
+  # ----------------------------------------------------------
+  # 所有 fine-structure 分支汇合后统一排序。第一个可信 locus 总是保留，
+  # strict loci 不裁剪；后续 locus 需要克服随已保留数量和对应区室 RNA
+  # burden 增长的门槛，不使用全局 prevalence quota。
+  metaspot_diminishing_return_selection: true
+  metaspot_diminishing_return_labels:
+    - Nucleolus
+    - Lamina
+    - Nuclear Pore
+    - ER
+    - OMM
+
+  # 当前 test2k_out 的保守敏感性档：不减少任何结构的 cell-level coverage，
+  # 仅裁剪同一细胞内较弱的重复 locus。后续用独立真值校准，而非按 prevalence 调参。
+  metaspot_diminishing_return_log_penalty: 0.10
+  metaspot_diminishing_return_burden_penalty: 0.50
+  metaspot_diminishing_return_min_dgi_support: 0.50
+
+
+  # ----------------------------------------------------------
+  # 可判定细胞的层级 Tier-B rescue
+  # ----------------------------------------------------------
+  # 只处理经过上述严格/探索/逐标签 rescue 后仍完全没有 fine structure
+  # 的细胞。它先用总转录本数和 MetaSpot 数判断该细胞是否有足够深度，
+  # 再联合细胞级 marker presence、焦点 MetaSpot marker localization 与
+  # leave-one-out DGI 支持。每个细胞最多新增一个结构，不执行按细胞配额。
+  metaspot_hierarchical_cell_rescue: true
+
+  # 低于该深度的细胞保留 Nucleus/Cytosol broad fallback，不强行细分。
+  metaspot_hierarchical_min_cell_transcripts: 200
+  metaspot_hierarchical_min_metaspots: 20
+
+  # 三个值均为 [0, 1] 的可审计 evidence score，并非校准后验概率。
+  # presence 汇总细胞级 marker 数量/基因数/enrichment/p 值；localization
+  # 汇总焦点 marker 与 DGI；joint 为二者几何均值。
+  metaspot_hierarchical_min_presence_score: 0.55
+  metaspot_hierarchical_min_localization_score: 0.55
+  metaspot_hierarchical_min_joint_score: 0.60
+
+  # 无论连续分数多高，发出标签前仍必须实测到 cell/local marker，且 DGI
+  # 必须可用。允许 DGI 次优但不能明显冲突，避免 winner-takes-all 漏检。
+  metaspot_hierarchical_min_local_marker_transcripts: 1
+  metaspot_hierarchical_min_local_marker_genes: 1
+  metaspot_hierarchical_min_cell_marker_transcripts: 1
+  metaspot_hierarchical_min_cell_marker_genes: 1
+  metaspot_hierarchical_min_dgi_support: 0.35
+  metaspot_hierarchical_min_dgi_margin: -0.25
+
+
+  # ----------------------------------------------------------
+  # OMM 细胞整体证据 + 局部定位
+  # ----------------------------------------------------------
+  # 不强制每个细胞出现 OMM。先在整个细胞的 cytoplasmic MetaSpots 中
+  # 聚合 OMM-specific marker，确认多转录本、多基因的一致证据；随后只
+  # 把 OMM 标到局部 enrichment、ER/Cytosol separation 和 DGI 共识均
+  # 合格的 MetaSpot。这样可以恢复被切散的线粒体周边 RNA，又不会把
+  # 普遍的 ER-OMM shared signal 当作 OMM。
+  metaspot_omm_cell_coherent_rescue: true
+
+  # 细胞整体必须有多转录本、多基因的 OMM-specific 证据。这里比原先
+  # 的 8/4 略灵敏，但仍不允许单基因或极少量 marker 建立 OMM presence。
+  metaspot_omm_cell_min_marker_transcripts: 6
+  metaspot_omm_cell_min_marker_genes: 3
+  metaspot_omm_cell_min_log2_enrichment: 0.25
+  # 低深度细胞的二项检验功效不足；p 值保留作 audit，但不再否决已经
+  # 满足 6 transcripts / 3 genes、局部 separation 和 DGI 的 OMM。
+  metaspot_omm_cell_max_binomial_p: 1.0
+
+  # 仅用于 audit 的敏感 OMM 候选层，不写入 canonical public label。
+  metaspot_omm_cell_exploratory_max_binomial_p: 1.0
+
+  # 小 MetaSpot 中一个 OMM-specific marker 只作为局部定位锚点；它必须
+  # 同时满足上面的细胞级多基因证据、下面的局部 separation 和 DGI 门槛，
+  # 因而不能单独产生 OMM 标签。
+  metaspot_omm_local_min_marker_transcripts: 1
+  metaspot_omm_local_min_marker_genes: 1
+  metaspot_omm_local_min_log2_enrichment: 0.50
+  metaspot_omm_local_min_score_gap: 0.15
+
+  # leave-one-out DGI 邻域必须更支持 OMM，而不是 ER/Cytosol。
+  # 0.50 要求 OMM 至少获得简单多数邻域支持，并且不能弱于 ER/Cytosol。
+  metaspot_omm_local_min_dgi_support: 0.50
+  metaspot_omm_local_min_dgi_margin: 0.0
+
+  # 线粒体可在同一细胞中形成多个局部区域，但数量保持有界。
+  # 上限 5 在提高细胞覆盖时抑制 OMM transcript burden。
+  metaspot_omm_cell_max_per_cell: 5
+
+  # 结果图仅使用分层抽样的 MetaSpots；10k 足以展示全局结构，并控制
+  # annotation 阶段诊断 UMAP 在大规模数据上的时间。该参数只影响绘图，
+  # 不影响聚类、统计检验或最终标签。
+  metaspot_result_umap_max_points: 10000
+
+
+  # ----------------------------------------------------------
+  # 全局 fine-label 基础门槛
+  # ----------------------------------------------------------
+  # 这些参数作为未定义 label-specific threshold 时的默认值。
+  # 当前配置有意偏宽松，因为 MetaSpot 的中位 transcript 数很低。
+  # 真正较严格的控制主要交给每个亚细胞结构自己的 threshold。
+
+  # 至少需要 1 个 marker transcript
+  metaspot_min_marker_transcripts: 1
+
+  # 至少需要 1 个独立 marker gene
+  metaspot_min_marker_genes: 1
+
+  # 最低 marker enrichment
+  # 从之前 0.3 下调到 0.05，解决大量 weak_enrichment fallback
+  metaspot_min_log2_enrichment: 0.05
+
+  # 第一候选和第二候选的最低 score gap
+  metaspot_min_score_gap: 0.03
+
+  # strict label FDR 阈值
+  metaspot_subtype_fdr: 0.15
+
+  # exploratory label 最大 q-value
+  metaspot_exploratory_max_q: 0.70
+
+
+  # ----------------------------------------------------------
+  # 亚细胞结构特异阈值
+  # ----------------------------------------------------------
+  # 设计原则：
+  # - Nucleolus / Lamina / Nuclear Pore / ER：提高 retention
+  # - OMM：继续明显更严格
+  #
+  # 当前 candidate 本身较丰富，主要 bottleneck 是 weak_enrichment
+  # 与 q_above_exploratory_threshold，因此这里针对这两项放宽。
+
+  metaspot_label_thresholds:
+
+    # ----------------------------
+    # Nucleolus
+    # ----------------------------
+    Nucleolus:
+      # 单个 marker transcript 即允许继续进入证据判断
+      min_marker_transcripts: 1
+
+      # 至少一个 marker gene
+      min_marker_genes: 1
+
+      # Nucleolus candidate 已由上游 scoring 提供，
+      # 这里不再额外要求正 enrichment
+      min_log2_enrichment: 0.0
+
+      # 只要求极小 score separation
+      min_score_gap: 0.01
+
+      # strict FDR
+      subtype_fdr: 0.20
+
+      # exploratory q-value
+      exploratory_max_q: 0.75
+
+      # 当前不额外强制 DGI 支持
+      min_dgi_support: 0.0
+      min_dgi_margin: 0.0
+
+
+    # ----------------------------
+    # Nuclear Lamina
+    # ----------------------------
+    Lamina:
+      min_marker_transcripts: 1
+      min_marker_genes: 1
+
+      # Lamina 还有几何位置约束，因此 expression gate 可更宽
+      min_log2_enrichment: 0.0
+
+      min_score_gap: 0.01
+      subtype_fdr: 0.20
+      exploratory_max_q: 0.75
+
+      min_dgi_support: 0.0
+      min_dgi_margin: 0.0
+
+
+    # ----------------------------
+    # Nuclear Pore
+    # ----------------------------
+    Nuclear Pore:
+      # Nuclear Pore marker set 较小，因此不宜要求多个 marker transcripts
+      min_marker_transcripts: 1
+      min_marker_genes: 1
+
+      # 不额外要求 enrichment
+      min_log2_enrichment: 0.0
+
+      # score gap 允许为 0
+      min_score_gap: 0.0
+
+      # 比其他 nuclear fine structure 略宽
+      subtype_fdr: 0.20
+      exploratory_max_q: 0.80
+
+      min_dgi_support: 0.0
+      min_dgi_margin: 0.0
+
+
+    # ----------------------------
+    # Endoplasmic Reticulum
+    # ----------------------------
+    ER:
+      min_marker_transcripts: 1
+      min_marker_genes: 1
+
+      # ER reference 相对丰富，仍保留轻度 enrichment 要求
+      min_log2_enrichment: 0.05
+
+      min_score_gap: 0.02
+
+      subtype_fdr: 0.20
+      exploratory_max_q: 0.70
+
+      min_dgi_support: 0.0
+      min_dgi_margin: 0.0
+
+
+    # ----------------------------
+    # Outer Mitochondrial Membrane
+    # ----------------------------
+    OMM:
+      # 至少需要多个 OMM marker transcripts
+      min_marker_transcripts: 3
+
+      # 必须由至少两个不同 marker genes 支持
+      # 防止单个高表达基因决定整个 MetaSpot
+      min_marker_genes: 2
+
+      # 强化 OMM-specific enrichment
+      min_log2_enrichment: 0.60
+
+      # OMM 必须明显领先 ER / Cytosol
+      min_score_gap: 0.20
+
+      # strict evidence
+      subtype_fdr: 0.20
+
+      # exploratory OMM 也保持较严格
+      exploratory_max_q: 0.20
+
+      # 暂时不将 DGI 设置成硬阈值
+      min_dgi_support: 0.0
+      min_dgi_margin: 0.0
+
+
+  # ----------------------------------------------------------
+  # OMM 独立确认策略
+  # ----------------------------------------------------------
+
+  # OMM 正常情况下需要独立模型确认
+  metaspot_require_omm_confirmation: true
+
+  # 当 OMM confirmation model 无法识别时：
+  # strict_local = 仍允许非常强的 local OMM evidence 通过
+  # 这样避免 OMM 直接全部变成 0
+  metaspot_omm_unidentifiable_policy: strict_local
+
+  # audit：OMM 模型主要用于审计和确认，不直接大规模改写主标签
+  omm_policy: audit
+
+
+  # ----------------------------------------------------------
+  # 其他 annotation 设置
+  # ----------------------------------------------------------
+
+  # 保存 annotation 诊断图
   save_plots: true
-  # Preferred representation for Leiden/UMAP (options: X_dgi_gcn|X_dgi_sage|X_expr|X_pca|auto)
-  cluster_rep: "X_dgi_gcn"
+
+  # annotation 使用的 MetaDomain / MetaSpot representation
+  cluster_rep: X_dgi_gcn
+
+  # broad-background prior 权重
+  # 1.0 保持当前稳定的 compartment prior
+  metaspot_background_prior_strength: 1.0
+
+
+# ============================================================
+# Runtime
+# ============================================================
 
 runtime:
-  n_jobs: 4
-  joblib_backend: threading
-  blas_threads: 4
+  # CellScoper 内部并行任务数量
+  n_jobs: 12
+
+  # 大规模 Module 3 使用进程绕过 Python GIL；小数据仍自动使用线程
+  joblib_backend: loky
+
+  # 每个 worker 内 BLAS 保持单线程，避免嵌套线程池
+  blas_threads: 1
+
+  # Numba/PyNNDescent 内层线程；会按 OpenBLAS 64 线程元数据上限安全截断
+  numba_threads: 4
+
+  # Scanpy 邻居图线程；不得超过 numba_threads 的实际安全值
+  scanpy_n_jobs: 4
+
+  # 使用 threadpoolctl 防止线程过度嵌套
   use_threadpoolctl: true

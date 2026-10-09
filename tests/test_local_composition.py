@@ -1,12 +1,15 @@
 import os
 import tempfile
 import unittest
+import warnings
+from unittest import mock
 from contextlib import contextmanager
 
 import numpy as np
 import pandas as pd
 import anndata as ad
 import scipy.sparse as sp
+import cellscope.pipeline as pipeline_module
 
 from cellscope.pipeline import (
     _LocalCompositionModel,
@@ -15,13 +18,34 @@ from cellscope.pipeline import (
     _apply_low_confidence_policy,
     _apply_low_confidence_policy_by_candidate,
     _apply_independent_evidence_policy,
+    _apply_independent_evidence_tracks,
     _choose_annotation_neighbors_key,
+    _build_same_cell_metaspot_dgi_pool,
+    _stable_group_layout,
+    _high_confidence_cell_coverage,
+    _unique_cell_counts_for_masks,
+    _compute_metaspot_dgi_consensus,
+    _compute_cell_structure_spatial_coherence,
     _configure_annotation_unit,
     _configure_rnalocate_augmentation,
     _prepare_apex_gold_reference,
+    _refine_metaspot_annotations_with_local_dgi,
+    _resolve_metaspot_label_thresholds,
+    _resolve_metaspot_omm_confirmation,
+    _apply_metaspot_diminishing_return_selection,
+    _select_metaspot_cell_coverage_rescues,
+    _select_metaspot_labelwise_cell_coverage_rescues,
+    _select_metaspot_multistructure_first_loci,
+    _select_metaspot_hierarchical_cell_rescues,
+    _select_metaspot_omm_cell_coherent_rescues,
     _load_default_gold_tables,
     _compose_omm_metaspot_labels,
     _apply_local_compartment_guard,
+    _metaspot_compartment_guard_values,
+    _map_metaspot_labels_to_transcripts,
+    _key_row_indexer,
+    _take_obs_column_by_row_indexer,
+    _sanitize_obs_for_h5ad,
     _demote_weak_top1,
     _guard_nuclear_pore_overcall,
     _guard_omm_overcall,
@@ -37,7 +61,9 @@ from cellscope.pipeline import (
     robust_gene_stats,
     _refresh_subcellular_group_columns,
     _resume_build_outputs,
+    _allocate_partition_target_counts,
     _enforce_spatially_connected_labels,
+    _metaspot_segmentation_audit,
     _migrate_legacy_metaspot_columns,
     _select_top_variance_features,
     _save_adata,
@@ -139,6 +165,8 @@ class LocalCompositionTests(unittest.TestCase):
         result = build_adata2_from_adata1_and_pointdf(
             adata1,
             pd.DataFrame(),
+            module6_config_override={"pool_reps": []},
+            graph_unit_override="metadomain",
         )
 
         np.testing.assert_allclose(
@@ -153,6 +181,44 @@ class LocalCompositionTests(unittest.TestCase):
         self.assertIn(
             "layers_counts",
             result.uns["matrix_semantics"],
+        )
+
+    def test_module6_accepts_lightweight_geometry_metadata(self):
+        obs = pd.DataFrame(
+            {
+                "meta-domain": pd.Categorical(["A", "A", "B"]),
+                "cell_id": ["c1", "c1", "c2"],
+                "r_mean": [-0.5, -0.4, 0.6],
+                "r_p50": [-0.5, -0.4, 0.6],
+                "d_cell_norm_mean": [0.4, 0.4, 0.3],
+                "d_nuc_norm_mean": [0.2, 0.2, 0.7],
+            },
+            index=["m1", "m2", "m3"],
+        )
+        adata1 = ad.AnnData(
+            X=sp.csr_matrix([[2, 0], [0, 3], [1, 1]], dtype=np.float32),
+            obs=obs,
+            var=pd.DataFrame(index=["G1", "G2"]),
+        )
+
+        result = build_adata2_from_adata1_and_pointdf(
+            adata1,
+            pd.DataFrame(),
+            module6_config_override={"pool_reps": []},
+            graph_unit_override="metadomain",
+        )
+
+        assert list(result.obs.columns) == [
+            "n_metaspots",
+            "r_mean",
+            "r_p50",
+            "d_cell_norm_mean",
+            "d_nuc_norm_mean",
+            "rep_cell_id",
+        ]
+        np.testing.assert_allclose(
+            result.obs["r_mean"].to_numpy(),
+            np.array([-0.45, 0.6]),
         )
 
     def test_explicit_annotation_rep_is_not_overridden_by_priority(self):
@@ -183,6 +249,1060 @@ class LocalCompositionTests(unittest.TestCase):
         self.assertEqual(result.obs["leiden"].astype(str).tolist(), ["d1", "d2", "d3"])
         self.assertEqual(result.obs["leiden_embedding"].tolist(), ["0", "0", "1"])
         self.assertEqual(result.uns["annotation_unit"], "metadomain")
+
+    def test_metaspot_annotation_unit_uses_metadomain_prior_groups(self):
+        adata = ad.AnnData(
+            X=np.ones((3, 2), dtype=np.float32),
+            obs=pd.DataFrame(
+                {"leiden": pd.Categorical(["0", "0", "1"])},
+                index=["d1", "d2", "d3"],
+            ),
+        )
+
+        result = _configure_annotation_unit(adata, "metaspot")
+
+        self.assertEqual(
+            result.obs["leiden"].astype(str).tolist(),
+            ["d1", "d2", "d3"],
+        )
+        self.assertEqual(result.obs["leiden_embedding"].tolist(), ["0", "0", "1"])
+        self.assertEqual(result.uns["annotation_unit"], "metaspot")
+        self.assertEqual(result.uns["annotation_prior_unit"], "metadomain")
+
+    def test_metaspot_dgi_pool_never_crosses_cell_or_compartment(self):
+        obs = pd.DataFrame(
+            {
+                "cell_id": ["c1", "c1", "c1", "c1", "c2", "c2"],
+            },
+            index=[f"s{i}" for i in range(6)],
+        )
+        adata = ad.AnnData(
+            X=sp.csr_matrix(np.ones((6, 1), dtype=np.int32)),
+            obs=obs,
+            var=pd.DataFrame(index=["G"]),
+        )
+        adata.obsm["X_dgi_gcn_metaspot"] = np.asarray(
+            [[1.0, 0.0], [0.99, 0.01], [1.0, 0.0], [0.99, 0.01], [1.0, 0.0], [0.99, 0.01]],
+            dtype=np.float32,
+        )
+        broad = pd.Series(
+            ["Nuclear", "Nuclear", "Cytoplasmic", "Cytoplasmic", "Nuclear", "Nuclear"],
+            index=obs.index,
+        )
+
+        pooling, pool_size = _build_same_cell_metaspot_dgi_pool(
+            adata,
+            broad,
+            n_neighbors=2,
+        )
+
+        rows, cols = pooling.nonzero()
+        for row, col in zip(rows, cols):
+            self.assertEqual(obs.iloc[row]["cell_id"], obs.iloc[col]["cell_id"])
+            self.assertEqual(broad.iloc[row], broad.iloc[col])
+        self.assertTrue(np.all(pool_size == 2))
+        self.assertTrue(np.all(pooling.diagonal() == 1))
+
+    def test_stable_group_layout_indexes_each_group_once(self):
+        group_codes = np.asarray([2, 0, 2, 1, 0, 2, 1], dtype=np.int64)
+
+        member_order, offsets, sizes = _stable_group_layout(group_codes, 3)
+
+        np.testing.assert_array_equal(sizes, [2, 2, 3])
+        np.testing.assert_array_equal(offsets, [0, 2, 4, 7])
+        np.testing.assert_array_equal(
+            member_order[offsets[0] : offsets[1]],
+            [1, 4],
+        )
+        np.testing.assert_array_equal(
+            member_order[offsets[1] : offsets[2]],
+            [3, 6],
+        )
+        np.testing.assert_array_equal(
+            member_order[offsets[2] : offsets[3]],
+            [0, 2, 5],
+        )
+
+    def test_metaspot_dgi_consensus_is_leave_one_out(self):
+        labels = ["Nucleus", "Nucleolus", "Lamina"]
+        allowed = {"Nuclear": labels}
+        broad = np.asarray(["Nuclear"] * 4, dtype=object)
+        raw_scores = np.asarray(
+            [
+                [0.0, 3.0, 0.0],
+                [0.0, 2.0, 0.0],
+                [0.0, 0.0, 3.0],
+                [3.0, 0.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        raw_counts = np.zeros_like(raw_scores)
+        raw_genes = np.zeros_like(raw_scores, dtype=np.int32)
+        for row, label_idx in enumerate([1, 1, 2, 0]):
+            raw_counts[row, label_idx] = 2
+            raw_genes[row, label_idx] = 1
+        pooling = sp.csr_matrix(
+            np.asarray(
+                [
+                    [1, 1, 0, 0],
+                    [1, 1, 0, 0],
+                    [0, 0, 1, 0],
+                    [1, 0, 1, 1],
+                ],
+                dtype=np.float32,
+            )
+        )
+
+        candidate, _, support, informative = (
+            _compute_metaspot_dgi_consensus(
+                pooling,
+                raw_scores,
+                raw_counts,
+                raw_genes,
+                broad,
+                labels,
+                allowed,
+                seed_min_transcripts=1,
+                seed_min_genes=1,
+                seed_min_enrichment=0.0,
+                min_informative_neighbors=1,
+            )
+        )
+
+        self.assertEqual(candidate.tolist(), [1, 1, 2, 0])
+        self.assertEqual(informative.tolist(), [1, 1, 0, 2])
+        self.assertEqual(float(support[2].sum()), 0.0)
+        self.assertAlmostEqual(float(support[3, 1]), 0.5)
+        self.assertAlmostEqual(float(support[3, 2]), 0.5)
+
+    def test_metaspot_label_thresholds_are_validated_per_label(self):
+        labels = ["Nucleus", "Nucleolus", "Cytosol", "ER"]
+        defaults = {
+            "min_marker_transcripts": 3,
+            "min_marker_genes": 2,
+            "min_log2_enrichment": 0.5,
+            "min_score_gap": 0.25,
+            "subtype_fdr": 0.05,
+            "exploratory_max_q": 0.30,
+            "min_dgi_support": 0.0,
+            "min_dgi_margin": 0.0,
+        }
+
+        arrays, resolved = _resolve_metaspot_label_thresholds(
+            {
+                "metaspot_label_thresholds": {
+                    "nucleolus": {
+                        "min_marker_transcripts": 5,
+                        "min_dgi_support": 0.60,
+                    }
+                }
+            },
+            labels,
+            defaults,
+        )
+
+        self.assertEqual(int(arrays["min_marker_transcripts"][1]), 5)
+        self.assertEqual(int(arrays["min_marker_transcripts"][3]), 3)
+        self.assertAlmostEqual(
+            resolved["Nucleolus"]["min_dgi_support"],
+            0.60,
+        )
+        with self.assertRaisesRegex(ValueError, "unknown label"):
+            _resolve_metaspot_label_thresholds(
+                {
+                    "metaspot_label_thresholds": {
+                        "Mitochondria": {"min_marker_genes": 2}
+                    }
+                },
+                labels,
+                defaults,
+            )
+        with self.assertRaisesRegex(ValueError, "Unknown MetaSpot"):
+            _resolve_metaspot_label_thresholds(
+                {
+                    "metaspot_label_thresholds": {
+                        "ER": {"unsupported_field": 1}
+                    }
+                },
+                labels,
+                defaults,
+            )
+
+    def test_cell_coverage_rescue_is_bounded_and_evidence_gated(self):
+        cell_ids = np.asarray(
+            ["c1", "c1", "c1", "c1", "c2", "c2", "c2"],
+            dtype=object,
+        )
+        candidate = np.asarray(
+            [
+                "Nucleolus",
+                "Nucleolus",
+                "ER",
+                "OMM",
+                "Nucleolus",
+                "Nucleolus",
+                "ER",
+            ],
+            dtype=object,
+        )
+        already_supported = np.asarray(
+            [False, False, False, False, True, False, False]
+        )
+        marker_base = np.asarray(
+            [True, True, True, True, True, True, False]
+        )
+        dgi_available = np.ones(7, dtype=bool)
+        support = np.asarray([0.60, 0.80, 0.70, 1.0, 0.90, 0.95, 1.0])
+        margin = np.asarray([0.10, 0.20, 0.10, 1.0, 0.30, 0.40, 1.0])
+        enrichment = np.asarray([2.0, 1.5, 1.0, 3.0, 2.0, 3.0, 4.0])
+        score_gap = np.asarray([1.0, 1.0, 0.5, 2.0, 1.0, 2.0, 3.0])
+        q_values = np.asarray([1.0, 1.0, 1.0, 0.01, 1.0, 1.0, 1.0])
+        counts = np.asarray([2, 2, 3, 5, 2, 4, 5])
+        cell_counts = np.asarray([1, 8, 10, 20, 8, 8, 1])
+        cell_genes = np.asarray([1, 3, 3, 5, 3, 3, 1])
+        cell_enrichment = np.asarray([-0.2, 0.4, 0.5, 1.0, 0.3, 0.3, 0.5])
+        cell_p = np.asarray([0.9, 0.1, 0.05, 0.01, 0.1, 0.1, 0.01])
+
+        rescued = _select_metaspot_cell_coverage_rescues(
+            cell_ids,
+            candidate,
+            already_supported,
+            marker_base,
+            dgi_available,
+            support,
+            margin,
+            enrichment,
+            score_gap,
+            q_values,
+            counts,
+            cell_counts,
+            cell_genes,
+            cell_enrichment,
+            cell_p,
+            labels=["Nucleolus", "ER"],
+            min_cell_transcripts=3,
+            min_cell_genes=2,
+            min_cell_enrichment=0.0,
+            max_cell_p=0.50,
+            min_dgi_support=0.50,
+            min_dgi_margin=0.0,
+            max_per_cell_label=1,
+        )
+
+        # c1's first Nucleolus lacks cell-level multi-gene evidence, while the
+        # second Nucleolus and ER pass cell, local, and DGI gates.
+        self.assertEqual(np.flatnonzero(rescued).tolist(), [1, 2])
+        # c2 already has Nucleolus, its ER fails marker evidence, and OMM was
+        # deliberately not included in the coverage-rescue label list.
+        self.assertFalse(rescued[3])
+        self.assertFalse(rescued[5])
+        self.assertFalse(rescued[6])
+
+    def test_labelwise_cell_coverage_rescue_recovers_nonwinning_label(self):
+        labels = ["Nucleus", "Nucleolus", "Lamina"]
+        allowed = {"Nuclear": labels}
+        cell_ids = np.asarray(
+            ["recover", "recover", "existing", "existing", "weak"],
+            dtype=object,
+        )
+        broad = np.asarray(["Nuclear"] * 5, dtype=object)
+        candidate = np.asarray(
+            ["Lamina", "Nucleus", "Nucleolus", "Nucleus", "Lamina"],
+            dtype=object,
+        )
+        supported = np.asarray([False, False, True, False, False])
+        counts = np.asarray(
+            [[2, 1, 2], [3, 1, 0], [1, 2, 0], [2, 0, 1], [2, 1, 2]],
+            dtype=float,
+        )
+        genes = (counts > 0).astype(int)
+        enrichment = np.asarray(
+            [
+                [0.2, 0.4, 0.8],
+                [0.3, 0.6, -0.2],
+                [0.0, 1.0, -0.1],
+                [0.2, -0.1, 0.5],
+                [0.2, 0.6, 0.8],
+            ]
+        )
+        q_values = np.full((5, 3), 0.9)
+        dgi_support = np.asarray(
+            [
+                [0.0, 0.6, 0.4],
+                [0.0, 0.7, 0.3],
+                [0.0, 0.8, 0.2],
+                [0.0, 0.3, 0.7],
+                [0.0, 0.7, 0.3],
+            ]
+        )
+        cell_counts = np.asarray(
+            [[5, 4, 2], [5, 4, 2], [3, 3, 3], [3, 3, 3], [5, 2, 4]],
+            dtype=float,
+        )
+        cell_genes = np.asarray(
+            [[2, 2, 2], [2, 2, 2], [2, 2, 2], [2, 2, 2], [2, 1, 2]]
+        )
+
+        rescued = _select_metaspot_labelwise_cell_coverage_rescues(
+            cell_ids,
+            broad,
+            candidate,
+            supported,
+            counts,
+            genes,
+            enrichment,
+            q_values,
+            np.ones(5, dtype=bool),
+            dgi_support,
+            cell_counts,
+            cell_genes,
+            np.full((5, 3), 0.5),
+            np.full((5, 3), 0.1),
+            labels=["Nucleolus", "Lamina"],
+            all_labels=labels,
+            allowed=allowed,
+            min_local_transcripts=np.ones(3, dtype=int),
+            min_local_genes=np.ones(3, dtype=int),
+            min_local_enrichment=np.zeros(3),
+            min_cell_transcripts=3,
+            min_cell_genes=2,
+            min_cell_enrichment=0.0,
+            max_cell_p=0.5,
+            min_dgi_support=0.5,
+            min_dgi_margin=0.0,
+            max_per_cell_label=1,
+        )
+
+        # Nucleolus is not the primary candidate in the first cell, yet its
+        # own evidence recovers row 1. The existing cell already has
+        # Nucleolus but can independently recover its missing Lamina at row 3;
+        # the weak cell fails the multi-gene presence gate.
+        self.assertEqual(
+            rescued.tolist(), ["", "Nucleolus", "", "Lamina", ""]
+        )
+
+    def test_diminishing_return_keeps_first_and_protects_strict_loci(self):
+        labels = [
+            "Nucleus",
+            "Nucleolus",
+            "Lamina",
+            "Nuclear Pore",
+            "Cytosol",
+            "ER",
+            "OMM",
+        ]
+        allowed = {
+            "Nuclear": labels[:4],
+            "Cytoplasmic": labels[4:],
+        }
+        enrichment = np.zeros((4, len(labels)), dtype=float)
+        support = np.zeros_like(enrichment)
+        enrichment[:3, labels.index("OMM")] = [0.9, 0.7, 0.6]
+        support[:3, labels.index("OMM")] = 0.6
+        enrichment[3, labels.index("Nucleolus")] = -0.5
+
+        keep, diagnostics = _apply_metaspot_diminishing_return_selection(
+            ["a", "a", "a", "b"],
+            ["OMM", "OMM", "OMM", "Nucleolus"],
+            [False, False, False, False],
+            ["Cytoplasmic", "Cytoplasmic", "Cytoplasmic", "Nuclear"],
+            enrichment,
+            support,
+            [10, 10, 80, 100],
+            enabled_labels=["Nucleolus", "OMM"],
+            all_labels=labels,
+            allowed=allowed,
+            min_local_enrichment=[0, 0, 0, 0, 0, 0, 0.5],
+            dgi_weight=0.6,
+            min_dgi_support=0.5,
+            log_penalty=0.2,
+            burden_penalty=1.0,
+        )
+
+        self.assertEqual(keep.tolist(), [True, True, False, True])
+        self.assertEqual(
+            diagnostics["first_locus"].tolist(),
+            [True, False, False, True],
+        )
+        self.assertAlmostEqual(diagnostics["burden_before"][2], 0.2)
+
+        strict_keep, _ = _apply_metaspot_diminishing_return_selection(
+            ["a", "a", "a"],
+            ["OMM", "OMM", "OMM"],
+            [False, False, True],
+            ["Cytoplasmic"] * 3,
+            enrichment[:3],
+            support[:3],
+            [10, 10, 80],
+            enabled_labels=["OMM"],
+            all_labels=labels,
+            allowed=allowed,
+            min_local_enrichment=[0, 0, 0, 0, 0, 0, 0.5],
+            dgi_weight=0.6,
+            min_dgi_support=0.5,
+            log_penalty=0.2,
+            burden_penalty=1.0,
+        )
+        self.assertTrue(strict_keep[2])
+
+    def test_multistructure_first_locus_is_missing_only_and_burden_guarded(self):
+        structures = ["Nucleolus", "ER"]
+        shape = (7, 2)
+        presence = np.zeros(shape, dtype=float)
+        localization = np.zeros(shape, dtype=float)
+        evidence = np.zeros(shape, dtype=float)
+        presence[[0, 1, 3, 5, 6], :] = 0.8
+        localization[[0, 1, 3, 5, 6], :] = 0.8
+        evidence[0, 0] = 0.9
+        evidence[1, 1] = 0.8
+        evidence[3, 0] = 0.9
+        evidence[5, 0] = 0.9
+        evidence[6, 0] = 0.95
+        marker_counts = np.ones(shape, dtype=int)
+        spatial_coherence = np.ones(shape, dtype=float)
+
+        selected, diagnostics = _select_metaspot_multistructure_first_loci(
+            ["a", "a", "a", "b", "b", "c", "c"],
+            ["Nucleus", "Cytosol", "Nucleus", "Nucleus", "Nucleus", "Nucleolus", "Nucleus"],
+            [False, False, False, False, False, True, False],
+            presence,
+            localization,
+            evidence,
+            spatial_coherence,
+            np.ones(shape, dtype=bool),
+            marker_counts,
+            marker_counts,
+            marker_counts,
+            marker_counts,
+            np.ones(shape, dtype=float),
+            np.zeros(shape, dtype=float),
+            [True] * 7,
+            [10, 10, 80, 30, 70, 10, 90],
+            structures=structures,
+            min_presence_score=0.5,
+            min_localization_score=0.5,
+            min_spatial_coherence=[0.5, 0.5],
+            min_evidence_score=[0.7, 0.7],
+            min_local_marker_transcripts=[1, 1],
+            min_local_marker_genes=[1, 1],
+            min_cell_marker_transcripts=[1, 1],
+            min_cell_marker_genes=[1, 1],
+            min_cell_marker_enrichment=[0.0, 0.0],
+            max_cell_marker_p=[1.0, 1.0],
+            max_projected_burden=0.2,
+        )
+
+        self.assertEqual(
+            selected.tolist(),
+            ["Nucleolus", "ER", "", "", "", "", ""],
+        )
+        self.assertTrue(diagnostics["burden_rejected"][3])
+        self.assertFalse(diagnostics["eligible"][6])
+        self.assertAlmostEqual(diagnostics["projected_burden"][0], 0.1)
+
+    def test_cell_structure_spatial_coherence_is_compartment_normalized(self):
+        coherence = _compute_cell_structure_spatial_coherence(
+            np.asarray([0, 0, 0, 0, 0]),
+            ["Nuclear", "Nuclear", "Nuclear", "Nuclear", "Cytoplasmic"],
+            np.asarray([[1, 4], [1, 0], [1, 0], [1, 0], [9, 9]]),
+            [10, 10, 10, 10, 90],
+            ["diffuse", "focused"],
+            {"diffuse": "Nuclear", "focused": "Nuclear"},
+        )
+
+        np.testing.assert_allclose(coherence[:4, 0], 0.0)
+        np.testing.assert_allclose(coherence[:4, 1], 0.75)
+        np.testing.assert_allclose(coherence[4], [0.0, 0.75])
+
+    def test_hierarchical_cell_rescue_requires_callability_marker_and_dgi(self):
+        labels = ["Nucleus", "Nucleolus", "Lamina"]
+        allowed = {"Nuclear": labels}
+        cell_ids = np.asarray(
+            [
+                "good",
+                "good",
+                "existing",
+                "existing",
+                "shallow",
+                "shallow",
+                "no_dgi",
+                "no_dgi",
+            ],
+            dtype=object,
+        )
+        broad = np.asarray(["Nuclear"] * 8, dtype=object)
+        supported = np.asarray(
+            [False, False, True, False, False, False, False, False]
+        )
+        local_counts = np.zeros((8, 3), dtype=float)
+        local_genes = np.zeros((8, 3), dtype=float)
+        local_enrichment = np.full((8, 3), -1.0, dtype=float)
+        for row in (0, 4, 6):
+            local_counts[row, 1] = 1.0
+            local_genes[row, 1] = 1.0
+            local_enrichment[row, 1] = 1.0
+
+        dgi_support = np.tile([0.2, 0.7, 0.1], (8, 1))
+        cell_counts = np.zeros((8, 3), dtype=float)
+        cell_genes = np.zeros((8, 3), dtype=float)
+        cell_enrichment = np.full((8, 3), -1.0, dtype=float)
+        cell_p = np.ones((8, 3), dtype=float)
+        for row in (0, 1, 4, 5, 6, 7):
+            cell_counts[row, 1] = 2.0
+            cell_genes[row, 1] = 2.0
+            cell_enrichment[row, 1] = 1.0
+            cell_p[row, 1] = 0.01
+
+        rescue_labels, diagnostics = (
+            _select_metaspot_hierarchical_cell_rescues(
+                cell_ids,
+                broad,
+                supported,
+                local_counts,
+                local_genes,
+                local_enrichment,
+                np.asarray(
+                    [True, True, True, True, True, True, False, False]
+                ),
+                dgi_support,
+                cell_counts,
+                cell_genes,
+                cell_enrichment,
+                cell_p,
+                np.asarray([6, 6, 6, 6, 3, 3, 6, 6], dtype=float),
+                labels=["Nucleolus", "Lamina"],
+                all_labels=labels,
+                allowed=allowed,
+                min_cell_transcripts=10,
+                min_metaspots=2,
+                min_presence_score=0.60,
+                min_localization_score=0.60,
+                min_joint_score=0.65,
+                min_local_marker_transcripts=1,
+                min_local_marker_genes=1,
+                min_cell_marker_transcripts=1,
+                min_cell_marker_genes=1,
+                min_dgi_support=0.35,
+                min_dgi_margin=-0.25,
+            )
+        )
+
+        self.assertEqual(
+            rescue_labels.tolist(),
+            ["Nucleolus", "", "", "", "", "", "", ""],
+        )
+        self.assertTrue(diagnostics["callable"][0])
+        self.assertFalse(diagnostics["callable"][4])
+        self.assertFalse(diagnostics["eligible_cell"][2])
+        self.assertTrue(diagnostics["eligible_cell"][6])
+        self.assertEqual(diagnostics["status"][0], "selected")
+        self.assertEqual(
+            diagnostics["status"][2], "already_has_fine_structure"
+        )
+        self.assertEqual(diagnostics["status"][4], "not_callable")
+        self.assertEqual(
+            diagnostics["status"][6], "no_anchored_candidate"
+        )
+        self.assertEqual(diagnostics["best_label"][0], "Nucleolus")
+        self.assertGreater(diagnostics["joint_score"][0], 0.65)
+        self.assertGreater(diagnostics["best_joint_score"][0], 0.65)
+        self.assertTrue(np.isnan(diagnostics["joint_score"][6]))
+
+    def test_omm_cell_coherent_rescue_requires_cell_and_local_evidence(self):
+        cell_ids = np.asarray(
+            ["supported", "supported", "good", "good", "good", "weak"],
+            dtype=object,
+        )
+        candidate = np.asarray(["OMM"] * 6, dtype=object)
+        already_supported = np.asarray([True, False, False, False, False, False])
+        broad = np.asarray(["Cytoplasmic"] * 6, dtype=object)
+        local_counts = np.asarray([8, 4, 3, 2, 3, 3])
+        local_genes = np.asarray([4, 2, 2, 2, 2, 2])
+        local_enrichment = np.asarray([2.0, 1.0, 0.8, 0.9, 0.7, 1.0])
+        local_gap = np.asarray([1.0, 0.5, 0.4, 0.3, 0.2, 0.5])
+        dgi_available = np.ones(6, dtype=bool)
+        dgi_support = np.asarray([1.0, 0.9, 0.8, 0.9, 0.7, 0.9])
+        dgi_margin = np.asarray([1.0, 0.4, 0.3, 0.4, -0.1, 0.4])
+        cell_counts = np.asarray([20, 20, 12, 12, 12, 4])
+        cell_genes = np.asarray([6, 6, 5, 5, 5, 2])
+        cell_enrichment = np.asarray([1.0, 1.0, 0.8, 0.8, 0.8, 1.0])
+        cell_p = np.asarray([0.001, 0.001, 0.01, 0.01, 0.01, 0.001])
+
+        rescued = _select_metaspot_omm_cell_coherent_rescues(
+            cell_ids,
+            candidate,
+            already_supported,
+            broad,
+            local_counts,
+            local_genes,
+            local_enrichment,
+            local_gap,
+            dgi_available,
+            dgi_support,
+            dgi_margin,
+            cell_counts,
+            cell_genes,
+            cell_enrichment,
+            cell_p,
+            min_cell_transcripts=8,
+            min_cell_genes=4,
+            min_cell_enrichment=0.5,
+            max_cell_p=0.05,
+            min_local_transcripts=2,
+            min_local_genes=2,
+            min_local_enrichment=0.5,
+            min_local_score_gap=0.15,
+            min_dgi_support=0.6,
+            min_dgi_margin=0.0,
+            max_per_cell=2,
+        )
+
+        # A pre-existing OMM prevents more calls in that cell. The good cell
+        # receives its two strongest local loci; the negative-margin locus and
+        # the cell without aggregate multi-gene evidence remain unlabelled.
+        self.assertEqual(np.flatnonzero(rescued).tolist(), [2, 3])
+
+    def test_omm_single_marker_anchor_still_requires_cell_and_dgi_gates(self):
+        rescued = _select_metaspot_omm_cell_coherent_rescues(
+            np.asarray(["eligible", "weak_cell", "weak_dgi"], dtype=object),
+            np.asarray(["OMM", "OMM", "OMM"], dtype=object),
+            np.zeros(3, dtype=bool),
+            np.asarray(["Cytoplasmic"] * 3, dtype=object),
+            np.ones(3, dtype=int),
+            np.ones(3, dtype=int),
+            np.ones(3, dtype=float),
+            np.full(3, 0.5),
+            np.ones(3, dtype=bool),
+            np.asarray([0.50, 0.90, 0.49]),
+            np.asarray([0.00, 0.40, -0.01]),
+            np.asarray([6, 5, 10]),
+            np.asarray([3, 3, 4]),
+            np.asarray([0.25, 1.0, 1.0]),
+            np.asarray([0.10, 0.01, 0.01]),
+            min_cell_transcripts=6,
+            min_cell_genes=3,
+            min_cell_enrichment=0.25,
+            max_cell_p=0.10,
+            min_local_transcripts=1,
+            min_local_genes=1,
+            min_local_enrichment=0.5,
+            min_local_score_gap=0.15,
+            min_dgi_support=0.50,
+            min_dgi_margin=0.0,
+            max_per_cell=10,
+        )
+
+        # A focal one-marker anchor is sufficient only in the cell that also
+        # passes aggregate multi-gene evidence and both local DGI gates.
+        self.assertEqual(np.flatnonzero(rescued).tolist(), [0])
+
+    def test_hybrid_metaspot_annotation_restricts_subtypes_and_falls_back(self):
+        labels = [
+            "Nucleus",
+            "Nucleolus",
+            "Lamina",
+            "Nuclear_Pore",
+            "Cytosol",
+            "ER",
+            "OMM",
+        ]
+        genes = [f"{label}_G{rep}" for label in labels for rep in range(2)]
+        gold = pd.DataFrame({"Common_Gene": genes})
+        for label in labels:
+            gold[label] = [
+                1.0 if gene.startswith(f"{label}_") else 0.0
+                for gene in genes
+            ]
+
+        X = np.zeros((10, len(genes)), dtype=np.int32)
+        gene_pos = {gene: idx for idx, gene in enumerate(genes)}
+        for row, label in {
+            0: "Nucleolus",
+            1: "Nucleolus",
+            3: "Nucleus",
+            4: "Lamina",
+            5: "ER",
+            6: "ER",
+            8: "Cytosol",
+            9: "OMM",
+        }.items():
+            source_label = label.replace(" ", "_")
+            X[row, gene_pos[f"{source_label}_G0"]] = 3
+            X[row, gene_pos[f"{source_label}_G1"]] = 2
+        obs = pd.DataFrame(
+            {
+                "cell_id": ["c1"] * 5 + ["c2"] * 5,
+                "metaspot": [f"s{i}" for i in range(10)],
+                "subcellular_annotation": ["Nucleus"] * 5 + ["Cytosol"] * 5,
+            },
+            index=[f"s{i}" for i in range(10)],
+        )
+        adata = ad.AnnData(
+            X=sp.csr_matrix(X),
+            obs=obs,
+            var=pd.DataFrame(index=genes),
+        )
+        adata.obsm["X_dgi_gcn_metaspot"] = np.eye(
+            10,
+            dtype=np.float32,
+        )
+        adata_template = adata.copy()
+        cfg = {
+            "gold_column_normalize": False,
+            "marker_set_target": 20,
+            "marker_min_weight": 0.05,
+            "marker_min_margin": 0.05,
+            "metaspot_pool_k": 1,
+            "metaspot_min_marker_transcripts": 1,
+            "metaspot_min_marker_genes": 1,
+            "metaspot_min_log2_enrichment": 0.0,
+            "metaspot_min_score_gap": 0.0,
+            "metaspot_subtype_fdr": 1.0,
+            "metaspot_exploratory_max_q": 1.0,
+            "metaspot_background_prior_strength": 1.0,
+            "metaspot_require_omm_confirmation": False,
+        }
+
+        result, scores, metadata = (
+            _refine_metaspot_annotations_with_local_dgi(
+                adata,
+                gold,
+                cfg,
+            )
+        )
+
+        final = result.obs["subcellular_annotation"].astype(str)
+        self.assertEqual(final.loc["s0"], "Nucleolus")
+        self.assertEqual(final.loc["s5"], "ER")
+        self.assertEqual(final.loc["s2"], "Nucleus")
+        self.assertEqual(final.loc["s7"], "Cytosol")
+        self.assertFalse(final.iloc[:5].isin(["Cytosol", "ER", "OMM"]).any())
+        self.assertFalse(final.iloc[5:].isin(["Nucleus", "Nucleolus", "Lamina", "Nuclear Pore"]).any())
+        self.assertEqual(len(scores), 10)
+        self.assertTrue(metadata["same_cell_only"])
+        self.assertTrue(metadata["same_broad_compartment_only"])
+        self.assertTrue(metadata["dgi_consensus_excludes_self"])
+        for key in (
+            "X_subcellular_structure_presence",
+            "X_subcellular_structure_localization",
+            "X_subcellular_structure_evidence",
+        ):
+            self.assertEqual(result.obsm[key].shape, (10, 5))
+            self.assertTrue(np.isfinite(result.obsm[key]).all())
+            self.assertTrue((result.obsm[key] >= 0.0).all())
+            self.assertTrue((result.obsm[key] <= 1.0).all())
+        self.assertEqual(
+            metadata["multi_structure_evidence"]["structures"],
+            ["Nucleolus", "Lamina", "Nuclear Pore", "ER", "OMM"],
+        )
+        self.assertFalse(
+            metadata["multi_structure_evidence"]["used_for_final_selection"]
+        )
+        np.testing.assert_allclose(
+            scores["structure_evidence__nucleolus"].to_numpy(),
+            result.obsm["X_subcellular_structure_evidence"][:, 0],
+        )
+        self.assertEqual(
+            result.uns["cell_structure_evidence"]["presence_score"].shape,
+            (2, 5),
+        )
+        self.assertEqual(
+            str(result.obs.loc["s2", "subcellular_fine_annotation"]),
+            "Nucleus",
+        )
+        self.assertEqual(
+            str(result.obs.loc["s2", "subcellular_fine_state"]),
+            "Broad-prior fallback",
+        )
+        self.assertEqual(
+            str(result.obs.loc["s0", "subcellular_fine_annotation"]),
+            "Nucleolus",
+        )
+        self.assertEqual(
+            result.obs.loc["s2", "subcellular_metaspot_fallback_reason"],
+            "broad_label_wins",
+        )
+
+        lean_result, lean_scores, lean_metadata = (
+            _refine_metaspot_annotations_with_local_dgi(
+                adata_template.copy(),
+                gold,
+                cfg,
+                build_score_table=False,
+            )
+        )
+        self.assertIsNone(lean_scores)
+        self.assertEqual(
+            lean_result.obs["subcellular_annotation"].astype(str).tolist(),
+            result.obs["subcellular_annotation"].astype(str).tolist(),
+        )
+        self.assertEqual(
+            lean_metadata["final_label_counts"],
+            metadata["final_label_counts"],
+        )
+        self.assertNotIn(
+            "subcellular_metaspot_fused_score",
+            lean_result.obs.columns,
+        )
+        np.testing.assert_allclose(
+            lean_result.obsm["X_subcellular_structure_evidence"],
+            result.obsm["X_subcellular_structure_evidence"],
+        )
+
+        # A marker-qualified candidate can enter only the explicitly tagged
+        # exploratory tier when leave-one-out DGI neighbors agree but its
+        # label-wise BH q-value does not pass the configured cutoff.
+        dgi_rescue = adata_template.copy()
+        dgi_rescue.obsm["X_dgi_gcn_metaspot"][1] = (
+            dgi_rescue.obsm["X_dgi_gcn_metaspot"][0]
+            + np.asarray(
+                [0.0, 0.001] + [0.0] * 8,
+                dtype=np.float32,
+            )
+        )
+        dgi_result, dgi_scores, dgi_metadata = (
+            _refine_metaspot_annotations_with_local_dgi(
+                dgi_rescue,
+                gold,
+                {
+                    **cfg,
+                    "metaspot_pool_k": 2,
+                    "metaspot_subtype_fdr": 0.0,
+                    "metaspot_exploratory_max_q": 0.0,
+                    "metaspot_dgi_seed_min_marker_transcripts": 1,
+                    "metaspot_dgi_seed_min_marker_genes": 1,
+                    "metaspot_dgi_seed_min_log2_enrichment": 0.0,
+                    "metaspot_dgi_min_informative_neighbors": 1,
+                    "metaspot_dgi_exploratory_min_support": 0.75,
+                    "metaspot_dgi_exploratory_min_margin": 0.25,
+                },
+            )
+        )
+        dgi_s0 = dgi_scores.set_index("metaspot").loc["s0"]
+        self.assertGreater(float(dgi_s0["candidate_bh_q"]), 0.0)
+        self.assertTrue(bool(dgi_s0["dgi_exploratory_supported"]))
+        self.assertEqual(
+            str(dgi_result.obs.loc["s0", "subcellular_fine_annotation"]),
+            "Nucleolus",
+        )
+        self.assertEqual(
+            str(dgi_result.obs.loc["s0", "subcellular_fine_state"]),
+            "DGI-supported exploratory fine structure",
+        )
+        self.assertGreaterEqual(
+            dgi_metadata["dgi_exploratory_supported_metaspots"],
+            2,
+        )
+
+        # The final Tier-B branch can recover one structure in a callable cell
+        # when q-value-based paths remain silent, but only through the same
+        # measured-marker plus leave-one-out DGI decision path.
+        hierarchical = adata_template.copy()
+        hierarchical.obsm["X_dgi_gcn_metaspot"][1] = (
+            hierarchical.obsm["X_dgi_gcn_metaspot"][0]
+            + np.asarray(
+                [0.0, 0.001] + [0.0] * 8,
+                dtype=np.float32,
+            )
+        )
+        hierarchical_result, hierarchical_scores, hierarchical_metadata = (
+            _refine_metaspot_annotations_with_local_dgi(
+                hierarchical,
+                gold,
+                {
+                    **cfg,
+                    "metaspot_pool_k": 2,
+                    "metaspot_subtype_fdr": 0.0,
+                    "metaspot_exploratory_max_q": 0.0,
+                    "metaspot_dgi_exploratory": False,
+                    "metaspot_dgi_seed_min_marker_transcripts": 1,
+                    "metaspot_dgi_seed_min_marker_genes": 1,
+                    "metaspot_dgi_seed_min_log2_enrichment": 0.0,
+                    "metaspot_dgi_min_informative_neighbors": 1,
+                    "metaspot_hierarchical_cell_rescue": True,
+                    "metaspot_hierarchical_min_cell_transcripts": 1,
+                    "metaspot_hierarchical_min_metaspots": 1,
+                    "metaspot_hierarchical_min_presence_score": 0.50,
+                    "metaspot_hierarchical_min_localization_score": 0.50,
+                    "metaspot_hierarchical_min_joint_score": 0.50,
+                    "metaspot_hierarchical_min_local_marker_transcripts": 1,
+                    "metaspot_hierarchical_min_local_marker_genes": 1,
+                    "metaspot_hierarchical_min_cell_marker_transcripts": 1,
+                    "metaspot_hierarchical_min_cell_marker_genes": 1,
+                    "metaspot_hierarchical_min_dgi_support": 0.35,
+                    "metaspot_hierarchical_min_dgi_margin": -0.25,
+                },
+            )
+        )
+        hierarchical_rows = hierarchical_scores.loc[
+            hierarchical_scores["hierarchical_cell_rescued"]
+        ]
+        self.assertEqual(len(hierarchical_rows), 2)
+        self.assertEqual(hierarchical_rows["cell_id"].nunique(), 2)
+        self.assertEqual(
+            hierarchical_rows.groupby("cell_id").size().max(), 1
+        )
+        c1_row = hierarchical_rows.loc[
+            hierarchical_rows["cell_id"] == "c1"
+        ].iloc[0]
+        self.assertEqual(
+            c1_row["fine_annotation"], "Nucleolus"
+        )
+        hierarchical_metaspot = c1_row["metaspot"]
+        self.assertEqual(
+            str(
+                hierarchical_result.obs.loc[
+                    hierarchical_metaspot,
+                    "subcellular_metaspot_decision_provenance",
+                ]
+            ),
+            "callable_cell_presence_plus_local_marker_plus_dgi",
+        )
+        self.assertGreater(
+            hierarchical_metadata["callable_cell_fine_coverage_after_hierarchical"],
+            hierarchical_metadata["callable_cell_fine_coverage_before_hierarchical"],
+        )
+
+        # An unidentifiable independent OMM model is unresolved by default;
+        # strict-local evidence remains visible in diagnostics.
+        unidentifiable = adata_template.copy()
+        unidentifiable.uns["omm_metaspot_refinement"] = {
+            "identifiable": False,
+        }
+        required_cfg = {
+            **cfg,
+            "metaspot_require_omm_confirmation": True,
+        }
+        unidentifiable_result, unidentifiable_scores, metadata = (
+            _refine_metaspot_annotations_with_local_dgi(
+                unidentifiable,
+                gold,
+                required_cfg,
+            )
+        )
+        self.assertEqual(
+            str(unidentifiable_result.obs.loc["s9", "subcellular_annotation"]),
+            "Cytosol",
+        )
+        self.assertEqual(
+            str(
+                unidentifiable_result.obs.loc[
+                    "s9", "subcellular_fine_annotation"
+                ]
+            ),
+            "Cytosol",
+        )
+        self.assertEqual(metadata["omm_confirmation_mode"], "unidentifiable")
+        self.assertEqual(metadata["omm_strict_local_candidate_metaspots"], 1)
+        self.assertEqual(metadata["omm_strict_local_fallback_metaspots"], 0)
+        self.assertEqual(
+            unidentifiable_result.obs.loc[
+                "s9", "subcellular_metaspot_decision_provenance"
+            ],
+            "broad_prior_fallback",
+        )
+        self.assertEqual(
+            unidentifiable_scores.set_index("metaspot").loc[
+                "s9", "omm_confirmation_status"
+            ],
+            "unidentifiable_strict_local_unresolved",
+        )
+
+        # The legacy behavior remains an explicit expert override.
+        strict_local = adata_template.copy()
+        strict_local.uns["omm_metaspot_refinement"] = {
+            "identifiable": False,
+        }
+        strict_local_result, _, strict_local_metadata = (
+            _refine_metaspot_annotations_with_local_dgi(
+                strict_local,
+                gold,
+                {
+                    **required_cfg,
+                    "metaspot_omm_unidentifiable_policy": "strict_local",
+                },
+            )
+        )
+        self.assertEqual(
+            str(strict_local_result.obs.loc["s9", "subcellular_annotation"]),
+            "OMM",
+        )
+        self.assertEqual(
+            strict_local_metadata["omm_strict_local_fallback_metaspots"],
+            1,
+        )
+
+        # When the same local call is exploratory but not strict, it remains
+        # audit-only while confirmation is unidentifiable.
+        s9_q = float(
+            scores.set_index("metaspot").loc["s9", "candidate_bh_q"]
+        )
+        self.assertGreater(s9_q, 0.0)
+        exploratory_only = adata_template.copy()
+        exploratory_only.uns["omm_metaspot_refinement"] = {
+            "identifiable": False,
+        }
+        exploratory_cfg = {
+            **required_cfg,
+            "metaspot_subtype_fdr": s9_q / 2.0,
+        }
+        exploratory_result, _, _ = (
+            _refine_metaspot_annotations_with_local_dgi(
+                exploratory_only,
+                gold,
+                exploratory_cfg,
+            )
+        )
+        self.assertEqual(
+            str(exploratory_result.obs.loc["s9", "subcellular_annotation"]),
+            "Cytosol",
+        )
+        self.assertEqual(
+            exploratory_result.obs.loc[
+                "s9", "subcellular_metaspot_fallback_reason"
+            ],
+            "omm_confirmation_unidentifiable_unresolved",
+        )
+
+        # If the model is identifiable, the original confirmation gate stays
+        # in force and an explicitly rejected OMM call still fails closed.
+        identifiable = adata_template.copy()
+        identifiable.uns["omm_metaspot_refinement"] = {
+            "identifiable": True,
+        }
+        identifiable.obs["omm_domain_gate"] = "rejected"
+        identifiable.obs["omm_refined_state"] = "OMM-rejected-by-domain"
+        identifiable_result, _, metadata = (
+            _refine_metaspot_annotations_with_local_dgi(
+                identifiable,
+                gold,
+                required_cfg,
+            )
+        )
+        self.assertEqual(metadata["omm_confirmation_mode"], "identifiable")
+        self.assertEqual(
+            str(identifiable_result.obs.loc["s9", "subcellular_annotation"]),
+            "Cytosol",
+        )
+        self.assertEqual(
+            identifiable_result.obs.loc[
+                "s9", "subcellular_metaspot_fallback_reason"
+            ],
+            "omm_not_confirmed",
+        )
+
+    def test_metaspot_omm_confirmation_missing_outputs_are_unavailable(self):
+        adata = ad.AnnData(np.zeros((2, 1), dtype=np.float32))
+        adata.uns["omm_metaspot_refinement"] = {"identifiable": True}
+
+        mode, confirmed = _resolve_metaspot_omm_confirmation(
+            adata,
+            require_confirmation=True,
+            posterior_high=0.8,
+        )
+
+        self.assertEqual(mode, "unavailable")
+        self.assertFalse(confirmed.any())
 
     def test_independent_evidence_policy_supports_mixed_and_unknown(self):
         index = pd.Index(["d1", "d2", "d3"], name="leiden")
@@ -224,6 +1344,53 @@ class LocalCompositionTests(unittest.TestCase):
         self.assertEqual(result.loc["d2", "secondary_label"], "ER")
         self.assertEqual(result.loc["d3", "label"], "Unknown")
         self.assertEqual(result.loc["d3", "annotation_state"], "Unknown")
+
+    def test_independent_tracks_preserve_expression_only_counterfactual(self):
+        index = pd.Index(["nuclear-domain"], name="leiden")
+        regions = ["Nucleus", "Cytosol", "ER"]
+        annot = pd.DataFrame(index=index)
+        values = {
+            "Nucleus": [2.0],
+            "Cytosol": [0.5],
+            "ER": [5.0],
+        }
+        for region in regions:
+            for prefix in ("z_mwu", "z_proj", "z_hyp"):
+                annot[f"{prefix}__{region}"] = values[region]
+            annot[f"subtype_empirical_q__{region}"] = [0.001]
+            annot[f"subtype_testable__{region}"] = True
+            annot[f"effective_marker_count__{region}"] = [20]
+
+        result = _apply_independent_evidence_tracks(
+            annot,
+            regions,
+            group_r_mean=pd.Series([-0.8], index=index),
+            assignment_mode="hierarchical",
+            subtype_fdr=0.05,
+            min_channel_support=2,
+        )
+
+        self.assertEqual(result.loc["nuclear-domain", "label"], "Nucleus")
+        self.assertEqual(
+            result.loc["nuclear-domain", "expression_only_label"],
+            "ER",
+        )
+        self.assertEqual(
+            result.loc[
+                "nuclear-domain",
+                "expression_only_candidate_label",
+            ],
+            "ER",
+        )
+        self.assertTrue(
+            result.loc[
+                "nuclear-domain",
+                "domain_compartment_feasibility_applied",
+            ]
+        )
+        self.assertFalse(
+            result.loc["nuclear-domain", "geometry_feasible__ER"]
+        )
 
     def test_independent_evidence_policy_tiered_keeps_strict_audit(self):
         index = pd.Index(["exploratory", "candidate"], name="leiden")
@@ -467,6 +1634,56 @@ class LocalCompositionTests(unittest.TestCase):
             ],
         )
 
+    def test_balanced_omm_policy_resolves_shared_domain_with_high_local_support(
+        self,
+    ):
+        index = pd.Index(
+            [
+                "confirmed-high",
+                "shared-high",
+                "shared-middle",
+                "rejected-high",
+            ]
+        )
+        result = _compose_omm_metaspot_labels(
+            pd.Series(["OMM", "ER", "ER", "OMM"], index=index),
+            pd.Series(
+                [
+                    "OMM-supported",
+                    "ER-OMM shared",
+                    "ER-OMM shared",
+                    "OMM-rejected-by-domain",
+                ],
+                index=index,
+            ),
+            pd.Series(
+                ["confirmed", "shared", "shared", "rejected"],
+                index=index,
+            ),
+            pd.Series(["ER", "ER", "Cytosol", "Cytosol"], index=index),
+            pd.Series([0.90, 0.95, 0.60, 0.99], index=index),
+            identifiable=True,
+            ambiguous_policy="competitor",
+            decision_policy="balanced",
+            posterior_high=0.80,
+        )
+
+        self.assertEqual(
+            result.tolist(),
+            ["OMM", "OMM", "Cytosol", "Cytosol"],
+        )
+
+    def test_balanced_omm_policy_requires_local_posteriors(self):
+        index = pd.Index(["shared"])
+        with self.assertRaisesRegex(ValueError, "reference_posteriors"):
+            _compose_omm_metaspot_labels(
+                pd.Series(["ER"], index=index),
+                pd.Series(["ER-OMM shared"], index=index),
+                pd.Series(["shared"], index=index),
+                identifiable=True,
+                decision_policy="balanced",
+            )
+
     def test_omm_metaspot_labels_fail_closed_when_model_is_unidentifiable(self):
         index = pd.Index(["confirmed", "rejected", "shared"])
         result = _compose_omm_metaspot_labels(
@@ -560,6 +1777,43 @@ class LocalCompositionTests(unittest.TestCase):
         self.assertEqual(result["in_nucleus"].tolist(), [True, False, True, False])
         self.assertTrue((result.loc[result["in_nucleus"], "r_signed"] <= 0).all())
         self.assertTrue((result.loc[~result["in_nucleus"], "r_signed"] >= 0).all())
+
+    def test_point_geometry_can_recompute_nucleus_flags_from_polygon(self):
+        transcripts = pd.DataFrame(
+            {
+                "cell_id": ["cell", "cell"],
+                "x_location": [0.5, 1.5],
+                "y_location": [0.5, 0.5],
+                "feature_name": ["A", "B"],
+                # Deliberately wrong; benchmark mode must ignore this column.
+                "overlaps_nucleus": [0, 1],
+            }
+        )
+        nucleus = pd.DataFrame(
+            {
+                "cell_id": ["cell"] * 4,
+                "vertex_x": [0.0, 1.0, 1.0, 0.0],
+                "vertex_y": [0.0, 0.0, 1.0, 1.0],
+            }
+        )
+        cell = pd.DataFrame(
+            {
+                "cell_id": ["cell"] * 4,
+                "vertex_x": [-1.0, 2.0, 2.0, -1.0],
+                "vertex_y": [-1.0, -1.0, 2.0, 2.0],
+            }
+        )
+
+        result = build_point_geometry_v2(
+            transcripts,
+            nucleus,
+            cell,
+            sampled_cells=["cell"],
+            include_directional=False,
+            use_input_nucleus_flags=False,
+        )
+
+        self.assertEqual(result["in_nucleus"].tolist(), [True, False])
 
     def test_signed_geometry_stretch_preserves_boundary_sign(self):
         values = np.array([-4.0, -1.0, -0.1, 0.0, 0.1, 1.0, 4.0] * 3)
@@ -723,6 +1977,166 @@ class LocalCompositionTests(unittest.TestCase):
             ["Cytosol", "Nucleus", "Nucleus", "Cytosol"],
         )
         self.assertEqual(conflict.tolist(), [True, True, False, False])
+
+    def test_metaspot_guard_uses_median_side_instead_of_mean_distance(self):
+        obs = pd.DataFrame(
+            {
+                "r_mean": [-0.4, 0.3],
+                "r_p50": [0.1, -0.2],
+            },
+            index=["spot-a", "spot-b"],
+        )
+        labels = pd.Series(
+            ["ER", "Nucleus"],
+            index=obs.index,
+        )
+
+        guard_values = _metaspot_compartment_guard_values(obs)
+        self.assertIsNotNone(guard_values)
+        result, conflict = _apply_local_compartment_guard(
+            labels,
+            guard_values,
+        )
+
+        self.assertEqual(result.tolist(), ["ER", "Nucleus"])
+        self.assertEqual(conflict.tolist(), [False, False])
+
+    def test_metaspot_guard_does_not_fall_back_to_mean_distance(self):
+        obs = pd.DataFrame(
+            {"r_mean": [-0.4]},
+            index=["legacy-spot"],
+        )
+
+        self.assertIsNone(_metaspot_compartment_guard_values(obs))
+
+    def test_primary_annotation_is_broadcast_from_local_metaspots(self):
+        adata = ad.AnnData(np.zeros((2, 1), dtype=np.float32))
+        adata.obs_names = ["spot-a", "spot-b"]
+        adata.obs["metaspot"] = ["cell-1::0", "cell-1::1"]
+        adata.obs["subcellular_annotation"] = pd.Categorical(
+            ["Nucleus", "Cytosol"]
+        )
+        transcripts = pd.DataFrame(
+            {
+                "metaspot": [
+                    "cell-1::1",
+                    "cell-1::0",
+                    "cell-1::1",
+                ]
+            }
+        )
+
+        mapped = _map_metaspot_labels_to_transcripts(
+            adata,
+            transcripts,
+        )
+
+        self.assertEqual(
+            mapped.tolist(),
+            ["Cytosol", "Nucleus", "Cytosol"],
+        )
+
+    def test_primary_annotation_mapping_rejects_missing_metaspots(self):
+        adata = ad.AnnData(np.zeros((1, 1), dtype=np.float32))
+        adata.obs["metaspot"] = ["cell-1::0"]
+        adata.obs["subcellular_annotation"] = ["Nucleus"]
+        transcripts = pd.DataFrame({"metaspot": ["cell-1::missing"]})
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "every transcript",
+        ):
+            _map_metaspot_labels_to_transcripts(
+                adata,
+                transcripts,
+            )
+
+    def test_shared_row_indexer_preserves_categorical_codes(self):
+        source_ids = pd.Index(["spot-a", "spot-b"])
+        target_ids = pd.Series(["spot-b", "spot-a", "spot-b"])
+        source = pd.Series(
+            pd.Categorical(
+                ["Nucleus", "ER"],
+                categories=["Nucleus", "ER", "OMM"],
+            ),
+            index=source_ids,
+            name="label",
+        )
+
+        row_indexer = _key_row_indexer(
+            source_ids,
+            target_ids,
+            error_context="test",
+        )
+        taken = _take_obs_column_by_row_indexer(
+            source,
+            row_indexer,
+            pd.RangeIndex(3),
+        )
+
+        self.assertEqual(row_indexer.dtype, np.int32)
+        self.assertIsInstance(taken.dtype, pd.CategoricalDtype)
+        self.assertEqual(taken.tolist(), ["ER", "Nucleus", "ER"])
+        self.assertEqual(
+            taken.cat.categories.tolist(),
+            ["Nucleus", "ER", "OMM"],
+        )
+        numeric_target_indexer = _key_row_indexer(
+            pd.Index(["1", "2"]),
+            pd.Series([2, 1]),
+            error_context="numeric fallback test",
+        )
+        np.testing.assert_array_equal(numeric_target_indexer, [1, 0])
+
+    def test_integer_cell_coverage_matches_pair_deduplication(self):
+        cell_ids = pd.Series(
+            ["c1", "c1", "c2", "c2", "c3", "c3", None]
+        )
+        labels = pd.Categorical(
+            ["Nucleus", "ER", "ER", "ER", "Nucleus", "ER", "ER"]
+        )
+        confidence = pd.Categorical(
+            ["High", "High", "High", "Low", "High", "High", "High"]
+        )
+
+        total_cells, coverage = _high_confidence_cell_coverage(
+            cell_ids,
+            labels,
+            confidence,
+        )
+        self.assertEqual(total_cells, 3)
+        self.assertEqual(coverage.to_dict(), {"ER": 3, "Nucleus": 2})
+
+        mask_a = np.asarray(labels == "ER")
+        mask_b = np.asarray(confidence == "High")
+        total_cells, counts = _unique_cell_counts_for_masks(
+            cell_ids,
+            [mask_a, mask_b, mask_a & mask_b],
+        )
+        self.assertEqual(total_cells, 3)
+        self.assertEqual(counts, [3, 3, 3])
+
+    def test_h5ad_sanitizer_keeps_compact_categoricals(self):
+        adata = ad.AnnData(np.zeros((3, 1), dtype=np.float32))
+        adata.obs["label"] = pd.Categorical(
+            ["Nucleus", "ER", "Nucleus"]
+        )
+        adata.obs["scalar_text"] = pd.Series(
+            ["a", "b", "c"],
+            index=adata.obs_names,
+            dtype=object,
+        )
+        adata.obs["sequence"] = pd.Series(
+            [["a", "b"], ["c"], None],
+            index=adata.obs_names,
+            dtype=object,
+        )
+
+        _sanitize_obs_for_h5ad(adata)
+
+        self.assertIsInstance(adata.obs["label"].dtype, pd.CategoricalDtype)
+        self.assertEqual(adata.obs["scalar_text"].tolist(), ["a", "b", "c"])
+        self.assertEqual(adata.obs["sequence"].tolist(), ["a,b", "c", ""])
 
     def test_spatial_false_disables_subtype_geometry_checks(self):
         adata = ad.AnnData(np.zeros((8, 40), dtype=np.float32))
@@ -1481,6 +2895,76 @@ class LocalCompositionTests(unittest.TestCase):
         self.assertEqual(connected[2], connected[3])
         self.assertNotEqual(connected[0], connected[2])
 
+    def test_spatial_ward_quiets_known_disconnected_graph_warning(self):
+        coordinates = np.asarray(
+            [[0.0, 0.0], [1.0, 0.0], [10.0, 0.0], [11.0, 0.0]],
+            dtype=np.float32,
+        )
+        labels = np.asarray([0, 0, 1, 1], dtype=np.int32)
+        features = np.asarray([[0.0], [0.1], [1.0], [1.1]], dtype=np.float32)
+
+        with warnings.catch_warnings(record=True) as caught:
+            connected = _enforce_spatially_connected_labels(
+                coordinates,
+                labels,
+                feature_matrix=features,
+                target_n_clusters=2,
+                connectivity_k=1,
+                radius_quantile=0.9,
+                radius_factor=1.1,
+                smoothing_iterations=0,
+                min_component_size=1,
+            )
+
+        disconnected_notices = [
+            warning
+            for warning in caught
+            if "number of connected components of the connectivity matrix"
+            in str(warning.message)
+        ]
+        self.assertEqual(disconnected_notices, [])
+        self.assertEqual(connected[0], connected[1])
+        self.assertEqual(connected[2], connected[3])
+        self.assertNotEqual(connected[0], connected[2])
+
+    def test_spatial_ward_early_stop_matches_full_tree_membership(self):
+        rng = np.random.default_rng(91)
+        coordinates = np.round(
+            rng.uniform(0.0, 50.0, size=(600, 2)),
+            2,
+        ).astype(np.float32)
+        features = rng.normal(size=(600, 12)).astype(np.float32)
+        labels = np.zeros(600, dtype=np.int32)
+        real_clustering = pipeline_module.AgglomerativeClustering
+
+        def _full_tree_clustering(*args, **kwargs):
+            kwargs["compute_full_tree"] = True
+            return real_clustering(*args, **kwargs)
+
+        with mock.patch.object(
+            pipeline_module,
+            "AgglomerativeClustering",
+            side_effect=_full_tree_clustering,
+        ):
+            full_tree = _enforce_spatially_connected_labels(
+                coordinates,
+                labels,
+                feature_matrix=features,
+                target_n_clusters=30,
+                connectivity_k=8,
+                min_component_size=5,
+            )
+        early_stop = _enforce_spatially_connected_labels(
+            coordinates,
+            labels,
+            feature_matrix=features,
+            target_n_clusters=30,
+            connectivity_k=8,
+            min_component_size=5,
+        )
+
+        np.testing.assert_array_equal(early_stop, full_tree)
+
     def test_spatial_connectivity_merges_small_component_to_neighbor(self):
         coordinates = np.column_stack(
             (np.arange(6, dtype=np.float32), np.zeros(6, dtype=np.float32))
@@ -1512,6 +2996,184 @@ class LocalCompositionTests(unittest.TestCase):
         self.assertEqual(_target_metaspot_count(coordinates, 100, 2, 100), 10)
         self.assertEqual(_target_metaspot_count(coordinates, 500, 5, 100), 5)
         self.assertEqual(_target_metaspot_count(coordinates, 5, 2, 20), 20)
+
+    def test_segmentation_audit_vectorizes_requested_metaspot_counts(self):
+        frame = pd.DataFrame(
+            {
+                "cell_id": ["A"] * 5 + ["B"] * 3 + ["C"] * 8,
+                "metaspot": (
+                    ["A:0", "A:0", "A:0", "A:1", "A:1"]
+                    + ["B:0"] * 3
+                    + ["C:0"] * 4
+                    + ["C:1"] * 4
+                ),
+                "x_location": [
+                    0.0,
+                    0.0,
+                    1.0,
+                    2.0,
+                    np.nan,
+                    np.nan,
+                    np.inf,
+                    np.nan,
+                    0.0,
+                    1.0,
+                    2.0,
+                    3.0,
+                    4.0,
+                    5.0,
+                    6.0,
+                    7.0,
+                ],
+                "y_location": np.zeros(16, dtype=np.float32),
+                "in_nucleus": [
+                    True,
+                    False,
+                    True,
+                    False,
+                    False,
+                    True,
+                    True,
+                    False,
+                    False,
+                    False,
+                    False,
+                    False,
+                    True,
+                    True,
+                    True,
+                    True,
+                ],
+            }
+        )
+        original_eq = pd.Series.eq
+
+        def reject_full_cell_scan(series, other, *args, **kwargs):
+            if series.name == "cell_id" and len(series) == len(frame):
+                raise AssertionError("audit rescanned the full cell_id column")
+            return original_eq(series, other, *args, **kwargs)
+
+        with mock.patch.object(pd.Series, "eq", new=reject_full_cell_scan):
+            audit = _metaspot_segmentation_audit(
+                frame,
+                target_sites_per_metaspot=2,
+                min_metaspots_per_cell=2,
+                max_metaspots_per_cell=3,
+                partition_by_nucleus=True,
+            )
+
+        expected = {
+            cell_id: _target_metaspot_count(
+                group[["x_location", "y_location"]].to_numpy(
+                    np.float32,
+                    copy=False,
+                ),
+                target_sites_per_metaspot=2,
+                min_metaspots_per_cell=2,
+                max_metaspots_per_cell=3,
+            )
+            for cell_id, group in frame.groupby("cell_id", sort=False)
+        }
+        actual = audit.set_index("cell_id")["requested_metaspots"].to_dict()
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual, {"A": 2, "B": 1, "C": 3})
+        self.assertEqual(
+            audit.set_index("cell_id")["n_unique_sites"].to_dict(),
+            {"A": 4, "B": 2, "C": 8},
+        )
+
+    def test_partition_target_allocation_preserves_cell_budget(self):
+        nucleus = np.column_stack(
+            (
+                np.arange(30, dtype=np.float32),
+                np.zeros(30, dtype=np.float32),
+            )
+        )
+        cytoplasm = np.column_stack(
+            (
+                np.arange(70, dtype=np.float32),
+                np.ones(70, dtype=np.float32),
+            )
+        )
+
+        allocated = _allocate_partition_target_counts(
+            [nucleus, cytoplasm],
+            target_sites_per_metaspot=10,
+            min_metaspots_per_cell=1,
+            max_metaspots_per_cell=8,
+        )
+
+        self.assertEqual(allocated, [2, 6])
+        self.assertEqual(sum(allocated), 8)
+
+    def test_module3_partition_prevents_nuclear_mixed_metaspots(self):
+        n_per_side = 40
+        frame = pd.DataFrame(
+            {
+                "cell_id": ["Cell1"] * (2 * n_per_side),
+                "feature_name": ["GeneA", "GeneB"] * n_per_side,
+                "x_location": np.r_[
+                    np.linspace(0, 19, n_per_side),
+                    np.linspace(20, 39, n_per_side),
+                ].astype(np.float32),
+                "y_location": np.zeros(2 * n_per_side, dtype=np.float32),
+                "in_nucleus": np.r_[
+                    np.ones(n_per_side, dtype=bool),
+                    np.zeros(n_per_side, dtype=bool),
+                ],
+                "r_signed": np.r_[
+                    -np.ones(n_per_side, dtype=np.float32),
+                    np.ones(n_per_side, dtype=np.float32),
+                ],
+                "d_cell_norm": np.full(
+                    2 * n_per_side,
+                    0.5,
+                    dtype=np.float32,
+                ),
+                "d_nuc_norm": np.full(
+                    2 * n_per_side,
+                    0.5,
+                    dtype=np.float32,
+                ),
+            }
+        )
+        clustered = per_cell_clustering(
+            frame,
+            ["r_signed", "d_cell_norm", "d_nuc_norm"],
+            hdbscan_min_cluster_size=5,
+            sequential_cells=10,
+            enforce_spatial_connectivity=True,
+            partition_by_nucleus=True,
+            spatial_connectivity_k=4,
+            spatial_min_component_size=2,
+            target_sites_per_metaspot=5,
+            min_metaspots_per_cell=2,
+            max_metaspots_per_cell=8,
+        )
+        mixed = (
+            clustered.groupby("metaspot", observed=True)["in_nucleus"]
+            .nunique()
+            .gt(1)
+        )
+        self.assertFalse(mixed.any())
+        self.assertLessEqual(clustered["metaspot"].nunique(), 8)
+
+        audit = _metaspot_segmentation_audit(
+            clustered,
+            target_sites_per_metaspot=5,
+            min_metaspots_per_cell=2,
+            max_metaspots_per_cell=8,
+            partition_by_nucleus=True,
+        )
+        self.assertEqual(
+            int(audit["nucleus_mixed_metaspots"].sum()),
+            0,
+        )
+        self.assertEqual(
+            float(audit["nucleus_mixed_transcript_fraction"].max()),
+            0.0,
+        )
 
     def test_legacy_metaspot_columns_are_migrated(self):
         legacy = pd.DataFrame(
@@ -1563,17 +3225,99 @@ class LocalCompositionTests(unittest.TestCase):
         self.assertFalse(aligned)
         self.assertIn("r_mean differs", reason)
 
+    def test_module4_vectorized_statistics_match_reference_formulas(self):
+        point_df = pd.DataFrame(
+            {
+                "metaspot": ["cell:0"] * 5 + ["cell:1"] * 4,
+                "feature_name": ["A", "B", "A", "C", "B"] * 1
+                + ["A", "C", "C", "B"],
+                "r_signed": [-0.8, np.nan, -0.2, 0.1, 0.5, 0.2, 0.4, 0.7, 0.9],
+                "d_cell_norm": np.linspace(0.1, 0.9, 9),
+                "d_nuc_norm": np.linspace(0.9, 0.1, 9),
+                "x_location": [0.0, np.nan, 2.0, 3.0, 4.0, 10.0, 11.0, 12.0, 13.0],
+                "y_location": [0.0, 1.0, 0.0, 2.0, 1.0, 5.0, 5.5, np.nan, 7.0],
+            }
+        )
+
+        adata1 = build_adata1(point_df)
+
+        for metaspot, group in point_df.groupby("metaspot", sort=True):
+            r_values = group["r_signed"].to_numpy(np.float32)
+            expected_quantiles = np.nanpercentile(
+                r_values,
+                [10, 50, 90],
+            )
+            np.testing.assert_allclose(
+                adata1.obs.loc[
+                    metaspot,
+                    ["r_p10", "r_p50", "r_p90"],
+                ].to_numpy(dtype=float),
+                expected_quantiles,
+                rtol=0.0,
+                atol=1e-6,
+            )
+            self.assertAlmostEqual(
+                float(adata1.obs.loc[metaspot, "r_mean"]),
+                float(np.nanmean(r_values)),
+                places=6,
+            )
+            self.assertAlmostEqual(
+                float(adata1.obs.loc[metaspot, "r_std"]),
+                float(np.nanstd(r_values)),
+                places=6,
+            )
+
+            x_values = group["x_location"].to_numpy(np.float32)
+            y_values = group["y_location"].to_numpy(np.float32)
+            centered_x = x_values - np.nanmean(x_values)
+            centered_y = y_values - np.nanmean(y_values)
+            finite = np.isfinite(centered_x) & np.isfinite(centered_y)
+            denominator = max(int(finite.sum()) - 1, 1)
+            var_x = float(
+                np.square(centered_x[finite]).sum() / denominator
+            )
+            var_y = float(
+                np.square(centered_y[finite]).sum() / denominator
+            )
+            covariance = float(
+                (centered_x[finite] * centered_y[finite]).sum()
+                / denominator
+            )
+            trace = max(var_x + var_y, 0.0)
+            discriminant = max(
+                trace * trace
+                - 4.0 * (var_x * var_y - covariance * covariance),
+                0.0,
+            )
+            root = np.sqrt(discriminant)
+            lambda_1 = max(0.5 * (trace + root), 1e-8)
+            lambda_2 = max(0.5 * (trace - root), 1e-8)
+            np.testing.assert_allclose(
+                float(adata1.obs.loc[metaspot, "elongation"]),
+                lambda_1 / lambda_2,
+                rtol=1e-5,
+                atol=1e-6,
+            )
+            np.testing.assert_allclose(
+                float(adata1.obs.loc[metaspot, "spread"]),
+                np.sqrt(trace),
+                rtol=1e-6,
+                atol=1e-6,
+            )
+
     def test_resume_fingerprint_tracks_applied_tuning_parameters(self):
         cfg = {
+            "module1": {"use_input_nucleus_flags": False},
             "module2": {"idf_mode": "log"},
             "module3": {
                 "hdbscan_max_points": 99,
                 "sequential_cells": 7,
                 "enforce_spatial_connectivity": True,
+                "partition_by_nucleus": True,
                 "target_sites_per_metaspot": 100,
             },
             "module5": {"assign_chunk_size": 123, "mbk_batch_size": 17},
-            "module6": {"preserve_raw_counts": True},
+            "module6": {"pool_normalize": True},
             "module8": {"amp": False},
             "annotation": {
                 "unit": "metadomain",
@@ -1587,6 +3331,7 @@ class LocalCompositionTests(unittest.TestCase):
                 "apex_omm_specificity_filter": True,
                 "apex_omm_min_log2fc": 0.75,
                 "apex_omm_min_delta": 0.50,
+                "independent_domain_compartment_feasibility": True,
                 "independent_omm_competitor_margin": 0.0,
                 "omm_metaspot_refinement": True,
                 "omm_metaspot_ambiguous_policy": "competitor",
@@ -1594,6 +3339,11 @@ class LocalCompositionTests(unittest.TestCase):
         }
 
         self.assertEqual(module_config_subset(cfg, "m2")["module2.idf_mode"], "log")
+        self.assertFalse(
+            module_config_subset(cfg, "m1")[
+                "module1.use_input_nucleus_flags"
+            ]
+        )
         self.assertEqual(
             module_config_subset(cfg, "m3")["module3.hdbscan_max_points"],
             99,
@@ -1601,6 +3351,11 @@ class LocalCompositionTests(unittest.TestCase):
         self.assertTrue(
             module_config_subset(cfg, "m3")[
                 "module3.enforce_spatial_connectivity"
+            ]
+        )
+        self.assertTrue(
+            module_config_subset(cfg, "m3")[
+                "module3.partition_by_nucleus"
             ]
         )
         self.assertEqual(
@@ -1615,9 +3370,7 @@ class LocalCompositionTests(unittest.TestCase):
         )
         self.assertFalse(module_config_subset(cfg, "m8")["module8.amp"])
         self.assertTrue(
-            module_config_subset(cfg, "m6")[
-                "module6.preserve_raw_counts"
-            ]
+            module_config_subset(cfg, "m6")["module6.pool_normalize"]
         )
         annotate_cfg = stage_config_subset(cfg, "annotate")
         self.assertEqual(annotate_cfg["annotation.unit"], "metadomain")
@@ -1640,6 +3393,11 @@ class LocalCompositionTests(unittest.TestCase):
         self.assertEqual(
             annotate_cfg["annotation.independent_omm_competitor_margin"],
             0.0,
+        )
+        self.assertTrue(
+            annotate_cfg[
+                "annotation.independent_domain_compartment_feasibility"
+            ]
         )
         self.assertTrue(
             annotate_cfg["annotation.omm_metaspot_refinement"]
@@ -1670,7 +3428,19 @@ class LocalCompositionTests(unittest.TestCase):
 
     def test_module3_consumes_streaming_expression_model(self):
         frame = _synthetic_transcripts()
-        with _local_config():
+        real_import = __import__
+
+        def reject_hdbscan(name, *args, **kwargs):
+            if name == "hdbscan":
+                raise AssertionError(
+                    "canonical spatial clustering must not import hdbscan"
+                )
+            return real_import(name, *args, **kwargs)
+
+        with _local_config(), mock.patch(
+            "builtins.__import__",
+            side_effect=reject_hdbscan,
+        ):
             point_df, gmm_cols, model = build_composition_embeddings(
                 frame.copy(),
                 frame,
@@ -1712,6 +3482,53 @@ class LocalCompositionTests(unittest.TestCase):
         adata1 = build_adata1(clustered)
         self.assertEqual(adata1.n_obs, clustered["metaspot"].nunique())
         self.assertNotIn("cell_sub", adata1.obs.columns)
+
+    def test_module3_worker_does_not_capture_full_point_table(self):
+        frame = _synthetic_transcripts()
+        captured = {}
+
+        class CaptureParallel:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def __call__(self, tasks):
+                worker, args, _ = next(iter(tasks))
+                captured["freevars"] = set(worker.__code__.co_freevars)
+                cell_id, group = args[0]
+                return [
+                    (
+                        cell_id,
+                        pd.Series(
+                            np.zeros(len(group), dtype=np.int32),
+                            index=group.index,
+                        ),
+                    )
+                ]
+
+        with _local_config(), mock.patch(
+            "joblib.Parallel",
+            CaptureParallel,
+        ):
+            per_cell_clustering(
+                frame,
+                ["r_signed", "d_cell_norm", "d_nuc_norm"],
+                sequential_cells=0,
+                small_backend_cells=0,
+                parallel_chunk_cells=16,
+                parallel_n_jobs=2,
+                enforce_spatial_connectivity=True,
+                target_sites_per_metaspot=10,
+                min_metaspots_per_cell=2,
+                max_metaspots_per_cell=4,
+            )
+
+        self.assertNotIn("point_df", captured["freevars"])
 
 
 if __name__ == "__main__":
